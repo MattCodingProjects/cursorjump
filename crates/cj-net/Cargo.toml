@@ -5,10 +5,16 @@ edition.workspace = true
 
 [dependencies]
 anyhow = "1"
+bytes = "1"
+cj-core = { path = "../cj-core" }
+postcard = { version = "1", features = ["alloc"] }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rcgen = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
 ring = "0.17"
 sha2 = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { version = "1", features = ["full"] }

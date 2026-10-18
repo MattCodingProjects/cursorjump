@@ -1,6 +1,7 @@
 //! Networking for CursorJump.
 
 pub mod identity;
+pub mod session;
 pub mod verify;
 
 pub use identity::*;

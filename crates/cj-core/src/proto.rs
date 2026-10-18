@@ -54,6 +54,18 @@ pub enum Control {
     PairConfirm {
         accepted: bool,
     },
+    /// Pairing step 1, connector to listener: commitment to the connector's nonce.
+    PairCommit {
+        commit: [u8; 32],
+    },
+    /// Pairing step 2, listener to connector: the listener's nonce.
+    PairNonce {
+        nonce: [u8; 32],
+    },
+    /// Pairing step 3, connector to listener: reveals the committed nonce.
+    PairReveal {
+        nonce: [u8; 32],
+    },
     /// PC to Mac: edge of the Mac screen being entered.
     Enter {
         edge: Side,
@@ -145,6 +157,42 @@ mod tests {
             enc.len() - 4
         );
         assert_eq!(decode_control_body(&enc[4..]).unwrap(), c);
+    }
+
+    #[test]
+    fn control_roundtrip_all_variants() {
+        let all = [
+            Control::Hello {
+                version: PROTOCOL_VERSION,
+                name: "PC".into(),
+            },
+            Control::PairConfirm { accepted: true },
+            Control::PairCommit { commit: [0xAB; 32] },
+            Control::PairNonce { nonce: [0x01; 32] },
+            Control::PairReveal { nonce: [0xFE; 32] },
+            Control::Enter {
+                edge: Side::Left,
+                frac: 0.25,
+            },
+            Control::Leave { frac: 1.0 },
+            Control::Button {
+                button: MouseButton::Forward,
+                down: true,
+            },
+            Control::Key {
+                mac_keycode: 0x7E,
+                down: false,
+            },
+            Control::ReleaseAll,
+        ];
+        for c in all {
+            let enc = encode_control(&c);
+            assert_eq!(
+                u32::from_le_bytes(enc[..4].try_into().unwrap()) as usize,
+                enc.len() - 4
+            );
+            assert_eq!(decode_control_body(&enc[4..]).unwrap(), c);
+        }
     }
 
     #[test]
