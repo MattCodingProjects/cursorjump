@@ -2,11 +2,12 @@
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use cj_core::clipboard::ClipboardData;
+use cj_core::clipboard::{ClipboardData, within_limit};
 use cj_core::proto::{
     Control, Datagram, MouseButton, PROTOCOL_VERSION, decode_control_body, encode_control,
+    encode_datagram,
 };
 use cj_net::session::{Listener, Session, connect};
 use cj_net::{ALPN, CjServerCertVerifier, Identity, SERVER_NAME, Trust, client_config};
@@ -373,6 +374,11 @@ async fn oversized_control_frame_is_error() {
     let len = (1024 * 1024 + 1) as u32;
     raw.tx.write_all(&len.to_le_bytes()).await.unwrap();
     assert!(timeout(T, server.recv_control()).await.unwrap().is_err());
+    // A control-stream error is fatal: the session is closed.
+    timeout(T, server.closed())
+        .await
+        .expect("recv_control error closes the session");
+    timeout(T, raw.conn.closed()).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -486,20 +492,32 @@ async fn clipboard_transfer_and_limit() {
     let (a, b) = (ident(), ident());
     let (_l, server, client) = pair_up(&a, Trust::PairingMode, &b, Trust::PairingMode).await;
 
+    // Items exactly at the sender's `within_limit` must pass the receiver's
+    // limit despite the postcard framing overhead.
     let big_text = ClipboardData {
         text: Some("x".repeat(MB)),
         ..Default::default()
     };
-    let (sent, got) = timeout(T, async {
-        tokio::join!(
-            client.send_clipboard(&big_text),
-            server.recv_clipboard(2 * MB as u64)
-        )
-    })
-    .await
-    .unwrap();
-    sent.unwrap();
-    assert_eq!(got.unwrap(), big_text);
+    let quarter = MB / 4;
+    let all_formats = ClipboardData {
+        text: Some("t".repeat(quarter)),
+        html: Some("h".repeat(quarter)),
+        rtf: Some(vec![1u8; quarter]),
+        png: Some(vec![2u8; quarter]),
+    };
+    for item in [&big_text, &all_formats] {
+        assert!(within_limit(item, MB as u64));
+        let (sent, got) = timeout(T, async {
+            tokio::join!(
+                client.send_clipboard(item),
+                server.recv_clipboard(MB as u64)
+            )
+        })
+        .await
+        .unwrap();
+        sent.unwrap();
+        assert_eq!(&got.unwrap(), item);
+    }
 
     let too_big = ClipboardData {
         png: Some(vec![7u8; 2 * MB]),
@@ -586,4 +604,145 @@ async fn session_ends_when_peer_vanishes() {
     timeout(Duration::from_secs(1), client.closed())
         .await
         .expect("closed() must resolve within 1 s of the peer vanishing");
+}
+
+/// Binds a PairingMode listener and returns a raw peer that has completed Hello.
+async fn listener_with_raw_peer(a: &Identity, b: &Identity) -> (Listener, Session, RawPeer) {
+    let listener = Listener::bind(a, Trust::PairingMode, localhost_any_port(), "A")
+        .await
+        .unwrap();
+    let addr = listener.local_addr();
+    let (accepted, raw) = timeout(T, async {
+        tokio::join!(listener.accept(), async {
+            let mut raw =
+                RawPeer::connect(client_config(b, Trust::PairingMode).unwrap(), addr).await?;
+            raw.hello(PROTOCOL_VERSION).await?;
+            anyhow::Ok(raw)
+        })
+    })
+    .await
+    .unwrap();
+    (listener, accepted.unwrap(), raw.unwrap())
+}
+
+/// A stranger that completes TLS (PairingMode trusts anyone) but never sends Hello.
+async fn stalled_stranger(addr: SocketAddr) -> anyhow::Result<RawPeer> {
+    RawPeer::connect(client_config(&ident(), Trust::PairingMode)?, addr).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stalled_strangers_do_not_block_paired_peer() {
+    let (a, b) = (ident(), ident());
+    let listener = Listener::bind(&a, Trust::PairingMode, localhost_any_port(), "A")
+        .await
+        .unwrap();
+    let addr = listener.local_addr();
+
+    let (accepted, (_stallers, joined)) = tokio::join!(timeout(T, listener.accept()), async {
+        let s1 = timeout(T, stalled_stranger(addr)).await.unwrap().unwrap();
+        let s2 = timeout(T, stalled_stranger(addr)).await.unwrap().unwrap();
+        let started = Instant::now();
+        let c = timeout(
+            Duration::from_secs(2),
+            connect(&b, Trust::PairingMode, addr, "B"),
+        )
+        .await;
+        ((s1, s2), (c, started.elapsed()))
+    });
+    let (c, took) = joined;
+    c.unwrap_or_else(|_| panic!("B must connect within 2 s (gave up after {took:?})"))
+        .unwrap();
+    assert_eq!(accepted.unwrap().unwrap().peer(), b.fingerprint());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_handshakes_are_capped() {
+    let (a, b) = (ident(), ident());
+    let listener = Listener::bind(&a, Trust::PairingMode, localhost_any_port(), "A")
+        .await
+        .unwrap();
+    let addr = listener.local_addr();
+
+    let (accepted, ()) = tokio::join!(timeout(T, listener.accept()), async {
+        let mut stallers = Vec::new();
+        for _ in 0..8 {
+            stallers.push(timeout(T, stalled_stranger(addr)).await.unwrap().unwrap());
+        }
+        let ninth = timeout(T, stalled_stranger(addr)).await.unwrap();
+        assert!(ninth.is_err(), "a 9th pending handshake must be refused");
+        // B is refused too while all slots are taken; once the stallers' Hello
+        // deadline passes, slots free up and B gets in.
+        timeout(T, async {
+            while connect(&b, Trust::PairingMode, addr, "B").await.is_err() {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        })
+        .await
+        .expect("B gets in once the stalled handshakes expire");
+        drop(stallers);
+    });
+    assert_eq!(accepted.unwrap().unwrap().peer(), b.fingerprint());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn undecodable_datagram_is_skipped() {
+    let (a, b) = (ident(), ident());
+    let (_l, server, raw) = listener_with_raw_peer(&a, &b).await;
+
+    let motion = Datagram::Motion { dx: 3, dy: -4 };
+    raw.conn
+        .send_datagram(bytes::Bytes::from_static(&[0xFF, 0xFF, 0xFF]))
+        .unwrap();
+    raw.conn
+        .send_datagram(bytes::Bytes::from(encode_datagram(&motion)))
+        .unwrap();
+    assert_eq!(
+        timeout(T, server.recv_datagram()).await.unwrap().unwrap(),
+        motion
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pair_times_out_and_closes() {
+    let (a, b) = (ident(), ident());
+    let (_l, server, raw) = listener_with_raw_peer(&a, &b).await;
+
+    // The raw peer stays connected but never sends PairCommit.
+    let started = Instant::now();
+    let code = timeout(T, server.pair()).await.unwrap();
+    assert!(code.is_err(), "pair() must give up without a code");
+    assert!(
+        started.elapsed() >= Duration::from_millis(2500),
+        "pair() gave up after only {:?}",
+        started.elapsed()
+    );
+    timeout(T, server.closed())
+        .await
+        .expect("a timed-out pairing closes the session");
+    timeout(T, raw.conn.closed()).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stream_limits_are_enforced() {
+    let (a, b) = (ident(), ident());
+    let (_l, _server, raw) = listener_with_raw_peer(&a, &b).await;
+    let short = Duration::from_millis(500);
+
+    // The control stream is the only bidirectional stream allowed.
+    assert!(
+        timeout(short, raw.conn.open_bi()).await.is_err(),
+        "a second bi stream must not be granted"
+    );
+
+    // At most 4 unaccepted clipboard streams in flight.
+    let mut unis = Vec::new();
+    for _ in 0..4 {
+        let mut s = timeout(T, raw.conn.open_uni()).await.unwrap().unwrap();
+        s.write_all(b"x").await.unwrap();
+        unis.push(s);
+    }
+    assert!(
+        timeout(short, raw.conn.open_uni()).await.is_err(),
+        "a 5th uni stream must wait for credit"
+    );
 }

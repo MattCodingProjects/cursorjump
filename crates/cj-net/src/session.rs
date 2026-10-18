@@ -20,7 +20,8 @@ use quinn::{
     Connection, Endpoint, ReadToEndError, RecvStream, SendStream, TransportConfig, VarInt,
 };
 use rustls::pki_types::CertificateDer;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
+use tokio::task::JoinSet;
 use tokio::time::timeout;
 
 use crate::identity::{
@@ -33,8 +34,22 @@ const KEEP_ALIVE_INTERVAL: Duration = Duration::from_millis(100);
 const DATAGRAM_BUFFER_BYTES: usize = 64 * 1024;
 /// Upper bound for QUIC handshake plus Hello exchange.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
+/// Upper bound for the whole `pair()` exchange.
+const PAIR_TIMEOUT: Duration = Duration::from_secs(3);
 /// Largest control message body accepted from the peer.
 const MAX_CONTROL_BODY: usize = 1024 * 1024;
+/// Inbound handshakes (QUIC + Hello) driven at once; more are refused.
+const MAX_PENDING_HANDSHAKES: usize = 8;
+/// Good sessions waiting for `Listener::accept`; more are dropped (closed).
+const ACCEPT_QUEUE: usize = 8;
+/// Only the control stream may be bidirectional.
+const MAX_BIDI_STREAMS: u32 = 1;
+/// Clipboard items in flight at once.
+const MAX_UNI_STREAMS: u32 = 4;
+/// Connection-wide flow-control window (per-stream window stays at quinn's default).
+const CONNECTION_RECEIVE_WINDOW: u32 = 48 * 1024 * 1024;
+/// Postcard framing (option tags, length varints) on top of `ClipboardData::byte_len`.
+const CLIPBOARD_FRAMING_ALLOWANCE: u64 = 64;
 
 /// Application close / stream stop codes.
 const CLOSE_BYE: u32 = 0;
@@ -51,7 +66,10 @@ fn transport_config() -> Arc<TransportConfig> {
     ))
     .keep_alive_interval(Some(KEEP_ALIVE_INTERVAL))
     .datagram_receive_buffer_size(Some(DATAGRAM_BUFFER_BYTES))
-    .datagram_send_buffer_size(DATAGRAM_BUFFER_BYTES);
+    .datagram_send_buffer_size(DATAGRAM_BUFFER_BYTES)
+    .max_concurrent_bidi_streams(VarInt::from_u32(MAX_BIDI_STREAMS))
+    .max_concurrent_uni_streams(VarInt::from_u32(MAX_UNI_STREAMS))
+    .receive_window(VarInt::from_u32(CONNECTION_RECEIVE_WINDOW));
     Arc::new(t)
 }
 
@@ -158,11 +176,15 @@ impl ControlReader {
 }
 
 /// Accepts inbound sessions on one UDP port.
+///
+/// A background task drives up to `MAX_PENDING_HANDSHAKES` inbound handshakes
+/// concurrently, so a stalled or hostile peer cannot hold up anyone else. It
+/// stops when the `Listener` is dropped.
 pub struct Listener {
     endpoint: Endpoint,
     identity: Identity,
     local_addr: SocketAddr,
-    name: String,
+    sessions: Mutex<mpsc::Receiver<Session>>,
 }
 
 impl Listener {
@@ -176,44 +198,31 @@ impl Listener {
         let endpoint = Endpoint::server(quinn_server_config(id, trust)?, addr)
             .with_context(|| format!("binding QUIC listener on {addr}"))?;
         let local_addr = endpoint.local_addr()?;
+        let (tx, rx) = mpsc::channel(ACCEPT_QUEUE);
+        tokio::spawn(run_acceptor(
+            endpoint.clone(),
+            id.fingerprint(),
+            Arc::from(name),
+            tx,
+        ));
         Ok(Listener {
             endpoint,
             identity: copy_identity(id),
             local_addr,
-            name: name.to_string(),
+            sessions: Mutex::new(rx),
         })
     }
 
     /// Returns the next peer that completes the TLS handshake and Hello exchange.
-    /// Peers that fail either (strangers, bad versions, stalls) are dropped silently.
+    /// Peers that fail either (strangers, bad versions, stalls) are dropped
+    /// silently. Cancel-safe.
     pub async fn accept(&self) -> Result<Session> {
-        loop {
-            let incoming = self
-                .endpoint
-                .accept()
-                .await
-                .ok_or_else(|| anyhow!("listener endpoint closed"))?;
-            if let Ok(Ok(session)) = timeout(HANDSHAKE_TIMEOUT, self.handshake(incoming)).await {
-                return Ok(session);
-            }
-        }
-    }
-
-    async fn handshake(&self, incoming: quinn::Incoming) -> Result<Session> {
-        let conn = incoming.await?;
-        let (mut tx, rx) = conn.accept_bi().await?;
-        let mut reader = ControlReader::new(rx);
-        let peer_name = expect_hello(&conn, reader.next().await?)?;
-        tx.write_all(&encode_control(&hello(&self.name))).await?;
-        Session::new(
-            conn,
-            tx,
-            reader,
-            self.identity.fingerprint(),
-            peer_name,
-            false,
-            self.endpoint.clone(),
-        )
+        self.sessions
+            .lock()
+            .await
+            .recv()
+            .await
+            .ok_or_else(|| anyhow!("listener endpoint closed"))
     }
 
     /// Replaces the trust policy for future handshakes (e.g. pin after pairing).
@@ -227,6 +236,63 @@ impl Listener {
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }
+}
+
+/// Feeds good sessions into `sessions` until the endpoint closes or the
+/// `Listener` (the receiver) is dropped.
+async fn run_acceptor(
+    endpoint: Endpoint,
+    local: Fingerprint,
+    name: Arc<str>,
+    sessions: mpsc::Sender<Session>,
+) {
+    let mut pending: JoinSet<Result<Session>> = JoinSet::new();
+    loop {
+        tokio::select! {
+            incoming = endpoint.accept() => {
+                let Some(incoming) = incoming else { break };
+                if !incoming.remote_address_validated() {
+                    // Stateless retry: the peer must prove its address before
+                    // it can occupy a handshake slot.
+                    if let Err(e) = incoming.retry() {
+                        e.into_incoming().ignore();
+                    }
+                } else if pending.len() >= MAX_PENDING_HANDSHAKES {
+                    incoming.refuse();
+                } else {
+                    let (endpoint, name) = (endpoint.clone(), name.clone());
+                    pending.spawn(async move {
+                        timeout(HANDSHAKE_TIMEOUT, listener_handshake(incoming, local, &name, endpoint))
+                            .await
+                            .map_err(|_| anyhow!("handshake timed out"))?
+                    });
+                }
+            }
+            Some(done) = pending.join_next() => {
+                if let Ok(Ok(session)) = done {
+                    // Queue full means nobody is accepting; dropping closes the session.
+                    let _ = sessions.try_send(session);
+                }
+            }
+            _ = sessions.closed() => break,
+        }
+    }
+    // No acceptor any more: refuse new connections instead of leaving them hanging.
+    endpoint.set_server_config(None);
+}
+
+async fn listener_handshake(
+    incoming: quinn::Incoming,
+    local: Fingerprint,
+    name: &str,
+    endpoint: Endpoint,
+) -> Result<Session> {
+    let conn = incoming.await?;
+    let (mut tx, rx) = conn.accept_bi().await?;
+    let mut reader = ControlReader::new(rx);
+    let peer_name = expect_hello(&conn, reader.next().await?)?;
+    tx.write_all(&encode_control(&hello(name))).await?;
+    Session::new(conn, tx, reader, local, peer_name, false, endpoint)
 }
 
 /// Connects to a listener at `addr`; `name` is this machine's display name sent in Hello.
@@ -326,10 +392,15 @@ impl Session {
         Ok(())
     }
 
-    /// Next datagram from the peer. Cancel-safe.
+    /// Next datagram from the peer. Datagrams that fail to decode are skipped.
+    /// Cancel-safe. An error means the connection is gone.
     pub async fn recv_datagram(&self) -> Result<Datagram> {
-        let b = self.inner.conn.read_datagram().await?;
-        Ok(decode_datagram(&b)?)
+        loop {
+            let b = self.inner.conn.read_datagram().await?;
+            if let Ok(d) = decode_datagram(&b) {
+                return Ok(d);
+            }
+        }
     }
 
     /// Sends one message on the control stream. Not cancel-safe: a cancelled
@@ -340,14 +411,23 @@ impl Session {
         Ok(())
     }
 
-    /// Next control message from the peer. Cancel-safe. A repeated Hello is a
-    /// protocol error (the initial one is consumed by the handshake).
+    /// Next control message from the peer. Cancel-safe.
+    ///
+    /// Any error is fatal: on a framing error, an undecodable message, a
+    /// repeated Hello (the initial one is consumed by the handshake) or a lost
+    /// stream, the connection is closed and the session is dead.
     pub async fn recv_control(&self) -> Result<Control> {
         let mut rx = self.inner.control_rx.lock().await;
-        match rx.next().await? {
-            Control::Hello { .. } => bail!("unexpected Hello after handshake"),
-            c => Ok(c),
+        let result = match rx.next().await {
+            Ok(Control::Hello { .. }) => Err(anyhow!("unexpected Hello after handshake")),
+            other => other,
+        };
+        if result.is_err() {
+            self.inner
+                .conn
+                .close(VarInt::from_u32(CLOSE_PROTOCOL), b"control stream error");
         }
+        result
     }
 
     /// Sends one clipboard item on a fresh unidirectional stream.
@@ -359,11 +439,15 @@ impl Session {
         Ok(())
     }
 
-    /// Next clipboard item from the peer. An item whose encoding exceeds
-    /// `max_bytes` is refused (its stream is stopped); the session stays up.
+    /// Next clipboard item from the peer. `max_bytes` is a content limit (as in
+    /// `clipboard::within_limit`); the wire encoding may exceed it by
+    /// 64 bytes of postcard framing. A larger item is refused (its stream
+    /// is stopped) and returns Err, but unlike the other `recv_*` errors the
+    /// session stays up.
     pub async fn recv_clipboard(&self, max_bytes: u64) -> Result<ClipboardData> {
         let mut s = self.inner.conn.accept_uni().await?;
-        let limit = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+        let wire_limit = max_bytes.saturating_add(CLIPBOARD_FRAMING_ALLOWANCE);
+        let limit = usize::try_from(wire_limit).unwrap_or(usize::MAX);
         match s.read_to_end(limit).await {
             Ok(body) => Ok(postcard::from_bytes(&body)?),
             Err(ReadToEndError::TooLong) => {
@@ -376,7 +460,20 @@ impl Session {
 
     /// Runs the commit-reveal pairing exchange and returns the 6-digit code
     /// both sides must show. The control stream must be otherwise idle.
+    /// Gives up after `PAIR_TIMEOUT`, closing the connection.
     pub async fn pair(&self) -> Result<String> {
+        match timeout(PAIR_TIMEOUT, self.pair_exchange()).await {
+            Ok(result) => result,
+            Err(_) => {
+                self.inner
+                    .conn
+                    .close(VarInt::from_u32(CLOSE_PAIRING), b"pairing timed out");
+                bail!("pairing timed out after {PAIR_TIMEOUT:?}")
+            }
+        }
+    }
+
+    async fn pair_exchange(&self) -> Result<String> {
         let me = &self.inner.local;
         let peer = &self.inner.peer;
         if self.inner.is_connector {
