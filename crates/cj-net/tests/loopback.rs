@@ -746,3 +746,25 @@ async fn stream_limits_are_enforced() {
         "a 5th uni stream must wait for credit"
     );
 }
+
+fn free_udp_port() -> u16 {
+    let s = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+    s.local_addr().unwrap().port()
+}
+
+#[tokio::test]
+async fn broadcast_fallback_finds_responder() {
+    use cj_net::discovery::{Advertiser, discover};
+    let fp = ident().fingerprint();
+    let responder_port = free_udp_port();
+    let _adv = Advertiser::start_responder_only("test-mac", 47800, &fp, responder_port).unwrap();
+    let peers = discover(Duration::from_secs(3), responder_port)
+        .await
+        .unwrap();
+    let found = peers
+        .iter()
+        .find(|p| p.fingerprint == fp)
+        .expect("responder found via broadcast fallback");
+    assert_eq!(found.addr.port(), 47800);
+    assert_eq!(found.name, "test-mac");
+}
