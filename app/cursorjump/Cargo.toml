@@ -1,0 +1,4 @@
+[package]
+name = "cursorjump"
+version.workspace = true
+edition.workspace = true
