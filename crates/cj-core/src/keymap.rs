@@ -18,8 +18,8 @@ pub fn pc_to_mac(k: PcKey, swap_ctrl_cmd: bool) -> Option<u16> {
         // Modifiers
         (0x1D, false) => pick(cmd_l, ctl_l),
         (0x1D, true) => pick(cmd_r, ctl_r),
-        (0x5B, _) => pick(ctl_l, cmd_l),
-        (0x5C, _) => pick(ctl_r, cmd_r),
+        (0x5B, true) => pick(ctl_l, cmd_l),
+        (0x5C, true) => pick(ctl_r, cmd_r),
         (0x38, false) => 0x3A,
         (0x38, true) => 0x3D,
         (0x2A, false) => 0x38, // extended 0x2A is the fake shift around PrintScreen: dropped
@@ -60,7 +60,7 @@ pub fn pc_to_mac(k: PcKey, swap_ctrl_cmd: bool) -> Option<u16> {
         (0x49, false) => 0x5C, // 9
 
         (0x45, false) => 0x71, // Pause -> F15
-        (0x46, _) => 0x6B,     // ScrollLock -> F14
+        (0x46, false) => 0x6B, // ScrollLock -> F14
 
         // Main block (non-extended only)
         (sc, false) => match sc {
