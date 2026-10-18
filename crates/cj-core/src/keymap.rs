@@ -138,8 +138,12 @@ pub fn pc_to_mac(k: PcKey, swap_ctrl_cmd: bool) -> Option<u16> {
 /// Where a key event goes while the cursor is on the Mac.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Route {
+    /// Pass to Windows: the release of a key that was down when the cursor crossed.
     Local,
+    /// Send to the Mac and swallow locally.
     Remote,
+    /// Swallow and send nowhere: an auto-repeat of a key still pending from entry.
+    Drop,
 }
 
 /// Tracks keys that were already down on Windows when the cursor crossed, so
@@ -158,11 +162,17 @@ impl KeyRouter {
         self.held_at_entry = down_now.into_iter().collect();
     }
 
+    /// Low-level hooks cannot tell auto-repeat from a re-press, so a down for a
+    /// key still pending from entry is dropped and the key stays pending; a real
+    /// re-press needs an up first, and that up goes to Windows.
     pub fn route(&mut self, k: PcKey, down: bool) -> Route {
-        if self.held_at_entry.remove(&k) && !down {
-            Route::Local
-        } else {
+        if !self.held_at_entry.contains(&k) {
             Route::Remote
+        } else if down {
+            Route::Drop
+        } else {
+            self.held_at_entry.remove(&k);
+            Route::Local
         }
     }
 
@@ -262,12 +272,23 @@ mod tests {
     }
 
     #[test]
-    fn key_router_repress_without_seeing_up_goes_remote_and_forgets() {
+    fn key_router_down_for_pending_entry_key_drops_and_stays_pending() {
         let mut r = KeyRouter::new();
         r.on_enter_mac([k(0x11, false)]);
+        assert_eq!(r.route(k(0x11, false), true), Route::Drop);
+        assert_eq!(r.route(k(0x11, false), false), Route::Local);
         assert_eq!(r.route(k(0x11, false), true), Route::Remote);
-        assert_eq!(r.route(k(0x11, false), false), Route::Remote);
         assert_eq!(r.route(k(0x12, false), true), Route::Remote);
+    }
+
+    #[test]
+    fn key_router_auto_repeat_of_entry_key_then_up_goes_local() {
+        let mut r = KeyRouter::new();
+        r.on_enter_mac([k(0x11, false)]);
+        let w = k(0x11, false);
+        assert_eq!(r.route(w, true), Route::Drop);
+        assert_eq!(r.route(w, true), Route::Drop);
+        assert_eq!(r.route(w, false), Route::Local);
     }
 
     #[test]

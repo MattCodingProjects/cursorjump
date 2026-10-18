@@ -7,7 +7,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SystemParametersInfoW,
 };
 
-const SYSTEM_CURSORS: [SYSTEM_CURSOR_ID; 14] = [
+/// Not defined as `OCR_*` by the `windows` crate; values match `IDC_PIN` / `IDC_PERSON`.
+const OCR_PIN: SYSTEM_CURSOR_ID = SYSTEM_CURSOR_ID(32671);
+const OCR_PERSON: SYSTEM_CURSOR_ID = SYSTEM_CURSOR_ID(32672);
+
+const SYSTEM_CURSORS: [SYSTEM_CURSOR_ID; 16] = [
     OCR_NORMAL,
     OCR_IBEAM,
     OCR_WAIT,
@@ -22,6 +26,8 @@ const SYSTEM_CURSORS: [SYSTEM_CURSOR_ID; 14] = [
     OCR_HAND,
     OCR_APPSTARTING,
     OCR_HELP,
+    OCR_PIN,
+    OCR_PERSON,
 ];
 
 /// 32x32 monochrome mask: 32 rows of 4 bytes.

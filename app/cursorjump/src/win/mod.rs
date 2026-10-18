@@ -16,7 +16,7 @@ use windows::Win32::UI::HiDpi::{
 };
 
 use cursor::restore_system_cursors;
-use input_thread::{InputCmd, InputMsg, set_raw_key_logging, spawn_input_thread};
+use input_thread::{InputCmd, InputMsg, set_diagnose_logging, spawn_input_thread};
 
 /// Process-wide setup: per-monitor DPI awareness, undo any cursor hiding a
 /// previous crashed run left behind, and restore cursors on panic.
@@ -37,7 +37,7 @@ const MAC_SAFETY: Duration = Duration::from_secs(20);
 /// `--diagnose`: run the input thread with a stub app that logs every message
 /// and simulates crossing on edge pushes and returning on the hotkey.
 pub fn run_diagnose(run_for: Duration) {
-    set_raw_key_logging(true);
+    set_diagnose_logging(true);
     let (cmd_tx, msg_rx) = spawn_input_thread(Config::default());
     info!(
         seconds = run_for.as_secs(),
@@ -115,6 +115,8 @@ impl Diagnose {
                 info!(frac, buttons_held, locked, ?game, "EdgePush");
                 if locked {
                     info!("blocked: game");
+                } else if buttons_held {
+                    info!("blocked: mouse button held");
                 } else if self.on_mac_since.is_none() {
                     self.frac = frac;
                     self.on_mac_since = Some(Instant::now());

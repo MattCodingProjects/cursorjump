@@ -51,11 +51,16 @@ const WATCHDOG: Duration = Duration::from_millis(250);
 /// After an `EdgePush`, further pushes are suppressed until a command arrives or this passes.
 const EDGE_DEBOUNCE: Duration = Duration::from_millis(250);
 
-/// When set, the keyboard hook logs every raw key event (diagnose mode).
-static LOG_RAW_KEYS: AtomicBool = AtomicBool::new(false);
+/// After a failed `EnterMac`, edge pushes are suppressed for this long.
+const ENTER_FAILED_DEBOUNCE: Duration = Duration::from_secs(1);
+/// A single hook move larger than this on either axis is a warp, not motion: dropped.
+const MAX_HOOK_DELTA: i32 = 200;
 
-pub fn set_raw_key_logging(on: bool) {
-    LOG_RAW_KEYS.store(on, Ordering::Relaxed);
+/// When set (diagnose mode), log every raw key event and the entry key snapshot.
+static DIAGNOSE_LOG: AtomicBool = AtomicBool::new(false);
+
+pub fn set_diagnose_logging(on: bool) {
+    DIAGNOSE_LOG.store(on, Ordering::Relaxed);
 }
 
 /// Input thread → app.
@@ -130,15 +135,24 @@ pub fn spawn_input_thread(
     (cmd_tx, msg_rx)
 }
 
+/// Forwards commands and wakes the input thread. A failed wake (e.g. a full
+/// queue) is not fatal: the command stays queued and the next wake drains it.
 fn relay_commands(from: mpsc::Receiver<InputCmd>, to: mpsc::Sender<InputCmd>, tid: u32) {
-    let wake = || unsafe { PostThreadMessageW(tid, WM_APP, WPARAM(0), LPARAM(0)) }.is_ok();
-    for cmd in from {
-        if to.send(cmd).is_err() || !wake() {
-            return;
+    let wake = || {
+        if let Err(e) = unsafe { PostThreadMessageW(tid, WM_APP, WPARAM(0), LPARAM(0)) } {
+            warn!("input thread wake failed (will retry on the next command): {e}");
         }
+    };
+    for cmd in from {
+        if to.send(cmd).is_err() {
+            return; // The input thread is gone.
+        }
+        wake();
     }
-    let _ = to.send(InputCmd::Quit);
-    wake();
+    // Skip the wake if the input thread has already gone (it drops its receiver first).
+    if to.send(InputCmd::Quit).is_ok() {
+        wake();
+    }
 }
 
 struct Hooks {
@@ -149,10 +163,35 @@ struct Hooks {
 /// Present only while the cursor is on the Mac.
 struct MacStay {
     hooks: Hooks,
+    /// Where the cursor is parked (read back after SetCursorPos).
     center: (i32, i32),
     entered_at: Instant,
     last_hook_motion: Instant,
     hook_lost_sent: bool,
+}
+
+impl MacStay {
+    fn new(hooks: Hooks, center: (i32, i32), now: Instant) -> Self {
+        MacStay {
+            hooks,
+            center,
+            entered_at: now,
+            last_hook_motion: now,
+            hook_lost_sent: false,
+        }
+    }
+
+    /// Watchdog decision for one raw-input packet: true (once per stay) when raw
+    /// input moved but the mouse hook has seen nothing for `WATCHDOG`, outside
+    /// the first `WATCHDOG` after entry.
+    fn watchdog_trips(&mut self, moved: bool, now: Instant) -> bool {
+        let trips = moved
+            && !self.hook_lost_sent
+            && now.saturating_duration_since(self.entered_at) > WATCHDOG
+            && now.saturating_duration_since(self.last_hook_motion) > WATCHDOG;
+        self.hook_lost_sent |= trips;
+        trips
+    }
 }
 
 struct State {
@@ -160,7 +199,10 @@ struct State {
     out: crossbeam_channel::Sender<InputMsg>,
     edge: Option<Rect>,
     mac: Option<MacStay>,
+    /// Debounce after an `EdgePush`; cleared by any command.
     edge_quiet_until: Option<Instant>,
+    /// Debounce after a failed `EnterMac`; not cleared by commands.
+    enter_failed_until: Option<Instant>,
     router: KeyRouter,
     /// Physical keys currently held, for the return hotkey.
     held: HashSet<PcKey>,
@@ -199,17 +241,7 @@ fn run(
     }
     let edge = edge_monitor(&monitors(), cfg.mac_side);
     info!(?edge, side = ?cfg.mac_side, "input thread: edge monitor");
-    STATE.with(|cell| {
-        *cell.borrow_mut() = Some(State {
-            cfg,
-            out,
-            edge,
-            mac: None,
-            edge_quiet_until: None,
-            router: KeyRouter::new(),
-            held: HashSet::with_capacity(32),
-        })
-    });
+    STATE.with(|cell| *cell.borrow_mut() = Some(State::new(cfg, out, edge)));
 
     if ready.send(unsafe { GetCurrentThreadId() }).is_ok() {
         message_loop(&cmds);
@@ -217,6 +249,9 @@ fn run(
 
     with_state(State::shutdown);
     let _ = unsafe { DestroyWindow(hwnd) };
+    // Close the command channel before the message channel, so the relay never
+    // tries to wake a thread the app already knows has stopped.
+    drop(cmds);
     info!("input thread: stopped");
     // Dropping the state drops the message sender, which tells the app we are done.
     STATE.with(|cell| cell.borrow_mut().take());
@@ -230,11 +265,14 @@ fn message_loop(cmds: &mpsc::Receiver<InputCmd>) {
             return;
         }
         if msg.hwnd.is_invalid() && msg.message == WM_APP {
-            while let Ok(cmd) = cmds.try_recv() {
-                if matches!(cmd, InputCmd::Quit) {
-                    return;
+            loop {
+                match cmds.try_recv() {
+                    Ok(InputCmd::Quit) | Err(mpsc::TryRecvError::Disconnected) => return,
+                    Ok(cmd) => {
+                        with_state(|s| s.on_command(cmd));
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
                 }
-                with_state(|s| s.on_command(cmd));
             }
             continue;
         }
@@ -243,6 +281,19 @@ fn message_loop(cmds: &mpsc::Receiver<InputCmd>) {
 }
 
 impl State {
+    fn new(cfg: Config, out: crossbeam_channel::Sender<InputMsg>, edge: Option<Rect>) -> Self {
+        State {
+            cfg,
+            out,
+            edge,
+            mac: None,
+            edge_quiet_until: None,
+            enter_failed_until: None,
+            router: KeyRouter::new(),
+            held: HashSet::with_capacity(32),
+        }
+    }
+
     fn send(&self, msg: InputMsg) {
         let _ = self.out.send(msg);
     }
@@ -279,62 +330,81 @@ impl State {
         }
         let Some(edge) = self.edge else {
             warn!("EnterMac refused: no edge monitor");
-            self.send(InputMsg::Edge(PcEvent::HookLost));
+            self.enter_failed();
             return;
         };
         let down = keys_down_now();
-        self.router.on_enter_mac(down.iter().copied());
-        self.held.clear();
-        self.held.extend(down.iter().copied());
+        if DIAGNOSE_LOG.load(Ordering::Relaxed) {
+            info!(?down, "entry snapshot: keys held");
+        }
+        self.seed_entry_keys(&down);
 
+        // Hide first and park before the hooks exist so the cursor never flashes
+        // or jumps; park again in case it moved while the hooks were installed.
+        hide_system_cursors();
+        let target = rect_center(&edge);
+        park_cursor(target);
         let hooks = match install_hooks() {
             Ok(h) => h,
             Err(e) => {
                 error!("hooks: install failed: {e}");
+                restore_system_cursors();
                 self.router.clear();
                 self.held.clear();
-                self.send(InputMsg::Edge(PcEvent::HookLost));
+                self.enter_failed();
                 return;
             }
         };
         info!(keys_held = down.len(), "hooks: installed");
+        park_cursor(target);
+        let center = cursor_pos().unwrap_or(target);
+        if center != target {
+            debug!(
+                ?target,
+                ?center,
+                "parked cursor landed elsewhere; adopting it"
+            );
+        }
+        self.mac = Some(MacStay::new(hooks, center, Instant::now()));
+    }
 
-        let center = rect_center(&edge);
-        park_cursor(center);
-        hide_system_cursors();
-        let now = Instant::now();
-        self.mac = Some(MacStay {
-            hooks,
-            center,
-            entered_at: now,
-            last_hook_motion: now,
-            hook_lost_sent: false,
-        });
+    /// Keys already down at entry: their releases go to Windows, and they count
+    /// towards the return hotkey.
+    fn seed_entry_keys(&mut self, down: &[PcKey]) {
+        self.router.on_enter_mac(down.iter().copied());
+        self.held.clear();
+        self.held.extend(down.iter().copied());
+    }
+
+    /// Tell the app the crossing failed and keep the edge quiet for a while.
+    fn enter_failed(&mut self) {
+        self.enter_failed_until = Some(Instant::now() + ENTER_FAILED_DEBOUNCE);
+        self.send(InputMsg::Edge(PcEvent::HookLost));
     }
 
     fn return_to_pc(&mut self, pc_frac: f32) {
-        if !self.leave_mac() {
+        // Position the cursor before the cursors reappear, so it never shows at the centre.
+        let target = self
+            .edge
+            .map(|edge| point_on_edge(&edge, self.cfg.mac_side, pc_frac, 2));
+        if !self.leave_mac(target) {
             debug!("ReturnToPc ignored: already on the PC");
-            return;
-        }
-        match self.edge {
-            Some(edge) => {
-                let (x, y) = point_on_edge(&edge, self.cfg.mac_side, pc_frac, 2);
-                if let Err(e) = unsafe { SetCursorPos(x, y) } {
-                    warn!("SetCursorPos on return failed: {e}");
-                }
-            }
-            None => warn!("ReturnToPc: no edge monitor; cursor left where it was"),
+        } else if target.is_none() {
+            warn!("ReturnToPc: no edge monitor; cursor left where it was");
         }
     }
 
-    /// Remove hooks, restore cursors and forget held keys. False if not on the Mac.
-    fn leave_mac(&mut self) -> bool {
+    /// Remove hooks, move the cursor to `park_at`, restore cursors and forget
+    /// held keys. False if not on the Mac.
+    fn leave_mac(&mut self, park_at: Option<(i32, i32)>) -> bool {
         let Some(stay) = self.mac.take() else {
             return false;
         };
         remove_hooks(stay.hooks);
         info!("hooks: removed");
+        if let Some(pt) = park_at {
+            park_cursor(pt);
+        }
         restore_system_cursors();
         self.router.clear();
         self.held.clear();
@@ -342,7 +412,7 @@ impl State {
     }
 
     fn shutdown(&mut self) {
-        self.leave_mac();
+        self.leave_mac(None);
         restore_system_cursors();
     }
 
@@ -351,34 +421,34 @@ impl State {
         let moved = dx != 0 || dy != 0;
         let now = Instant::now();
         if let Some(stay) = &mut self.mac {
-            if moved
-                && !stay.hook_lost_sent
-                && now.duration_since(stay.entered_at) > WATCHDOG
-                && now.duration_since(stay.last_hook_motion) > WATCHDOG
-            {
-                stay.hook_lost_sent = true;
+            if stay.watchdog_trips(moved, now) {
                 warn!("watchdog: raw motion but no mouse hook events; hook lost");
                 self.send(InputMsg::Edge(PcEvent::HookLost));
+                return;
+            }
+            // Something other than our swallowed input moved the cursor: re-park.
+            if moved && cursor_pos().is_some_and(|p| p != stay.center) {
+                park_cursor(stay.center);
             }
             return;
         }
-        if !moved || self.edge_quiet_until.is_some_and(|t| now < t) {
+        let quiet = |until: Option<Instant>| until.is_some_and(|t| now < t);
+        if !moved || quiet(self.edge_quiet_until) || quiet(self.enter_failed_until) {
             return;
         }
         let Some(edge) = self.edge else {
             return;
         };
-        let mut pt = POINT::default();
-        if unsafe { GetCursorPos(&mut pt) }.is_err() {
+        let Some((x, y)) = cursor_pos() else {
             return;
-        }
+        };
         let side = self.cfg.mac_side;
-        if !is_pushing_out(&edge, side, pt.x, pt.y, dx, dy) {
+        if !is_pushing_out(&edge, side, x, y, dx, dy) {
             return;
         }
         self.edge_quiet_until = Some(now + EDGE_DEBOUNCE);
         self.send(InputMsg::Edge(PcEvent::EdgePush {
-            frac: edge_frac(&edge, side, pt.x, pt.y),
+            frac: edge_frac(&edge, side, x, y),
             game: probe_game(),
             buttons_held: mouse_buttons_held(),
         }));
@@ -397,6 +467,9 @@ impl State {
                 stay.last_hook_motion = Instant::now();
                 let (dx, dy) = (info.pt.x - stay.center.0, info.pt.y - stay.center.1);
                 if dx == 0 && dy == 0 {
+                    None
+                } else if dx.abs() > MAX_HOOK_DELTA || dy.abs() > MAX_HOOK_DELTA {
+                    debug!(dx, dy, "hook: dropped oversized move");
                     None
                 } else {
                     let (dx, dy) = scale_motion(dx, dy, self.cfg.pointer_speed);
@@ -447,7 +520,7 @@ impl State {
             return false;
         }
         let down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
-        if LOG_RAW_KEYS.load(Ordering::Relaxed) {
+        if DIAGNOSE_LOG.load(Ordering::Relaxed) {
             info!(
                 "key raw: vk={:#04x} scan={:#04x} flags={:#04x} down={down}",
                 info.vkCode, info.scanCode, info.flags.0
@@ -471,6 +544,7 @@ impl State {
         }
         match self.router.route(k, down) {
             Route::Local => false,
+            Route::Drop => true,
             Route::Remote => {
                 if let Some(mac_keycode) = pc_to_mac(k, self.cfg.swap_ctrl_cmd) {
                     self.send(InputMsg::Key { mac_keycode, down });
@@ -629,6 +703,12 @@ fn rect_center(r: &Rect) -> (i32, i32) {
     ((r.left + r.right) / 2, (r.top + r.bottom) / 2)
 }
 
+fn cursor_pos() -> Option<(i32, i32)> {
+    let mut pt = POINT::default();
+    // SAFETY: valid out-pointer to a stack local.
+    unsafe { GetCursorPos(&mut pt) }.ok().map(|()| (pt.x, pt.y))
+}
+
 fn park_cursor((x, y): (i32, i32)) {
     if let Err(e) = unsafe { SetCursorPos(x, y) } {
         warn!("SetCursorPos({x}, {y}) failed: {e}");
@@ -649,15 +729,287 @@ fn mouse_buttons_held() -> bool {
 /// Physical keys down right now. Skips the generic VK_SHIFT/CONTROL/MENU
 /// (0x10..=0x12) in favour of their left/right forms; mouse VKs lie below 0x08.
 fn keys_down_now() -> Vec<PcKey> {
-    (0x08u16..=0xFE)
-        .filter(|vk| !(0x10..=0x12).contains(vk) && is_down(*vk))
-        .filter_map(|vk| {
-            // SAFETY: MapVirtualKeyW has no preconditions.
-            let sc = unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC_EX) };
-            (sc != 0).then_some(PcKey {
-                scancode: (sc & 0xFF) as u16,
-                extended: matches!((sc >> 8) & 0xFF, 0xE0 | 0xE1),
-            })
-        })
-        .collect()
+    let mut out = Vec::new();
+    for vk in (0x08u16..=0xFE).filter(|vk| !(0x10..=0x12).contains(vk) && is_down(*vk)) {
+        // SAFETY: MapVirtualKeyW has no preconditions.
+        let sc = unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC_EX) };
+        out.extend(entry_keys(vk, sc));
+    }
+    out
+}
+
+/// VKs whose key can reach the hook either with or without LLKHF_EXTENDED
+/// (Enter vs numpad Enter, numpad digits/decimal vs the navigation cluster).
+fn is_ambiguous_vk(vk: u16) -> bool {
+    matches!(vk,
+        0x0D // VK_RETURN
+        | 0x21..=0x28 // VK_PRIOR, NEXT, END, HOME, LEFT, UP, RIGHT, DOWN
+        | 0x2D | 0x2E // VK_INSERT, VK_DELETE
+        | 0x60..=0x69 // VK_NUMPAD0..9
+        | 0x6E // VK_DECIMAL
+    )
+}
+
+/// The hook-form PcKey(s) for a held VK, given `MapVirtualKeyW(vk, MAPVK_VK_TO_VSC_EX)`.
+fn entry_keys(vk: u16, sc: u32) -> impl Iterator<Item = PcKey> {
+    let (first, second) = match sc >> 8 {
+        _ if sc == 0 => (None, None),
+        // E1-prefixed (Pause): the hook reports it as 0x45, not extended.
+        0xE1 => (
+            Some(PcKey {
+                scancode: 0x45,
+                extended: false,
+            }),
+            None,
+        ),
+        prefix => {
+            let scancode = (sc & 0xFF) as u16;
+            let extended = prefix == 0xE0;
+            let k = PcKey { scancode, extended };
+            let twin = is_ambiguous_vk(vk).then_some(PcKey {
+                scancode,
+                extended: !extended,
+            });
+            (Some(k), twin)
+        }
+    };
+    first.into_iter().chain(second)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::UI::WindowsAndMessaging::{KBDLLHOOKSTRUCT_FLAGS, WM_KEYUP};
+
+    const CENTER: (i32, i32) = (960, 540);
+    const W: PcKey = PcKey {
+        scancode: 0x11,
+        extended: false,
+    };
+    const LCTRL: PcKey = PcKey {
+        scancode: 0x1D,
+        extended: false,
+    };
+    const LALT: PcKey = PcKey {
+        scancode: 0x38,
+        extended: false,
+    };
+
+    fn dummy_hooks() -> Hooks {
+        Hooks {
+            mouse: HHOOK::default(),
+            keyboard: HHOOK::default(),
+        }
+    }
+
+    /// A state that is "on the Mac" with dummy hook handles (never unhooked).
+    fn on_mac(entry_keys: &[PcKey]) -> (State, crossbeam_channel::Receiver<InputMsg>) {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut s = State::new(Config::default(), tx, None);
+        s.seed_entry_keys(entry_keys);
+        s.mac = Some(MacStay::new(dummy_hooks(), CENTER, Instant::now()));
+        (s, rx)
+    }
+
+    /// Feeds one keyboard-hook event; true = swallowed.
+    fn key(s: &mut State, k: PcKey, down: bool) -> bool {
+        let flags = if k.extended {
+            LLKHF_EXTENDED
+        } else {
+            KBDLLHOOKSTRUCT_FLAGS(0)
+        };
+        let info = KBDLLHOOKSTRUCT {
+            scanCode: k.scancode as u32,
+            flags,
+            ..Default::default()
+        };
+        s.on_key_hook(if down { WM_KEYDOWN } else { WM_KEYUP }, &info)
+    }
+
+    fn drain(rx: &crossbeam_channel::Receiver<InputMsg>) -> Vec<InputMsg> {
+        rx.try_iter().collect()
+    }
+
+    #[test]
+    fn key_hook_auto_repeat_of_entry_key_then_up_reaches_windows() {
+        let (mut s, rx) = on_mac(&[W]);
+        assert!(key(&mut s, W, true), "repeat-down swallowed");
+        assert!(key(&mut s, W, true), "repeat-down swallowed");
+        assert!(!key(&mut s, W, false), "up passes to Windows");
+        assert!(drain(&rx).is_empty(), "nothing sent to the Mac");
+        // A fresh press afterwards goes to the Mac.
+        assert!(key(&mut s, W, true));
+        assert!(matches!(
+            drain(&rx)[..],
+            [InputMsg::Key {
+                mac_keycode: 0x0D,
+                down: true
+            }]
+        ));
+    }
+
+    #[test]
+    fn key_hook_remote_key_is_swallowed_and_sent() {
+        let (mut s, rx) = on_mac(&[]);
+        assert!(key(&mut s, W, true));
+        assert!(key(&mut s, W, false));
+        assert!(matches!(
+            drain(&rx)[..],
+            [
+                InputMsg::Key {
+                    mac_keycode: 0x0D,
+                    down: true
+                },
+                InputMsg::Key {
+                    mac_keycode: 0x0D,
+                    down: false
+                }
+            ]
+        ));
+    }
+
+    #[test]
+    fn key_hook_return_hotkey_is_swallowed_and_reported() {
+        let home = PcKey {
+            scancode: 0x47,
+            extended: true,
+        };
+        let (mut s, rx) = on_mac(&[]);
+        key(&mut s, LCTRL, true);
+        key(&mut s, LALT, true);
+        drain(&rx);
+        assert!(key(&mut s, home, true));
+        assert!(matches!(
+            drain(&rx)[..],
+            [InputMsg::Edge(PcEvent::ReturnHotkey)]
+        ));
+    }
+
+    #[test]
+    fn key_hook_hotkey_works_with_modifiers_held_since_entry() {
+        let home = PcKey {
+            scancode: 0x47,
+            extended: true,
+        };
+        let (mut s, rx) = on_mac(&[LCTRL, LALT]);
+        // Auto-repeats of the entry-held modifiers are dropped...
+        assert!(key(&mut s, LCTRL, true));
+        assert!(drain(&rx).is_empty());
+        // ...but still count towards the hotkey.
+        assert!(key(&mut s, home, true));
+        assert!(matches!(
+            drain(&rx)[..],
+            [InputMsg::Edge(PcEvent::ReturnHotkey)]
+        ));
+    }
+
+    #[test]
+    fn key_hook_scancode_zero_is_swallowed_silently() {
+        let (mut s, rx) = on_mac(&[]);
+        let zero = PcKey {
+            scancode: 0,
+            extended: false,
+        };
+        assert!(key(&mut s, zero, true));
+        assert!(drain(&rx).is_empty());
+    }
+
+    #[test]
+    fn key_hook_passes_through_on_the_pc() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut s = State::new(Config::default(), tx, None);
+        assert!(!key(&mut s, W, true));
+        assert!(drain(&rx).is_empty());
+    }
+
+    #[test]
+    fn mouse_hook_sends_motion_and_drops_oversized_moves() {
+        let (mut s, rx) = on_mac(&[]);
+        let mv = |dx: i32, dy: i32| MSLLHOOKSTRUCT {
+            pt: POINT {
+                x: CENTER.0 + dx,
+                y: CENTER.1 + dy,
+            },
+            ..Default::default()
+        };
+        assert!(s.on_mouse_hook(WM_MOUSEMOVE, &mv(5, -3)));
+        assert!(s.on_mouse_hook(WM_MOUSEMOVE, &mv(201, 0)));
+        assert!(s.on_mouse_hook(WM_MOUSEMOVE, &mv(0, -201)));
+        assert!(s.on_mouse_hook(WM_MOUSEMOVE, &mv(200, -200)));
+        assert!(s.on_mouse_hook(WM_MOUSEMOVE, &mv(0, 0)));
+        assert!(matches!(
+            drain(&rx)[..],
+            [
+                InputMsg::Motion { dx: 5, dy: -3 },
+                InputMsg::Motion { dx: 200, dy: -200 }
+            ]
+        ));
+    }
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    #[test]
+    fn watchdog_quiet_during_grace_after_entry() {
+        let t0 = Instant::now();
+        let mut stay = MacStay::new(dummy_hooks(), CENTER, t0);
+        assert!(!stay.watchdog_trips(true, t0 + ms(200)));
+    }
+
+    #[test]
+    fn watchdog_trips_once_when_hook_is_silent() {
+        let t0 = Instant::now();
+        let mut stay = MacStay::new(dummy_hooks(), CENTER, t0);
+        assert!(stay.watchdog_trips(true, t0 + ms(300)));
+        assert!(
+            !stay.watchdog_trips(true, t0 + ms(400)),
+            "only once per stay"
+        );
+    }
+
+    #[test]
+    fn watchdog_quiet_when_hook_saw_motion_recently() {
+        let t0 = Instant::now();
+        let mut stay = MacStay::new(dummy_hooks(), CENTER, t0);
+        stay.last_hook_motion = t0 + ms(200);
+        assert!(!stay.watchdog_trips(true, t0 + ms(300)));
+        assert!(stay.watchdog_trips(true, t0 + ms(500)));
+    }
+
+    #[test]
+    fn watchdog_ignores_raw_packets_without_motion() {
+        let t0 = Instant::now();
+        let mut stay = MacStay::new(dummy_hooks(), CENTER, t0);
+        assert!(!stay.watchdog_trips(false, t0 + ms(1000)));
+    }
+
+    fn keys(vk: u16, sc: u32) -> Vec<PcKey> {
+        entry_keys(vk, sc).collect()
+    }
+
+    fn pk(scancode: u16, extended: bool) -> PcKey {
+        PcKey { scancode, extended }
+    }
+
+    #[test]
+    fn entry_keys_pause_is_plain_0x45() {
+        assert_eq!(keys(0x13, 0xE11D), [pk(0x45, false)]);
+    }
+
+    #[test]
+    fn entry_keys_ambiguous_vks_seed_both_forms() {
+        assert_eq!(keys(0x24, 0xE047), [pk(0x47, true), pk(0x47, false)]); // Home
+        assert_eq!(keys(0x0D, 0x1C), [pk(0x1C, false), pk(0x1C, true)]); // Enter
+        assert_eq!(keys(0x67, 0x47), [pk(0x47, false), pk(0x47, true)]); // Numpad 7
+        assert_eq!(keys(0x6E, 0x53), [pk(0x53, false), pk(0x53, true)]); // Decimal
+        assert_eq!(keys(0x2E, 0xE053), [pk(0x53, true), pk(0x53, false)]); // Delete
+    }
+
+    #[test]
+    fn entry_keys_plain_and_unmapped() {
+        assert_eq!(keys(0x57, 0x11), [pk(0x11, false)]); // W
+        assert_eq!(keys(0xA3, 0xE01D), [pk(0x1D, true)]); // Right Ctrl
+        assert!(keys(0xFF, 0).is_empty());
+    }
 }
