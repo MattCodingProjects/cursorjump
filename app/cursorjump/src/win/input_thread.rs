@@ -8,6 +8,7 @@
 //! procedure run on this same thread, so no locks are needed.
 use std::cell::RefCell;
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -20,7 +21,8 @@ use cj_core::pc_state::PcEvent;
 use cj_core::proto::MouseButton;
 use tracing::{debug, error, info, warn};
 use windows::Win32::Foundation::{
-    ERROR_CLASS_ALREADY_EXISTS, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM,
+    ERROR_CLASS_ALREADY_EXISTS, ERROR_INVALID_THREAD_ID, HINSTANCE, HWND, LPARAM, LRESULT, POINT,
+    WPARAM,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
@@ -53,6 +55,9 @@ const EDGE_DEBOUNCE: Duration = Duration::from_millis(250);
 
 /// After a failed `EnterMac`, edge pushes are suppressed for this long.
 const ENTER_FAILED_DEBOUNCE: Duration = Duration::from_secs(1);
+/// A failed wake-up is retried every `WAKE_RETRY_STEP` for up to `WAKE_RETRY_LIMIT`.
+const WAKE_RETRY_STEP: Duration = Duration::from_millis(10);
+const WAKE_RETRY_LIMIT: Duration = Duration::from_secs(1);
 /// A single hook move larger than this on either axis is a warp, not motion: dropped.
 const MAX_HOOK_DELTA: i32 = 200;
 
@@ -115,10 +120,14 @@ pub fn spawn_input_thread(
     let (cmd_tx, cmd_rx) = mpsc::channel::<InputCmd>();
     let (relay_tx, relay_rx) = mpsc::channel::<InputCmd>();
     let (ready_tx, ready_rx) = mpsc::sync_channel::<u32>(1);
+    // Cleared by the input thread when it drops `relay_rx`; std's Sender cannot
+    // report disconnection on its own, and the wake retry needs to know.
+    let receiver_alive = Arc::new(AtomicBool::new(true));
+    let alive = receiver_alive.clone();
 
     std::thread::Builder::new()
         .name("cj-input".into())
-        .spawn(move || run(cfg, msg_tx, relay_rx, ready_tx))
+        .spawn(move || run(cfg, msg_tx, relay_rx, alive, ready_tx))
         .expect("spawn input thread");
 
     // The thread reports its id once its window (and so its message queue)
@@ -127,7 +136,7 @@ pub fn spawn_input_thread(
         Ok(tid) => {
             std::thread::Builder::new()
                 .name("cj-input-cmd".into())
-                .spawn(move || relay_commands(cmd_rx, relay_tx, tid))
+                .spawn(move || relay_commands(cmd_rx, relay_tx, &receiver_alive, tid))
                 .expect("spawn input command relay");
         }
         Err(_) => error!("input thread failed to start"),
@@ -135,13 +144,17 @@ pub fn spawn_input_thread(
     (cmd_tx, msg_rx)
 }
 
-/// Forwards commands and wakes the input thread. A failed wake (e.g. a full
-/// queue) is not fatal: the command stays queued and the next wake drains it.
-fn relay_commands(from: mpsc::Receiver<InputCmd>, to: mpsc::Sender<InputCmd>, tid: u32) {
+/// Forwards commands and wakes the input thread, retrying a failed wake so a
+/// command such as `ReturnToPc` is never stranded in the queue.
+fn relay_commands(
+    from: mpsc::Receiver<InputCmd>,
+    to: mpsc::Sender<InputCmd>,
+    receiver_alive: &AtomicBool,
+    tid: u32,
+) {
     let wake = || {
-        if let Err(e) = unsafe { PostThreadMessageW(tid, WM_APP, WPARAM(0), LPARAM(0)) } {
-            warn!("input thread wake failed (will retry on the next command): {e}");
-        }
+        let post = || unsafe { PostThreadMessageW(tid, WM_APP, WPARAM(0), LPARAM(0)) };
+        wake_with_retry(post, receiver_alive, WAKE_RETRY_STEP, WAKE_RETRY_LIMIT)
     };
     for cmd in from {
         if to.send(cmd).is_err() {
@@ -152,6 +165,53 @@ fn relay_commands(from: mpsc::Receiver<InputCmd>, to: mpsc::Sender<InputCmd>, ti
     // Skip the wake if the input thread has already gone (it drops its receiver first).
     if to.send(InputCmd::Quit).is_ok() {
         wake();
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum WakeOutcome {
+    Woken,
+    ThreadGone,
+    ReceiverGone,
+    GaveUp,
+}
+
+/// Call `post` until it succeeds, retrying every `step` for up to `limit`.
+/// Stops early when the thread id is invalid or the receiver has been dropped.
+fn wake_with_retry(
+    mut post: impl FnMut() -> windows::core::Result<()>,
+    receiver_alive: &AtomicBool,
+    step: Duration,
+    limit: Duration,
+) -> WakeOutcome {
+    let started = Instant::now();
+    let mut retried = false;
+    loop {
+        let e = match post() {
+            Ok(()) => {
+                if retried {
+                    info!("input thread wake succeeded after retrying");
+                }
+                return WakeOutcome::Woken;
+            }
+            Err(e) => e,
+        };
+        if e.code() == ERROR_INVALID_THREAD_ID.to_hresult() {
+            debug!("input thread gone; not waking it");
+            return WakeOutcome::ThreadGone;
+        }
+        if !receiver_alive.load(Ordering::Acquire) {
+            return WakeOutcome::ReceiverGone;
+        }
+        if started.elapsed() >= limit {
+            error!("input thread wake failed for {limit:?}; giving up: {e}");
+            return WakeOutcome::GaveUp;
+        }
+        if !retried {
+            warn!("input thread wake failed, retrying: {e}");
+            retried = true;
+        }
+        std::thread::sleep(step);
     }
 }
 
@@ -206,6 +266,9 @@ struct State {
     router: KeyRouter,
     /// Physical keys currently held, for the return hotkey.
     held: HashSet<PcKey>,
+    /// Entry keys seeded only as the other form of an ambiguous key; forgotten
+    /// together with their partner so the key's first press on the Mac is kept.
+    entry_twins: HashSet<PcKey>,
 }
 
 thread_local! {
@@ -225,6 +288,7 @@ fn run(
     cfg: Config,
     out: crossbeam_channel::Sender<InputMsg>,
     cmds: mpsc::Receiver<InputCmd>,
+    receiver_alive: Arc<AtomicBool>,
     ready: mpsc::SyncSender<u32>,
 ) {
     let hwnd = match create_window() {
@@ -251,6 +315,7 @@ fn run(
     let _ = unsafe { DestroyWindow(hwnd) };
     // Close the command channel before the message channel, so the relay never
     // tries to wake a thread the app already knows has stopped.
+    receiver_alive.store(false, Ordering::Release);
     drop(cmds);
     info!("input thread: stopped");
     // Dropping the state drops the message sender, which tells the app we are done.
@@ -291,6 +356,7 @@ impl State {
             enter_failed_until: None,
             router: KeyRouter::new(),
             held: HashSet::with_capacity(32),
+            entry_twins: HashSet::with_capacity(8),
         }
     }
 
@@ -318,8 +384,7 @@ impl State {
         }
         self.edge = edge;
         if let (Some(stay), Some(edge)) = (&mut self.mac, edge) {
-            stay.center = rect_center(&edge);
-            park_cursor(stay.center);
+            stay.center = park_and_read_back(rect_center(&edge));
         }
     }
 
@@ -333,14 +398,15 @@ impl State {
             self.enter_failed();
             return;
         };
-        let down = keys_down_now();
+        let snapshot = keys_down_now();
         if DIAGNOSE_LOG.load(Ordering::Relaxed) {
-            info!(?down, "entry snapshot: keys held");
+            info!(keys = ?snapshot.keys, twins = ?snapshot.twins, "entry snapshot: keys held");
         }
-        self.seed_entry_keys(&down);
+        self.seed_entry_keys(&snapshot);
 
         // Hide first and park before the hooks exist so the cursor never flashes
         // or jumps; park again in case it moved while the hooks were installed.
+        let before = cursor_pos();
         hide_system_cursors();
         let target = rect_center(&edge);
         park_cursor(target);
@@ -348,32 +414,58 @@ impl State {
             Ok(h) => h,
             Err(e) => {
                 error!("hooks: install failed: {e}");
+                // Undo the park, then show the cursors again.
+                if let Some(pt) = before {
+                    park_cursor(pt);
+                }
                 restore_system_cursors();
-                self.router.clear();
-                self.held.clear();
+                self.forget_entry_keys();
                 self.enter_failed();
                 return;
             }
         };
-        info!(keys_held = down.len(), "hooks: installed");
-        park_cursor(target);
-        let center = cursor_pos().unwrap_or(target);
-        if center != target {
-            debug!(
-                ?target,
-                ?center,
-                "parked cursor landed elsewhere; adopting it"
-            );
-        }
+        info!(keys_held = snapshot.keys.len(), "hooks: installed");
+        let center = park_and_read_back(target);
         self.mac = Some(MacStay::new(hooks, center, Instant::now()));
     }
 
     /// Keys already down at entry: their releases go to Windows, and they count
     /// towards the return hotkey.
-    fn seed_entry_keys(&mut self, down: &[PcKey]) {
-        self.router.on_enter_mac(down.iter().copied());
+    fn seed_entry_keys(&mut self, snap: &EntrySnapshot) {
+        let all = || snap.keys.iter().chain(&snap.twins).copied();
+        self.router.on_enter_mac(all());
         self.held.clear();
-        self.held.extend(down.iter().copied());
+        self.held.extend(all());
+        self.entry_twins.clear();
+        // A twin is a guess only if exactly one held VK produced it and no held VK
+        // maps to it directly. Two held VKs on one scancode (e.g. VK_HOME and
+        // VK_NUMPAD7) mean both physical keys are down, so neither form is a guess.
+        let twin_only = snap.twins.iter().filter(|t| {
+            !snap.keys.contains(t) && snap.twins.iter().filter(|u| u == t).count() == 1
+        });
+        self.entry_twins.extend(twin_only.copied());
+    }
+
+    fn forget_entry_keys(&mut self) {
+        self.router.clear();
+        self.held.clear();
+        self.entry_twins.clear();
+    }
+
+    /// After `k`'s release went to Windows: if `k` was seeded as one of an
+    /// ambiguous key's two forms, forget the other form too.
+    fn forget_twin(&mut self, k: PcKey) {
+        let twin = PcKey {
+            extended: !k.extended,
+            ..k
+        };
+        let k_was_twin = self.entry_twins.remove(&k);
+        let partner_was_twin = self.entry_twins.remove(&twin);
+        if k_was_twin || partner_was_twin {
+            // A pending key's up only forgets it; the Route is irrelevant here.
+            let _ = self.router.route(twin, false);
+            self.held.remove(&twin);
+        }
     }
 
     /// Tell the app the crossing failed and keep the edge quiet for a while.
@@ -406,8 +498,7 @@ impl State {
             park_cursor(pt);
         }
         restore_system_cursors();
-        self.router.clear();
-        self.held.clear();
+        self.forget_entry_keys();
         true
     }
 
@@ -543,7 +634,10 @@ impl State {
             return true;
         }
         match self.router.route(k, down) {
-            Route::Local => false,
+            Route::Local => {
+                self.forget_twin(k);
+                false
+            }
             Route::Drop => true,
             Route::Remote => {
                 if let Some(mac_keycode) = pc_to_mac(k, self.cfg.swap_ctrl_cmd) {
@@ -709,6 +803,21 @@ fn cursor_pos() -> Option<(i32, i32)> {
     unsafe { GetCursorPos(&mut pt) }.ok().map(|()| (pt.x, pt.y))
 }
 
+/// Park at `target` and return where the cursor actually is (Windows may
+/// clamp or adjust it); that position is what hook deltas are measured from.
+fn park_and_read_back(target: (i32, i32)) -> (i32, i32) {
+    park_cursor(target);
+    let actual = cursor_pos().unwrap_or(target);
+    if actual != target {
+        debug!(
+            ?target,
+            ?actual,
+            "parked cursor landed elsewhere; adopting it"
+        );
+    }
+    actual
+}
+
 fn park_cursor((x, y): (i32, i32)) {
     if let Err(e) = unsafe { SetCursorPos(x, y) } {
         warn!("SetCursorPos({x}, {y}) failed: {e}");
@@ -726,16 +835,27 @@ fn mouse_buttons_held() -> bool {
         .any(|vk| is_down(vk.0))
 }
 
+/// Keys down when crossing, in the forms the keyboard hook reports.
+#[derive(Debug, Default)]
+struct EntrySnapshot {
+    /// One form per held VK.
+    keys: Vec<PcKey>,
+    /// The other form of ambiguous VKs (see `is_ambiguous_vk`).
+    twins: Vec<PcKey>,
+}
+
 /// Physical keys down right now. Skips the generic VK_SHIFT/CONTROL/MENU
 /// (0x10..=0x12) in favour of their left/right forms; mouse VKs lie below 0x08.
-fn keys_down_now() -> Vec<PcKey> {
-    let mut out = Vec::new();
+fn keys_down_now() -> EntrySnapshot {
+    let mut snap = EntrySnapshot::default();
     for vk in (0x08u16..=0xFE).filter(|vk| !(0x10..=0x12).contains(vk) && is_down(*vk)) {
         // SAFETY: MapVirtualKeyW has no preconditions.
         let sc = unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC_EX) };
-        out.extend(entry_keys(vk, sc));
+        let (key, twin) = entry_keys(vk, sc);
+        snap.keys.extend(key);
+        snap.twins.extend(twin);
     }
-    out
+    snap
 }
 
 /// VKs whose key can reach the hook either with or without LLKHF_EXTENDED
@@ -750,30 +870,30 @@ fn is_ambiguous_vk(vk: u16) -> bool {
     )
 }
 
-/// The hook-form PcKey(s) for a held VK, given `MapVirtualKeyW(vk, MAPVK_VK_TO_VSC_EX)`.
-fn entry_keys(vk: u16, sc: u32) -> impl Iterator<Item = PcKey> {
-    let (first, second) = match sc >> 8 {
+/// The hook-form key for a held VK, plus its other form if the VK is ambiguous.
+/// `sc` is `MapVirtualKeyW(vk, MAPVK_VK_TO_VSC_EX)`.
+fn entry_keys(vk: u16, sc: u32) -> (Option<PcKey>, Option<PcKey>) {
+    let key = |scancode, extended| Some(PcKey { scancode, extended });
+    // Keys whose MapVirtualKeyW result differs from what the hook reports.
+    match vk {
+        0x90 => return (key(0x45, true), None), // VK_NUMLOCK (maps to 0x45)
+        0x2C => return (key(0x37, true), None), // VK_SNAPSHOT (maps to 0x54)
+        _ => {}
+    }
+    match sc >> 8 {
         _ if sc == 0 => (None, None),
-        // E1-prefixed (Pause): the hook reports it as 0x45, not extended.
-        0xE1 => (
-            Some(PcKey {
-                scancode: 0x45,
-                extended: false,
-            }),
-            None,
-        ),
+        0xE1 => (key(0x45, false), None), // Pause (maps to 0xE11D)
         prefix => {
             let scancode = (sc & 0xFF) as u16;
             let extended = prefix == 0xE0;
-            let k = PcKey { scancode, extended };
-            let twin = is_ambiguous_vk(vk).then_some(PcKey {
-                scancode,
-                extended: !extended,
-            });
-            (Some(k), twin)
+            let twin = if is_ambiguous_vk(vk) {
+                key(scancode, !extended)
+            } else {
+                None
+            };
+            (key(scancode, extended), twin)
         }
-    };
-    first.into_iter().chain(second)
+    }
 }
 
 #[cfg(test)]
@@ -804,9 +924,17 @@ mod tests {
 
     /// A state that is "on the Mac" with dummy hook handles (never unhooked).
     fn on_mac(entry_keys: &[PcKey]) -> (State, crossbeam_channel::Receiver<InputMsg>) {
+        let snap = EntrySnapshot {
+            keys: entry_keys.to_vec(),
+            twins: Vec::new(),
+        };
+        on_mac_with(&snap)
+    }
+
+    fn on_mac_with(snap: &EntrySnapshot) -> (State, crossbeam_channel::Receiver<InputMsg>) {
         let (tx, rx) = crossbeam_channel::unbounded();
         let mut s = State::new(Config::default(), tx, None);
-        s.seed_entry_keys(entry_keys);
+        s.seed_entry_keys(snap);
         s.mac = Some(MacStay::new(dummy_hooks(), CENTER, Instant::now()));
         (s, rx)
     }
@@ -985,7 +1113,8 @@ mod tests {
     }
 
     fn keys(vk: u16, sc: u32) -> Vec<PcKey> {
-        entry_keys(vk, sc).collect()
+        let (key, twin) = entry_keys(vk, sc);
+        key.into_iter().chain(twin).collect()
     }
 
     fn pk(scancode: u16, extended: bool) -> PcKey {
@@ -997,13 +1126,137 @@ mod tests {
         assert_eq!(keys(0x13, 0xE11D), [pk(0x45, false)]);
     }
 
+    // Inputs below are what MapVirtualKeyW(vk, MAPVK_VK_TO_VSC_EX) returns on
+    // Windows 11 (US layout), checked on this machine.
+
+    #[test]
+    fn entry_keys_numlock_and_snapshot_use_hook_forms() {
+        assert_eq!(keys(0x90, 0x0045), [pk(0x45, true)]); // NumLock
+        assert_eq!(keys(0x2C, 0x0054), [pk(0x37, true)]); // PrintScreen
+    }
+
     #[test]
     fn entry_keys_ambiguous_vks_seed_both_forms() {
-        assert_eq!(keys(0x24, 0xE047), [pk(0x47, true), pk(0x47, false)]); // Home
-        assert_eq!(keys(0x0D, 0x1C), [pk(0x1C, false), pk(0x1C, true)]); // Enter
-        assert_eq!(keys(0x67, 0x47), [pk(0x47, false), pk(0x47, true)]); // Numpad 7
-        assert_eq!(keys(0x6E, 0x53), [pk(0x53, false), pk(0x53, true)]); // Decimal
-        assert_eq!(keys(0x2E, 0xE053), [pk(0x53, true), pk(0x53, false)]); // Delete
+        assert_eq!(keys(0x24, 0x0047), [pk(0x47, false), pk(0x47, true)]); // Home
+        assert_eq!(keys(0x2E, 0x0053), [pk(0x53, false), pk(0x53, true)]); // Delete
+        assert_eq!(keys(0x0D, 0x001C), [pk(0x1C, false), pk(0x1C, true)]); // Enter
+        assert_eq!(keys(0x67, 0x0047), [pk(0x47, false), pk(0x47, true)]); // Numpad 7
+        assert_eq!(keys(0x6E, 0x0053), [pk(0x53, false), pk(0x53, true)]); // Decimal
+    }
+
+    /// Nav Home held at entry: VK_HOME maps to (0x47, plain), twin (0x47, ext).
+    fn home_held_at_entry() -> EntrySnapshot {
+        EntrySnapshot {
+            keys: vec![pk(0x47, false)],
+            twins: vec![pk(0x47, true)],
+        }
+    }
+
+    #[test]
+    fn twin_is_forgotten_when_the_real_form_is_released() {
+        let (mut s, rx) = on_mac_with(&home_held_at_entry());
+        // The physical nav Home key reports extended; its release goes to Windows.
+        assert!(!key(&mut s, pk(0x47, true), false));
+        // Numpad 7 (the plain form) pressed on the Mac is not lost.
+        assert!(key(&mut s, pk(0x47, false), true));
+        assert!(matches!(drain(&rx)[..], [InputMsg::Key { down: true, .. }]));
+    }
+
+    #[test]
+    fn twin_is_forgotten_when_the_mapped_form_is_released() {
+        let (mut s, rx) = on_mac_with(&home_held_at_entry());
+        assert!(!key(&mut s, pk(0x47, false), false));
+        assert!(key(&mut s, pk(0x47, true), true));
+        assert!(matches!(drain(&rx)[..], [InputMsg::Key { down: true, .. }]));
+    }
+
+    #[test]
+    fn both_forms_genuinely_held_each_release_reaches_windows() {
+        // VK_HOME and VK_NUMPAD7 both down: two physical keys on scancode 0x47.
+        let snap = EntrySnapshot {
+            keys: vec![pk(0x47, false), pk(0x47, false)],
+            twins: vec![pk(0x47, true), pk(0x47, true)],
+        };
+        let (mut s, rx) = on_mac_with(&snap);
+        assert!(!key(&mut s, pk(0x47, true), false));
+        assert!(!key(&mut s, pk(0x47, false), false), "still pending");
+        assert!(drain(&rx).is_empty());
+    }
+
+    #[test]
+    fn non_ambiguous_keys_are_independent() {
+        // Left and right Ctrl share scancode 0x1D but are not twins.
+        let rctrl = pk(0x1D, true);
+        let (mut s, rx) = on_mac(&[LCTRL, rctrl]);
+        assert!(!key(&mut s, LCTRL, false));
+        assert!(!key(&mut s, rctrl, false), "right Ctrl still pending");
+        assert!(drain(&rx).is_empty());
+    }
+
+    fn quota_error() -> windows::core::Error {
+        windows::core::Error::from_hresult(
+            windows::Win32::Foundation::ERROR_NOT_ENOUGH_QUOTA.to_hresult(),
+        )
+    }
+
+    fn retry(post: impl FnMut() -> windows::core::Result<()>, alive: &AtomicBool) -> WakeOutcome {
+        wake_with_retry(post, alive, ms(1), ms(50))
+    }
+
+    #[test]
+    fn wake_retries_until_the_post_succeeds() {
+        let alive = AtomicBool::new(true);
+        let mut calls = 0;
+        let post = || {
+            calls += 1;
+            if calls < 4 {
+                Err(quota_error())
+            } else {
+                Ok(())
+            }
+        };
+        assert_eq!(retry(post, &alive), WakeOutcome::Woken);
+        assert_eq!(calls, 4);
+    }
+
+    #[test]
+    fn wake_stops_at_once_on_invalid_thread_id() {
+        let alive = AtomicBool::new(true);
+        let mut calls = 0;
+        let post = || {
+            calls += 1;
+            Err(windows::core::Error::from_hresult(
+                ERROR_INVALID_THREAD_ID.to_hresult(),
+            ))
+        };
+        assert_eq!(retry(post, &alive), WakeOutcome::ThreadGone);
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn wake_stops_when_the_receiver_is_gone() {
+        let alive = AtomicBool::new(false);
+        assert_eq!(
+            retry(|| Err(quota_error()), &alive),
+            WakeOutcome::ReceiverGone
+        );
+    }
+
+    #[test]
+    fn wake_gives_up_after_the_limit() {
+        let alive = AtomicBool::new(true);
+        let started = Instant::now();
+        assert_eq!(retry(|| Err(quota_error()), &alive), WakeOutcome::GaveUp);
+        assert!(started.elapsed() >= ms(50));
+    }
+
+    #[test]
+    fn wake_against_thread_id_zero_reports_thread_gone() {
+        // Thread id 0 is never valid, so the real PostThreadMessageW must fail
+        // with ERROR_INVALID_THREAD_ID (and posts nothing anywhere).
+        let alive = AtomicBool::new(true);
+        let post = || unsafe { PostThreadMessageW(0, WM_APP, WPARAM(0), LPARAM(0)) };
+        assert_eq!(retry(post, &alive), WakeOutcome::ThreadGone);
     }
 
     #[test]
