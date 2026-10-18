@@ -103,6 +103,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "rcgen",
+ "ring",
  "rustls",
  "sha2",
  "tempfile",

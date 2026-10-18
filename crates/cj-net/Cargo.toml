@@ -7,6 +7,7 @@ edition.workspace = true
 anyhow = "1"
 rcgen = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
+ring = "0.17"
 sha2 = "0.10"
 
 [dev-dependencies]

@@ -4,7 +4,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
-use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+use ring::rand::SecureRandom;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use sha2::{Digest, Sha256};
 
 /// Fixed server name (SAN and SNI) used by every CursorJump certificate.
@@ -62,10 +63,8 @@ impl Identity {
         }
         let id = Identity::generate()?;
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-        std::fs::write(&cert_path, &id.cert_der)
-            .with_context(|| format!("writing {}", cert_path.display()))?;
-        std::fs::write(&key_path, &id.key_der)
-            .with_context(|| format!("writing {}", key_path.display()))?;
+        write_atomic(&cert_path, &id.cert_der)?;
+        write_atomic(&key_path, &id.key_der)?;
         Ok(id)
     }
 
@@ -95,27 +94,65 @@ impl Identity {
         })
     }
 
-    /// Cheap sanity check: the key must be loadable and the cert must look like DER.
+    /// Same check the TLS configs run: the cert parses, the key loads and they match.
     fn is_valid(&self) -> bool {
-        self.cert_der.first() == Some(&0x30)
-            && rustls::crypto::ring::sign::any_supported_type(&self.private_key()).is_ok()
+        rustls::sign::CertifiedKey::from_der(
+            vec![CertificateDer::from(self.cert_der.clone())],
+            self.private_key(),
+            &rustls::crypto::ring::default_provider(),
+        )
+        .is_ok()
     }
 }
 
-/// Order-independent 6-digit pairing code ("NNN NNN") for two fingerprints.
-pub fn pairing_code(a: &Fingerprint, b: &Fingerprint) -> String {
-    let (lo, hi) = if a.0 <= b.0 { (a, b) } else { (b, a) };
+/// Writes `data` to a temp file next to `path`, then renames it into place.
+fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, data).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("renaming to {}", path.display()))?;
+    Ok(())
+}
+
+/// Fresh 32-byte random nonce from the OS RNG, for one pairing session.
+pub fn random_nonce() -> [u8; 32] {
+    let mut n = [0u8; 32];
+    ring::rand::SystemRandom::new()
+        .fill(&mut n)
+        .expect("OS random number generator failed");
+    n
+}
+
+/// Commitment to a pairing nonce: SHA-256("cj-commit-v1" || nonce).
+pub fn pair_commit(nonce: &[u8; 32]) -> [u8; 32] {
     let mut h = Sha256::new();
-    h.update(lo.0);
-    h.update(hi.0);
-    let digest = h.finalize();
-    let n = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]) % 1_000_000;
+    h.update(b"cj-commit-v1");
+    h.update(nonce);
+    h.finalize().into()
+}
+
+/// 6-digit pairing code ("NNN NNN") bound to both fingerprints and both
+/// per-session nonces. Roles are explicit (connector vs. listener).
+pub fn pairing_code(
+    connector: &Fingerprint,
+    listener: &Fingerprint,
+    connector_nonce: &[u8; 32],
+    listener_nonce: &[u8; 32],
+) -> String {
+    let mut h = Sha256::new();
+    h.update(b"cj-pair-v1");
+    h.update(connector.0);
+    h.update(listener.0);
+    h.update(connector_nonce);
+    h.update(listener_nonce);
+    let d = h.finalize();
+    let n = u32::from_be_bytes([d[0], d[1], d[2], d[3]]) % 1_000_000;
     format!("{:03} {:03}", n / 1000, n % 1000)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::verify::{Trust, server_config};
 
     #[test]
     fn identity_persists() {
@@ -125,6 +162,35 @@ mod tests {
         assert_eq!(a.fingerprint(), b.fingerprint());
         assert!(dir.path().join("identity.der").exists());
         assert!(dir.path().join("identity.key").exists());
+    }
+
+    #[test]
+    fn corrupt_identity_regenerates() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = Identity::load_or_create(dir.path()).unwrap();
+        std::fs::write(
+            dir.path().join("identity.der"),
+            [0x30, 0xde, 0xad, 0xbe, 0xef],
+        )
+        .unwrap();
+        let b = Identity::load_or_create(dir.path()).unwrap();
+        assert_ne!(a.fingerprint(), b.fingerprint());
+        assert!(server_config(&b, Trust::PairingMode).is_ok());
+        let c = Identity::load_or_create(dir.path()).unwrap();
+        assert_eq!(b.fingerprint(), c.fingerprint());
+    }
+
+    #[test]
+    fn mismatched_key_regenerates() {
+        let d1 = tempfile::tempdir().unwrap();
+        let d2 = tempfile::tempdir().unwrap();
+        let a = Identity::load_or_create(d1.path()).unwrap();
+        let other = Identity::load_or_create(d2.path()).unwrap();
+        std::fs::write(d1.path().join("identity.key"), &other.key_der).unwrap();
+        let b = Identity::load_or_create(d1.path()).unwrap();
+        assert_ne!(a.fingerprint(), b.fingerprint());
+        assert_ne!(b.key_der, other.key_der);
+        assert!(server_config(&b, Trust::PairingMode).is_ok());
     }
 
     #[test]
@@ -139,27 +205,48 @@ mod tests {
     }
 
     #[test]
-    fn pairing_code_symmetric_and_formatted() {
-        let a = Fingerprint([1; 32]);
-        let b = Fingerprint([2; 32]);
-        let c = pairing_code(&a, &b);
-        assert_eq!(c, pairing_code(&b, &a));
-        let bytes = c.as_bytes();
-        assert_eq!(bytes.len(), 7);
-        assert_eq!(bytes[3], b' ');
+    fn pairing_code_formatted() {
+        let c = pairing_code(
+            &Fingerprint([1; 32]),
+            &Fingerprint([2; 32]),
+            &[3; 32],
+            &[4; 32],
+        );
+        let b = c.as_bytes();
+        assert_eq!(b.len(), 7);
+        assert_eq!(b[3], b' ');
         assert!(
-            bytes
-                .iter()
+            b.iter()
                 .enumerate()
                 .all(|(i, ch)| i == 3 || ch.is_ascii_digit())
         );
     }
 
     #[test]
-    fn different_peer_different_code() {
-        let a = Fingerprint([1; 32]);
-        let b = Fingerprint([2; 32]);
-        let c = Fingerprint([3; 32]);
-        assert_ne!(pairing_code(&a, &b), pairing_code(&a, &c));
+    fn pairing_code_changes_with_any_input() {
+        let (f1, f2, f3) = (
+            Fingerprint([1; 32]),
+            Fingerprint([2; 32]),
+            Fingerprint([9; 32]),
+        );
+        let (n1, n2, n3) = ([3u8; 32], [4u8; 32], [7u8; 32]);
+        let base = pairing_code(&f1, &f2, &n1, &n2);
+        assert_ne!(base, pairing_code(&f3, &f2, &n1, &n2));
+        assert_ne!(base, pairing_code(&f1, &f3, &n1, &n2));
+        assert_ne!(base, pairing_code(&f1, &f2, &n3, &n2));
+        assert_ne!(base, pairing_code(&f1, &f2, &n1, &n3));
+        // Roles are explicit: swapping them changes the code.
+        assert_ne!(base, pairing_code(&f2, &f1, &n2, &n1));
+    }
+
+    #[test]
+    fn commit_binds_nonce() {
+        assert_eq!(pair_commit(&[1; 32]), pair_commit(&[1; 32]));
+        assert_ne!(pair_commit(&[1; 32]), pair_commit(&[2; 32]));
+    }
+
+    #[test]
+    fn nonces_are_random() {
+        assert_ne!(random_nonce(), random_nonce());
     }
 }
