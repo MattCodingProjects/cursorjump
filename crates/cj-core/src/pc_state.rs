@@ -70,6 +70,8 @@ pub struct PcMachine {
     cfg: Config,
     /// PC-side frac at the last entry.
     last_frac: f32,
+    /// `edge_offset` in force when the cursor entered the Mac.
+    entry_offset: f32,
     local_ans: Option<bool>,
     remote_ans: Option<bool>,
 }
@@ -81,6 +83,7 @@ impl PcMachine {
             where_: Where::Pc,
             cfg,
             last_frac: 0.5,
+            entry_offset: 0.0,
             local_ans: None,
             remote_ans: None,
         }
@@ -133,6 +136,7 @@ impl PcMachine {
                     return vec![];
                 }
                 self.last_frac = frac;
+                self.entry_offset = self.cfg.edge_offset;
                 self.where_ = Where::Mac;
                 vec![PcAction::EnterMac {
                     mac_edge: opposite(self.cfg.mac_side),
@@ -145,7 +149,7 @@ impl PcMachine {
                 }
                 self.where_ = Where::Pc;
                 vec![PcAction::ReturnToPc {
-                    pc_frac: remove_offset(frac, self.cfg.edge_offset),
+                    pc_frac: remove_offset(frac, self.entry_offset),
                 }]
             }
             PcEvent::Disconnected => {
@@ -329,6 +333,21 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         }
         assert_eq!(m.where_(), &Where::Pc);
+    }
+
+    #[test]
+    fn pc_offset_snapshot_survives_config_change() {
+        let mut m = connected(Config::default());
+        m.on(push(0.5, free(), false));
+        m.on(PcEvent::ConfigChanged(Config {
+            edge_offset: 0.2,
+            ..Config::default()
+        }));
+        let a = m.on(PcEvent::MacLeave { frac: 0.4 });
+        match a.as_slice() {
+            [PcAction::ReturnToPc { pc_frac }] => assert!((pc_frac - 0.4).abs() < 1e-5),
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[test]
