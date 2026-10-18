@@ -2,3 +2,15 @@
 name = "cursorjump"
 version.workspace = true
 edition.workspace = true
+
+[dependencies]
+cj-core = { path = "../../crates/cj-core" }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
+
+[target."cfg(windows)".dependencies]
+crossbeam-channel = "0.5.17"
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input", "Win32_UI_Input_KeyboardAndMouse", "Win32_Graphics_Gdi", "Win32_UI_Shell", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_UI_HiDpi"] }
+
+[build-dependencies]
+embed-manifest = "1.5.1"
