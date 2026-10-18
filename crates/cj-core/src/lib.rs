@@ -1,3 +1,4 @@
 //! Core types and logic for CursorJump.
-pub mod proto;
+pub mod gaming;
 pub mod layout;
+pub mod proto;
