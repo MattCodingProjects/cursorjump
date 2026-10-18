@@ -43,7 +43,8 @@ pub fn edge_frac(r: &Rect, s: Side, x: i32, y: i32) -> f32 {
 /// Point on the given edge at fraction `frac`, `inset` pixels inside the edge.
 pub fn point_on_edge(r: &Rect, s: Side, frac: f32, inset: i32) -> (i32, i32) {
     let frac = frac.clamp(0.0, 1.0);
-    let along = |start: i32, end: i32| start + (frac * ((end - start - 1).max(0) as f32)).round() as i32;
+    let along =
+        |start: i32, end: i32| start + (frac * ((end - start - 1).max(0) as f32)).round() as i32;
     match s {
         Side::Left => (r.left + inset, along(r.top, r.bottom)),
         Side::Right => (r.right - 1 - inset, along(r.top, r.bottom)),
@@ -75,22 +76,48 @@ pub fn remove_offset(frac: f32, offset: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    const MAIN: Rect = Rect { left: 0, top: 0, right: 2560, bottom: 1440 };
-    #[test] fn edge_frac_right_middle() { assert!((edge_frac(&MAIN, Side::Right, 2559, 720) - 0.5).abs() < 0.001); }
-    #[test] fn edge_frac_negative_origin() {
-        let vert = Rect { left: -1080, top: -400, right: 0, bottom: 1520 };
+    const MAIN: Rect = Rect {
+        left: 0,
+        top: 0,
+        right: 2560,
+        bottom: 1440,
+    };
+    #[test]
+    fn edge_frac_right_middle() {
+        assert!((edge_frac(&MAIN, Side::Right, 2559, 720) - 0.5).abs() < 0.001);
+    }
+    #[test]
+    fn edge_frac_negative_origin() {
+        let vert = Rect {
+            left: -1080,
+            top: -400,
+            right: 0,
+            bottom: 1520,
+        };
         assert!((edge_frac(&vert, Side::Left, -1080, -400)).abs() < 1e-6);
         assert!((edge_frac(&vert, Side::Left, -1080, 1519) - 1.0).abs() < 1e-6);
     }
-    #[test] fn point_on_edge_inverts_frac() { assert_eq!(point_on_edge(&MAIN, Side::Right, 0.5, 2), (2557, 720)); }
-    #[test] fn pushing_out_only_at_edge_moving_out() {
+    #[test]
+    fn point_on_edge_inverts_frac() {
+        assert_eq!(point_on_edge(&MAIN, Side::Right, 0.5, 2), (2557, 720));
+    }
+    #[test]
+    fn pushing_out_only_at_edge_moving_out() {
         assert!(is_pushing_out(&MAIN, Side::Right, 2559, 100, 3, 0));
         assert!(!is_pushing_out(&MAIN, Side::Right, 2559, 100, -3, 0));
         assert!(!is_pushing_out(&MAIN, Side::Right, 2558, 100, 3, 0));
     }
-    #[test] fn offset_clamps() { assert_eq!(apply_offset(0.9, 0.2), 1.0); assert_eq!(remove_offset(0.1, 0.2), 0.0); }
-    #[test] fn opposite_sides() { assert_eq!(opposite(Side::Right), Side::Left); }
-    #[test] fn other_sides() {
+    #[test]
+    fn offset_clamps() {
+        assert_eq!(apply_offset(0.9, 0.2), 1.0);
+        assert_eq!(remove_offset(0.1, 0.2), 0.0);
+    }
+    #[test]
+    fn opposite_sides() {
+        assert_eq!(opposite(Side::Right), Side::Left);
+    }
+    #[test]
+    fn other_sides() {
         assert_eq!(point_on_edge(&MAIN, Side::Left, 0.0, 3), (3, 0));
         assert_eq!(point_on_edge(&MAIN, Side::Top, 1.0, 0), (2559, 0));
         assert_eq!(point_on_edge(&MAIN, Side::Bottom, 0.5, 1), (1280, 1438));
@@ -100,10 +127,16 @@ mod tests {
         assert!(!is_pushing_out(&MAIN, Side::Right, 2559, 1440, 3, 0));
         assert!(!is_pushing_out(&MAIN, Side::Top, 2560, 0, 0, -1));
     }
-    #[test] fn edge_frac_clamps_and_degenerate() {
+    #[test]
+    fn edge_frac_clamps_and_degenerate() {
         assert_eq!(edge_frac(&MAIN, Side::Right, 2559, 5000), 1.0);
         assert_eq!(edge_frac(&MAIN, Side::Right, 2559, -5), 0.0);
-        let one = Rect { left: 0, top: 0, right: 10, bottom: 1 };
+        let one = Rect {
+            left: 0,
+            top: 0,
+            right: 10,
+            bottom: 1,
+        };
         assert_eq!(edge_frac(&one, Side::Left, 0, 0), 0.0);
     }
 }
