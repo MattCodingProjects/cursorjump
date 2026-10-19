@@ -45,6 +45,10 @@ struct Formats {
     html: u32,
     rtf: u32,
     png: u32,
+    // Privacy markers set by password managers, see `marked_private`.
+    exclude_from_monitors: u32,
+    can_include_in_history: u32,
+    can_upload_to_cloud: u32,
 }
 
 fn formats() -> Formats {
@@ -54,6 +58,11 @@ fn formats() -> Formats {
             html: RegisterClipboardFormatW(w!("HTML Format")),
             rtf: RegisterClipboardFormatW(w!("Rich Text Format")),
             png: RegisterClipboardFormatW(w!("PNG")),
+            exclude_from_monitors: RegisterClipboardFormatW(w!(
+                "ExcludeClipboardContentFromMonitorProcessing"
+            )),
+            can_include_in_history: RegisterClipboardFormatW(w!("CanIncludeInClipboardHistory")),
+            can_upload_to_cloud: RegisterClipboardFormatW(w!("CanUploadToCloudClipboard")),
         }
     }
 }
@@ -225,12 +234,42 @@ fn trim_nul_tail(mut b: Vec<u8>) -> Vec<u8> {
     b
 }
 
-/// Read the current clipboard. Formats that are absent are `None`; `CF_HDROP` is ignored.
+/// Whether the copying app asked clipboard monitors to leave this content
+/// alone, as password managers do. From the registered formats documented at
+/// <https://learn.microsoft.com/en-us/windows/win32/dataxchg/clipboard-formats#cloud-clipboard-and-clipboard-history-formats>:
+/// "ExcludeClipboardContentFromMonitorProcessing" present (any data), or
+/// "CanIncludeInClipboardHistory" / "CanUploadToCloudClipboard" holding a DWORD 0.
+fn marked_private(
+    exclude_from_monitors: bool,
+    can_include_in_history: Option<&[u8]>,
+    can_upload_to_cloud: Option<&[u8]>,
+) -> bool {
+    let is_zero_dword = |b: Option<&[u8]>| {
+        b.and_then(|b| b.get(..4))
+            .is_some_and(|d| u32::from_le_bytes([d[0], d[1], d[2], d[3]]) == 0)
+    };
+    exclude_from_monitors
+        || is_zero_dword(can_include_in_history)
+        || is_zero_dword(can_upload_to_cloud)
+}
+
+/// Read the current clipboard. Formats that are absent are `None`; `CF_HDROP` is
+/// ignored. Content marked private (see `marked_private`) reads as empty.
 pub fn read_clipboard() -> Result<ClipboardData> {
     // Under the guard only copy bytes; the (slow) image conversion runs after it is dropped.
     let (mut data, raw_image) = {
         let _guard = ClipboardGuard::open()?;
         let f = formats();
+        // SAFETY: IsClipboardFormatAvailable has no preconditions.
+        let exclude = unsafe { IsClipboardFormatAvailable(f.exclude_from_monitors) }.is_ok();
+        if marked_private(
+            exclude,
+            get_bytes(f.can_include_in_history).as_deref(),
+            get_bytes(f.can_upload_to_cloud).as_deref(),
+        ) {
+            debug!("clipboard: content marked private; not shared");
+            return Ok(ClipboardData::default());
+        }
         let data = ClipboardData {
             text: read_text(),
             html: get_bytes(f.html)
@@ -410,6 +449,30 @@ mod tests {
     static CLIPBOARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
+    fn private_when_monitor_exclusion_present() {
+        assert!(marked_private(true, None, None));
+    }
+
+    #[test]
+    fn private_when_history_or_cloud_is_zero() {
+        assert!(marked_private(false, Some(&0u32.to_le_bytes()), None));
+        assert!(marked_private(false, None, Some(&0u32.to_le_bytes())));
+    }
+
+    #[test]
+    fn not_private_when_flags_allow_or_are_absent() {
+        assert!(!marked_private(false, None, None));
+        let one = 1u32.to_le_bytes();
+        assert!(!marked_private(false, Some(&one), Some(&one)));
+    }
+
+    #[test]
+    fn short_flag_data_is_ignored() {
+        assert!(!marked_private(false, Some(&[0, 0]), Some(&[])));
+    }
+
+    #[test]
+    #[ignore = "writes the live clipboard; run with --ignored"]
     fn clipboard_roundtrip_text_html() {
         let _serial = CLIPBOARD.lock().unwrap_or_else(|e| e.into_inner());
         // Keep the user's clipboard: restore it best-effort at the end.
@@ -449,6 +512,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "writes the live clipboard; run with --ignored"]
     fn clipboard_roundtrip_image() {
         let _serial = CLIPBOARD.lock().unwrap_or_else(|e| e.into_inner());
         let original = read_clipboard().ok();
