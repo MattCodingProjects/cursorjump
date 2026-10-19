@@ -198,8 +198,11 @@ pub fn dib_to_png(dib: &[u8]) -> Result<Vec<u8>> {
         }
     }
     // Many Windows apps leave the alpha channel zeroed: treat as opaque.
-    if bpp == 32 && rgba.chunks_exact(4).all(|p| p[3] == 0) {
-        rgba.chunks_exact_mut(4).for_each(|p| p[3] = 255);
+    if bpp == 32 && rgba.as_chunks::<4>().0.iter().all(|p| p[3] == 0) {
+        rgba.as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .for_each(|p| p[3] = 255);
     }
 
     let img = image::RgbaImage::from_raw(w as u32, h as u32, rgba)
@@ -271,9 +274,11 @@ impl EchoGuard {
         Self::default()
     }
 
-    /// We just wrote remote data locally.
+    /// We just wrote remote data locally. That replaces whatever we sent last,
+    /// so sending that item again is a real change.
     pub fn mark_applied(&mut self, hash: u64) {
         self.applied = Some(hash);
+        self.sent = None;
     }
 
     /// False if `hash` equals the last applied or last sent hash.
@@ -440,5 +445,17 @@ mod tests {
         assert!(!g.should_send(1));
         assert!(g.should_send(2));
         assert!(!g.should_send(2));
+    }
+
+    #[test]
+    fn echo_guard_resends_after_peer_item() {
+        let mut g = EchoGuard::new();
+        assert!(g.should_send(1)); // copy X here
+        assert!(!g.should_send(1)); // Windows' duplicate events for X
+        g.mark_applied(2); // Y arrives from the peer
+        assert!(!g.should_send(2)); // the echo of writing Y
+        assert!(!g.should_send(2)); // and its duplicates
+        assert!(g.should_send(1)); // copy X again: a real change
+        assert!(!g.should_send(1));
     }
 }

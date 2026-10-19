@@ -1,5 +1,6 @@
 //! User settings file.
 use crate::proto::Side;
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -53,11 +54,23 @@ fn clamp_or(v: f32, lo: f32, hi: f32, default: f32) -> f32 {
 impl Config {
     /// Never panics: a missing or corrupt file yields the defaults.
     pub fn load(path: &Path) -> Config {
-        std::fs::read_to_string(path)
-            .ok()
-            .and_then(|s| toml::from_str::<Config>(&s).ok())
-            .unwrap_or_default()
-            .clamped()
+        Config::try_load(path).ok().flatten().unwrap_or_default()
+    }
+
+    /// `Ok(None)` if the file does not exist; an error if it cannot be read
+    /// or parsed. Callers that write the file back must not do so after an
+    /// error, or they would replace the user's settings with defaults.
+    pub fn try_load(path: &Path) -> anyhow::Result<Option<Config>> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(anyhow::Error::new(e).context(format!("reading {}", path.display())));
+            }
+        };
+        let cfg = toml::from_str::<Config>(&text)
+            .with_context(|| format!("parsing {}", path.display()))?;
+        Ok(Some(cfg.clamped()))
     }
 
     /// Atomic write: temp file in the same directory, then rename.
@@ -95,6 +108,23 @@ mod tests {
         assert_eq!(Config::load(&p), Config::default());
         std::fs::write(&p, "not toml {{").unwrap();
         assert_eq!(Config::load(&p), Config::default());
+    }
+
+    #[test]
+    fn config_try_load_distinguishes_missing_and_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        assert_eq!(Config::try_load(&p).unwrap(), None);
+        std::fs::write(&p, "paused = tru").unwrap();
+        assert!(Config::try_load(&p).is_err());
+        std::fs::write(
+            &p,
+            "pointer_speed = 9.0
+",
+        )
+        .unwrap();
+        let c = Config::try_load(&p).unwrap().unwrap();
+        assert_eq!(c.pointer_speed, 4.0, "clamped like load");
     }
 
     #[test]

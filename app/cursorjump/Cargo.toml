@@ -4,13 +4,35 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+anyhow = "1"
 cj-core = { path = "../../crates/cj-core" }
+cj-net = { path = "../../crates/cj-net" }
+crossbeam-channel = "0.5.17"
+eframe = { version = "0.37.0", default-features = false, features = ["default_fonts", "glow"] }
+rfd = "0.17.2"
+tao = "0.37.1"
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "sync", "time"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
+tray-icon = "0.26.1"
 
 [target."cfg(windows)".dependencies]
-crossbeam-channel = "0.5.17"
-windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input", "Win32_UI_Input_KeyboardAndMouse", "Win32_Graphics_Gdi", "Win32_UI_Shell", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_UI_HiDpi"] }
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input", "Win32_UI_Input_KeyboardAndMouse", "Win32_Graphics_Gdi", "Win32_UI_Shell", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_System_StationsAndDesktops", "Win32_UI_HiDpi", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_Registry", "Win32_System_Console", "Win32_Security"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "tiff"] }
+libc = "0.2.191"
+objc2 = "0.6.5"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSEvent", "NSPasteboard"] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFCGTypes", "CFString"] }
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "CGDirectDisplay", "CGDisplayConfiguration", "CGEvent", "CGEventSource", "CGEventTypes", "CGRemoteOperation", "CGError", "libc"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSData", "NSProcessInfo", "NSString"] }
+objc2-io-kit = { version = "0.3.2", default-features = false, features = ["std", "pwr_mgt"] }
+# SIGTERM (launchctl bootout, logout) runs the normal quit.
+tokio = { version = "1.53.3", features = ["signal"] }
+
+[dev-dependencies]
+tempfile = "3"
 
 [build-dependencies]
 embed-manifest = "1.5.1"

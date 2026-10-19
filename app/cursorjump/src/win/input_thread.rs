@@ -14,20 +14,25 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use cj_core::config::Config;
-use cj_core::input::{scale_motion, wheel_to_pixels};
+use cj_core::input::{MotionScaler, WheelAxis};
 use cj_core::keymap::{KeyRouter, PcKey, Route, is_return_hotkey, pc_to_mac};
 use cj_core::layout::{Rect, edge_frac, is_pushing_out, point_on_edge};
 use cj_core::pc_state::PcEvent;
-use cj_core::proto::MouseButton;
+use cj_core::proto::{MouseButton, Side};
 use tracing::{debug, error, info, warn};
 use windows::Win32::Foundation::{
-    ERROR_CLASS_ALREADY_EXISTS, ERROR_INVALID_THREAD_ID, HINSTANCE, HWND, LPARAM, LRESULT, POINT,
-    WPARAM,
+    ERROR_CLASS_ALREADY_EXISTS, ERROR_INVALID_THREAD_ID, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT,
+    POINT, WPARAM,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::StationsAndDesktops::{
+    CloseDesktop, DESKTOP_CONTROL_FLAGS, DESKTOP_READOBJECTS, GetUserObjectInformationW,
+    OpenInputDesktop, UOI_NAME,
+};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON,
+    VK_XBUTTON1, VK_XBUTTON2,
 };
 use windows::Win32::UI::Input::{
     GetRawInputData, HRAWINPUT, MOUSE_MOVE_ABSOLUTE, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER,
@@ -35,12 +40,13 @@ use windows::Win32::UI::Input::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos,
-    GetMessageW, HHOOK, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLMHF_INJECTED, MSG,
-    MSLLHOOKSTRUCT, PostThreadMessageW, RegisterClassExW, SetCursorPos, SetWindowsHookExW,
-    UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE, WM_APP, WM_DISPLAYCHANGE,
-    WM_INPUT, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
-    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETTINGCHANGE,
-    WM_SYSKEYDOWN, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSEXW, WS_POPUP, XBUTTON1, XBUTTON2,
+    GetMessageW, HHOOK, KBDLLHOOKSTRUCT, KillTimer, LLKHF_EXTENDED, LLKHF_INJECTED, LLMHF_INJECTED,
+    MSG, MSLLHOOKSTRUCT, PostThreadMessageW, RegisterClassExW, SetCursorPos, SetTimer,
+    SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE, WM_APP,
+    WM_DISPLAYCHANGE, WM_INPUT, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
+    WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    WM_SETTINGCHANGE, WM_SYSKEYDOWN, WM_TIMER, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSEXW, WS_POPUP,
+    XBUTTON1, XBUTTON2,
 };
 use windows::core::w;
 
@@ -53,6 +59,10 @@ const WATCHDOG: Duration = Duration::from_millis(250);
 /// After an `EdgePush`, further pushes are suppressed until a command arrives or this passes.
 const EDGE_DEBOUNCE: Duration = Duration::from_millis(250);
 
+/// After a return to the PC, the cursor must get this far inside the Mac edge
+/// (physical pixels, along the crossing axis) before the edge crosses again.
+const REARM_DISTANCE_PX: i32 = 8;
+
 /// After a failed `EnterMac`, edge pushes are suppressed for this long.
 const ENTER_FAILED_DEBOUNCE: Duration = Duration::from_secs(1);
 /// A failed wake-up is retried every `WAKE_RETRY_STEP` for up to `WAKE_RETRY_LIMIT`.
@@ -60,6 +70,11 @@ const WAKE_RETRY_STEP: Duration = Duration::from_millis(10);
 const WAKE_RETRY_LIMIT: Duration = Duration::from_secs(1);
 /// A single hook move larger than this on either axis is a warp, not motion: dropped.
 const MAX_HOOK_DELTA: i32 = 200;
+
+/// While on the Mac, how often the input desktop is checked (`DESKTOP_TIMER`).
+const DESKTOP_POLL: Duration = Duration::from_millis(150);
+/// The input window's timer id for the desktop check.
+const DESKTOP_TIMER: usize = 1;
 
 /// When set (diagnose mode), log every raw key event and the entry key snapshot.
 static DIAGNOSE_LOG: AtomicBool = AtomicBool::new(false);
@@ -96,13 +111,7 @@ pub enum InputMsg {
 #[derive(Debug, Clone)]
 pub enum InputCmd {
     EnterMac,
-    ReturnToPc {
-        pc_frac: f32,
-    },
-    #[allow(
-        dead_code,
-        reason = "sent by the app wiring; diagnose does not change config"
-    )]
+    ReturnToPc { pc_frac: f32 },
     ApplyConfig(Config),
     Quit,
 }
@@ -254,7 +263,49 @@ impl MacStay {
     }
 }
 
+/// Stops an instant re-cross after a return while the user keeps pushing at the
+/// edge: a return disarms it, moving `REARM_DISTANCE_PX` inward re-arms it.
+struct RecrossGuard {
+    armed: bool,
+    logged: bool,
+}
+
+impl RecrossGuard {
+    fn new() -> Self {
+        RecrossGuard {
+            armed: true,
+            logged: false,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+        self.logged = false;
+    }
+
+    /// Feed a cursor position; returns whether the edge is armed now.
+    fn observe(&mut self, edge: &Rect, side: Side, x: i32, y: i32) -> bool {
+        if !self.armed {
+            let inward = match side {
+                Side::Right => edge.right - 1 - x,
+                Side::Left => x - edge.left,
+                Side::Top => y - edge.top,
+                Side::Bottom => edge.bottom - 1 - y,
+            };
+            self.armed = inward >= REARM_DISTANCE_PX;
+        }
+        self.armed
+    }
+
+    /// True the first time it is called after each `disarm`.
+    fn first_swallow(&mut self) -> bool {
+        !std::mem::replace(&mut self.logged, true)
+    }
+}
+
 struct State {
+    /// The input thread's hidden window (owns the desktop-check timer).
+    hwnd: HWND,
     cfg: Config,
     out: crossbeam_channel::Sender<InputMsg>,
     edge: Option<Rect>,
@@ -263,12 +314,15 @@ struct State {
     edge_quiet_until: Option<Instant>,
     /// Debounce after a failed `EnterMac`; not cleared by commands.
     enter_failed_until: Option<Instant>,
+    recross: RecrossGuard,
     router: KeyRouter,
     /// Physical keys currently held, for the return hotkey.
     held: HashSet<PcKey>,
     /// Entry keys seeded only as the other form of an ambiguous key; forgotten
     /// together with their partner so the key's first press on the Mac is kept.
     entry_twins: HashSet<PcKey>,
+    /// Motion and wheel rounding remainders; reset at each entry.
+    scaler: MotionScaler,
 }
 
 thread_local! {
@@ -305,7 +359,9 @@ fn run(
     }
     let edge = edge_monitor(&monitors(), cfg.mac_side);
     info!(?edge, side = ?cfg.mac_side, "input thread: edge monitor");
-    STATE.with(|cell| *cell.borrow_mut() = Some(State::new(cfg, out, edge)));
+    let mut state = State::new(cfg, out, edge);
+    state.hwnd = hwnd;
+    STATE.with(|cell| *cell.borrow_mut() = Some(state));
 
     if ready.send(unsafe { GetCurrentThreadId() }).is_ok() {
         message_loop(&cmds);
@@ -348,15 +404,18 @@ fn message_loop(cmds: &mpsc::Receiver<InputCmd>) {
 impl State {
     fn new(cfg: Config, out: crossbeam_channel::Sender<InputMsg>, edge: Option<Rect>) -> Self {
         State {
+            hwnd: HWND::default(),
             cfg,
             out,
             edge,
             mac: None,
             edge_quiet_until: None,
             enter_failed_until: None,
+            recross: RecrossGuard::new(),
             router: KeyRouter::new(),
             held: HashSet::with_capacity(32),
             entry_twins: HashSet::with_capacity(8),
+            scaler: MotionScaler::default(),
         }
     }
 
@@ -426,7 +485,34 @@ impl State {
         };
         info!(keys_held = snapshot.keys.len(), "hooks: installed");
         let center = park_and_read_back(target);
+        self.scaler.reset();
         self.mac = Some(MacStay::new(hooks, center, Instant::now()));
+        // SAFETY: `hwnd` is this thread's window; WM_TIMER arrives in `wnd_proc`.
+        let ms = DESKTOP_POLL.as_millis() as u32;
+        if unsafe { SetTimer(Some(self.hwnd), DESKTOP_TIMER, ms, None) } == 0 {
+            warn!(
+                "desktop check: SetTimer failed: {}",
+                windows::core::Error::from_thread()
+            );
+        }
+    }
+
+    /// Ctrl+Alt+Del, Win+L and UAC switch the input desktop: our hooks then
+    /// never see the key-ups for downs already sent to the Mac. Treat it as a
+    /// lost hook, so the app releases everything and returns the cursor.
+    fn check_desktop(&mut self) {
+        let Some(stay) = &mut self.mac else {
+            return;
+        };
+        if stay.hook_lost_sent {
+            return;
+        }
+        let name = input_desktop_name();
+        if desktop_verdict(name.as_deref()) == DesktopVerdict::HookLost {
+            warn!(desktop = ?name, "input desktop switched away; hook lost");
+            stay.hook_lost_sent = true;
+            self.send(InputMsg::Edge(PcEvent::HookLost));
+        }
     }
 
     /// Keys already down at entry: their releases go to Windows, and they count
@@ -471,6 +557,7 @@ impl State {
     /// Tell the app the crossing failed and keep the edge quiet for a while.
     fn enter_failed(&mut self) {
         self.enter_failed_until = Some(Instant::now() + ENTER_FAILED_DEBOUNCE);
+        self.recross.disarm();
         self.send(InputMsg::Edge(PcEvent::HookLost));
     }
 
@@ -494,6 +581,9 @@ impl State {
         };
         remove_hooks(stay.hooks);
         info!("hooks: removed");
+        // SAFETY: kills this thread's own timer; failure means it was not running.
+        let _ = unsafe { KillTimer(Some(self.hwnd), DESKTOP_TIMER) };
+        self.recross.disarm();
         if let Some(pt) = park_at {
             park_cursor(pt);
         }
@@ -534,7 +624,14 @@ impl State {
             return;
         };
         let side = self.cfg.mac_side;
+        let armed = self.recross.observe(&edge, side, x, y);
         if !is_pushing_out(&edge, side, x, y, dx, dy) {
+            return;
+        }
+        if !armed {
+            if self.recross.first_swallow() {
+                info!("re-cross guard: move away from the edge to cross again");
+            }
             return;
         }
         self.edge_quiet_until = Some(now + EDGE_DEBOUNCE);
@@ -563,18 +660,21 @@ impl State {
                     debug!(dx, dy, "hook: dropped oversized move");
                     None
                 } else {
-                    let (dx, dy) = scale_motion(dx, dy, self.cfg.pointer_speed);
-                    Some(InputMsg::Motion { dx, dy })
+                    // A slow move may round to nothing; its remainder carries over.
+                    match self.scaler.motion(dx, dy, self.cfg.pointer_speed) {
+                        (0, 0) => None,
+                        (dx, dy) => Some(InputMsg::Motion { dx, dy }),
+                    }
                 }
             }
-            WM_MOUSEWHEEL => Some(InputMsg::Scroll {
-                dx: 0,
-                dy: self.wheel(hiword),
-            }),
-            WM_MOUSEHWHEEL => Some(InputMsg::Scroll {
-                dx: self.wheel(hiword),
-                dy: 0,
-            }),
+            WM_MOUSEWHEEL => match self.wheel(WheelAxis::Vertical, hiword) {
+                0 => None,
+                dy => Some(InputMsg::Scroll { dx: 0, dy }),
+            },
+            WM_MOUSEHWHEEL => match self.wheel(WheelAxis::Horizontal, hiword) {
+                0 => None,
+                dx => Some(InputMsg::Scroll { dx, dy: 0 }),
+            },
             WM_LBUTTONDOWN => button(MouseButton::Left, true),
             WM_LBUTTONUP => button(MouseButton::Left, false),
             WM_RBUTTONDOWN => button(MouseButton::Right, true),
@@ -597,8 +697,9 @@ impl State {
         true
     }
 
-    fn wheel(&self, hiword: u16) -> i32 {
-        wheel_to_pixels(
+    fn wheel(&mut self, axis: WheelAxis, hiword: u16) -> i32 {
+        self.scaler.wheel(
+            axis,
             hiword as i16 as i32,
             self.cfg.scroll_speed,
             self.cfg.reverse_scroll,
@@ -689,6 +790,9 @@ unsafe extern "system" fn wnd_proc(
         }
         WM_DISPLAYCHANGE | WM_SETTINGCHANGE => {
             with_state(State::refresh_monitors);
+        }
+        WM_TIMER if wparam.0 == DESKTOP_TIMER => {
+            with_state(State::check_desktop);
         }
         _ => {}
     }
@@ -824,13 +928,52 @@ fn park_cursor((x, y): (i32, i32)) {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum DesktopVerdict {
+    Keep,
+    HookLost,
+}
+
+/// `name` is the input desktop's name, `None` if it could not be opened or
+/// read (the secure desktop denies access). Only "Default" is ours.
+fn desktop_verdict(name: Option<&str>) -> DesktopVerdict {
+    if name.is_some_and(|n| n.eq_ignore_ascii_case("Default")) {
+        DesktopVerdict::Keep
+    } else {
+        DesktopVerdict::HookLost
+    }
+}
+
+/// The name of the desktop receiving user input, if it can be read.
+fn input_desktop_name() -> Option<String> {
+    // SAFETY: no preconditions; the handle is closed below.
+    let desk =
+        unsafe { OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_READOBJECTS) }.ok()?;
+    let mut buf = [0u16; 256];
+    // SAFETY: `buf` is writable for the byte length passed.
+    let read = unsafe {
+        GetUserObjectInformationW(
+            HANDLE(desk.0),
+            UOI_NAME,
+            Some(buf.as_mut_ptr().cast()),
+            size_of_val(&buf) as u32,
+            None,
+        )
+    };
+    // SAFETY: `desk` came from OpenInputDesktop and is closed once.
+    let _ = unsafe { CloseDesktop(desk) };
+    read.ok()?;
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    Some(String::from_utf16_lossy(&buf[..len]))
+}
+
 fn is_down(vk: u16) -> bool {
     // SAFETY: GetAsyncKeyState has no preconditions.
     (unsafe { GetAsyncKeyState(vk as i32) } as u16) & 0x8000 != 0
 }
 
 fn mouse_buttons_held() -> bool {
-    [VK_LBUTTON, VK_RBUTTON, VK_MBUTTON]
+    [VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2]
         .into_iter()
         .any(|vk| is_down(vk.0))
 }
@@ -899,6 +1042,56 @@ fn entry_keys(vk: u16, sc: u32) -> (Option<PcKey>, Option<PcKey>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const GEDGE: Rect = Rect {
+        left: 0,
+        top: 0,
+        right: 1920,
+        bottom: 1080,
+    };
+
+    #[test]
+    fn recross_guard_armed_initially() {
+        let mut g = RecrossGuard::new();
+        assert!(g.observe(&GEDGE, Side::Right, 1919, 500));
+    }
+
+    #[test]
+    fn recross_guard_disarmed_until_eight_px_inward() {
+        let mut g = RecrossGuard::new();
+        g.disarm();
+        assert!(!g.observe(&GEDGE, Side::Right, 1919, 500));
+        assert!(!g.observe(&GEDGE, Side::Right, 1919 - 7, 500));
+        assert!(g.observe(&GEDGE, Side::Right, 1919 - 8, 500));
+        // Stays armed once re-armed, even back at the edge.
+        assert!(g.observe(&GEDGE, Side::Right, 1919, 500));
+    }
+
+    #[test]
+    fn recross_guard_mirrors_all_sides() {
+        for (side, edge_pt, near, far) in [
+            (Side::Right, (1919, 500), (1912, 500), (1911, 500)),
+            (Side::Left, (0, 500), (7, 500), (8, 500)),
+            (Side::Top, (500, 0), (500, 7), (500, 8)),
+            (Side::Bottom, (500, 1079), (500, 1072), (500, 1071)),
+        ] {
+            let mut g = RecrossGuard::new();
+            g.disarm();
+            assert!(!g.observe(&GEDGE, side, edge_pt.0, edge_pt.1), "{side:?}");
+            assert!(!g.observe(&GEDGE, side, near.0, near.1), "{side:?}");
+            assert!(g.observe(&GEDGE, side, far.0, far.1), "{side:?}");
+        }
+    }
+
+    #[test]
+    fn recross_guard_logs_once_per_disarm() {
+        let mut g = RecrossGuard::new();
+        g.disarm();
+        assert!(g.first_swallow());
+        assert!(!g.first_swallow());
+        g.disarm();
+        assert!(g.first_swallow());
+    }
     use windows::Win32::UI::WindowsAndMessaging::{KBDLLHOOKSTRUCT_FLAGS, WM_KEYUP};
 
     const CENTER: (i32, i32) = (960, 540);
@@ -1072,6 +1265,61 @@ mod tests {
                 InputMsg::Motion { dx: 200, dy: -200 }
             ]
         ));
+    }
+
+    #[test]
+    fn mouse_hook_carries_slow_motion_and_wheel_remainders() {
+        let (mut s, rx) = on_mac(&[]);
+        s.cfg.pointer_speed = 0.4;
+        let mv = MSLLHOOKSTRUCT {
+            pt: POINT {
+                x: CENTER.0 + 1,
+                y: CENTER.1,
+            },
+            ..Default::default()
+        };
+        for _ in 0..5 {
+            assert!(s.on_mouse_hook(WM_MOUSEMOVE, &mv));
+        }
+        // 0.4, 0.8, 0.2, 0.6, 0.0: two 1-px moves, no empty ones.
+        assert!(matches!(
+            drain(&rx)[..],
+            [
+                InputMsg::Motion { dx: 1, dy: 0 },
+                InputMsg::Motion { dx: 1, dy: 0 }
+            ]
+        ));
+        // A hi-res wheel delta of 1 (0.4 px) is held until it adds up.
+        let wheel = MSLLHOOKSTRUCT {
+            mouseData: 1 << 16,
+            ..Default::default()
+        };
+        assert!(s.on_mouse_hook(WM_MOUSEWHEEL, &wheel));
+        assert!(s.on_mouse_hook(WM_MOUSEWHEEL, &wheel));
+        assert!(matches!(
+            drain(&rx)[..],
+            [InputMsg::Scroll { dx: 0, dy: 1 }]
+        ));
+    }
+
+    #[test]
+    fn desktop_default_is_kept() {
+        assert_eq!(desktop_verdict(Some("Default")), DesktopVerdict::Keep);
+        assert_eq!(desktop_verdict(Some("default")), DesktopVerdict::Keep);
+    }
+
+    #[test]
+    fn desktop_secure_or_screen_saver_is_lost() {
+        assert_eq!(desktop_verdict(Some("Winlogon")), DesktopVerdict::HookLost);
+        assert_eq!(
+            desktop_verdict(Some("Screen-saver")),
+            DesktopVerdict::HookLost
+        );
+    }
+
+    #[test]
+    fn desktop_open_failure_is_lost() {
+        assert_eq!(desktop_verdict(None), DesktopVerdict::HookLost);
     }
 
     fn ms(n: u64) -> Duration {

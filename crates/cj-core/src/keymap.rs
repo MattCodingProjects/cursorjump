@@ -181,13 +181,19 @@ impl KeyRouter {
     }
 }
 
-/// Ctrl+Alt+Home (either Ctrl, either Alt) pressed.
+/// Ctrl+Alt+Home or Ctrl+Alt+Shift+H (either side of each modifier) pressed.
+/// The second combo exists for keyboards without a Home key (60% boards).
 pub fn is_return_hotkey(held: &HashSet<PcKey>, k: PcKey, down: bool) -> bool {
-    if !down || k.scancode != 0x47 || !k.extended {
+    if !down {
         return false;
     }
     let has = |sc: u16| held.iter().any(|h| h.scancode == sc);
-    has(0x1D) && has(0x38)
+    let ctrl_alt = has(0x1D) && has(0x38);
+    match (k.scancode, k.extended) {
+        (0x47, true) => ctrl_alt,
+        (0x23, false) => ctrl_alt && (has(0x2A) || has(0x36)),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -310,5 +316,20 @@ mod tests {
         assert!(!is_return_hotkey(&ctrl_only, home, true));
         assert!(!is_return_hotkey(&lctrl_lalt, home, false));
         assert!(!is_return_hotkey(&lctrl_lalt, k(0x47, false), true));
+    }
+
+    #[test]
+    fn return_hotkey_ctrl_alt_shift_h() {
+        let h = k(0x23, false);
+        let left: HashSet<PcKey> = [k(0x1D, false), k(0x38, false), k(0x2A, false)].into();
+        assert!(is_return_hotkey(&left, h, true));
+        let right: HashSet<PcKey> = [k(0x1D, true), k(0x38, true), k(0x36, false)].into();
+        assert!(is_return_hotkey(&right, h, true));
+        let ctrl_alt: HashSet<PcKey> = [k(0x1D, false), k(0x38, false)].into();
+        assert!(!is_return_hotkey(&ctrl_alt, h, true));
+        let ctrl_shift: HashSet<PcKey> = [k(0x1D, false), k(0x2A, false)].into();
+        assert!(!is_return_hotkey(&ctrl_shift, h, true));
+        assert!(!is_return_hotkey(&left, h, false));
+        assert!(!is_return_hotkey(&left, k(0x24, false), true));
     }
 }

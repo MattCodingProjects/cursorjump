@@ -1,8 +1,14 @@
 //! Windows platform layer.
+pub mod app;
+pub mod autostart;
+mod bridges;
+pub mod clipboard;
 pub mod cursor;
 pub mod input_thread;
+mod link;
 pub mod monitors;
 pub mod probe;
+mod settings_window;
 
 use std::time::{Duration, Instant};
 
@@ -11,6 +17,7 @@ use cj_core::gaming::game_locked;
 use cj_core::pc_state::PcEvent;
 use crossbeam_channel::RecvTimeoutError;
 use tracing::{debug, error, info};
+use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
@@ -31,8 +38,20 @@ pub fn init_process() {
     }));
 }
 
+/// Release builds have no console of their own; when started from a
+/// terminal, log to that terminal. Does nothing in debug builds, which have one.
+pub fn attach_parent_console() {
+    // SAFETY: plain FFI call. It fails harmlessly when there is no parent
+    // console or this process already has one.
+    let _ = unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
+}
+
 /// Longest stay on the "Mac" before diagnose forces a return.
-const MAC_SAFETY: Duration = Duration::from_secs(20);
+const MAC_SAFETY: Duration = Duration::from_secs(8);
+
+/// After any return to the PC, edge pushes are ignored this long so a user who
+/// is still pushing does not cross straight back.
+const RECROSS_COOLDOWN: Duration = Duration::from_secs(2);
 
 /// `--diagnose`: run the input thread with a stub app that logs every message
 /// and simulates crossing on edge pushes and returning on the hotkey.
@@ -41,12 +60,16 @@ pub fn run_diagnose(run_for: Duration) {
     let (cmd_tx, msg_rx) = spawn_input_thread(Config::default());
     info!(
         seconds = run_for.as_secs(),
-        "diagnose: push against the Mac edge to cross; Ctrl+Alt+Home returns"
+        "diagnose: push against the Mac edge to cross; Ctrl+Alt+Shift+H or Ctrl+Alt+Home returns (auto-return after {} s)",
+        MAC_SAFETY.as_secs()
     );
+    spawn_clipboard_logger();
     let mut diag = Diagnose {
         cmd_tx,
         on_mac_since: None,
         frac: 0.5,
+        cooldown_until: None,
+        cooldown_logged: false,
     };
     let deadline = Instant::now() + run_for;
     loop {
@@ -55,7 +78,10 @@ pub fn run_diagnose(run_for: Duration) {
             .on_mac_since
             .is_some_and(|since| now.duration_since(since) >= MAC_SAFETY)
         {
-            info!("diagnose: safety return after 20 s on the Mac");
+            info!(
+                "diagnose: safety return after {} s on the Mac",
+                MAC_SAFETY.as_secs()
+            );
             diag.return_to_pc();
         }
         if now >= deadline {
@@ -84,10 +110,36 @@ pub fn run_diagnose(run_for: Duration) {
     info!("diagnose: done");
 }
 
+/// Log a one-line summary per clipboard change (never the data itself).
+fn spawn_clipboard_logger() {
+    let rx = clipboard::spawn_clipboard_watcher();
+    let spawned = std::thread::Builder::new()
+        .name("cj-clipboard-log".into())
+        .spawn(move || {
+            let field = |len: Option<usize>| len.map_or("-".to_string(), |n| format!("{n}B"));
+            for d in rx {
+                info!(
+                    "clipboard: text={} html={} rtf={} png={}",
+                    field(d.text.as_ref().map(|v| v.len())),
+                    field(d.html.as_ref().map(|v| v.len())),
+                    field(d.rtf.as_ref().map(|v| v.len())),
+                    field(d.png.as_ref().map(|v| v.len())),
+                );
+            }
+        });
+    if let Err(e) = spawned {
+        error!("clipboard log thread failed to start: {e}");
+    }
+}
+
 struct Diagnose {
     cmd_tx: std::sync::mpsc::Sender<InputCmd>,
     on_mac_since: Option<Instant>,
     frac: f32,
+    /// Edge pushes are ignored until this instant (set on every return).
+    cooldown_until: Option<Instant>,
+    /// Whether the current cooldown window already logged an ignored push.
+    cooldown_logged: bool,
 }
 
 impl Diagnose {
@@ -96,6 +148,8 @@ impl Diagnose {
             .cmd_tx
             .send(InputCmd::ReturnToPc { pc_frac: self.frac });
         self.on_mac_since = None;
+        self.cooldown_until = Some(Instant::now() + RECROSS_COOLDOWN);
+        self.cooldown_logged = false;
     }
 
     fn handle(&mut self, msg: InputMsg) {
@@ -113,7 +167,12 @@ impl Diagnose {
             }) => {
                 let locked = game_locked(&game);
                 info!(frac, buttons_held, locked, ?game, "EdgePush");
-                if locked {
+                if self.cooldown_until.is_some_and(|t| Instant::now() < t) {
+                    if !self.cooldown_logged {
+                        self.cooldown_logged = true;
+                        info!("ignored: cooldown after returning to the PC");
+                    }
+                } else if locked {
                     info!("blocked: game");
                 } else if buttons_held {
                     info!("blocked: mouse button held");
