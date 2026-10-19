@@ -13,7 +13,7 @@
 #[cfg(target_os = "macos")]
 macro_rules! log {
     ($($arg:tt)*) => {
-        eprintln!("{} cursorjump-netd: {}", crate::timestamp(), format_args!($($arg)*))
+        crate::logging::write_line(format_args!($($arg)*))
     };
 }
 
@@ -21,6 +21,8 @@ macro_rules! log {
 mod awdl;
 #[cfg(target_os = "macos")]
 mod iface;
+#[cfg(target_os = "macos")]
+mod logging;
 #[cfg(target_os = "macos")]
 mod protocol;
 #[cfg(target_os = "macos")]
@@ -55,10 +57,13 @@ const INTERFACE: &str = "awdl0";
 /// How often a held interface is checked (macOS brings it back up).
 #[cfg(target_os = "macos")]
 const RECHECK: std::time::Duration = std::time::Duration::from_secs(1);
-
-/// Set by SIGTERM (launchctl bootout) or SIGINT.
+/// The plist's StandardErrorPath too (for anything written to stderr).
 #[cfg(target_os = "macos")]
-static STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+const LOG_FILE: &str = "/var/log/cursorjump-netd.log";
+
+/// Requested by SIGTERM (launchctl bootout) or SIGINT.
+#[cfg(target_os = "macos")]
+static STOP: std::sync::OnceLock<server::Stop> = std::sync::OnceLock::new();
 
 /// The uid from `--allowed-uid <uid>`, the only arguments accepted.
 #[cfg(target_os = "macos")]
@@ -76,13 +81,25 @@ fn parse_args(args: &[String]) -> Result<u32, String> {
 
 #[cfg(target_os = "macos")]
 fn run(allowed_uid: u32) -> std::io::Result<()> {
+    let _ = logging::LOG_FILE.set(LOG_FILE.into());
+    let stop = server::Stop::new().map_err(ctx("creating the stop pipe"))?;
+    let stop = STOP.get_or_init(|| stop);
     stop_on_signals().map_err(ctx("installing the signal handlers"))?;
-    let iface = iface::Interface::open(INTERFACE).map_err(ctx(INTERFACE))?;
+    let mut iface = iface::Interface::open(INTERFACE).map_err(ctx(INTERFACE))?;
+    // Before any client can hold it: an unclean exit (SIGKILL, a crash)
+    // may have left the interface down, and KeepAlive started this copy.
+    match awdl::bring_up_if_down(&mut iface) {
+        Ok(true) => {
+            log!("{INTERFACE} was down at start (an earlier run did not finish); brought it up")
+        }
+        Ok(false) => {}
+        Err(e) => log!("could not check {INTERFACE} at start: {e}"),
+    }
     let staff = group_id("staff").map_err(ctx("looking up the staff group"))?;
     let listener = server::bind(std::path::Path::new(SOCKET), Some(staff))
         .map_err(ctx(&format!("binding {SOCKET}")))?;
     log!("listening on {SOCKET} for uid {allowed_uid}");
-    let result = server::serve(listener, allowed_uid, iface, RECHECK, &STOP);
+    let result = server::serve(listener, allowed_uid, iface, RECHECK, stop);
     let _ = std::fs::remove_file(SOCKET);
     log!("stopped");
     result
@@ -96,18 +113,20 @@ fn ctx(what: &str) -> impl FnOnce(std::io::Error) -> std::io::Error {
 
 #[cfg(target_os = "macos")]
 extern "C" fn on_stop_signal(_: libc::c_int) {
-    STOP.store(true, std::sync::atomic::Ordering::SeqCst);
+    if let Some(stop) = STOP.get() {
+        stop.request();
+    }
 }
 
-/// SIGTERM and SIGINT set `STOP`. Without `SA_RESTART`, so they also
-/// interrupt the loop's poll().
+/// SIGTERM and SIGINT request `STOP`, which also wakes the loop's poll().
 #[cfg(target_os = "macos")]
 fn stop_on_signals() -> std::io::Result<()> {
     for sig in [libc::SIGTERM, libc::SIGINT] {
         // SAFETY: sigaction is plain data; all zeroes is an empty mask and no flags.
         let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
         sa.sa_sigaction = on_stop_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
-        // SAFETY: the handler only stores to an atomic, which is async-signal-safe.
+        // SAFETY: the handler only loads an initialized OnceLock and calls
+        // Stop::request (an atomic store and a write(2)): async-signal-safe.
         if unsafe { libc::sigaction(sig, &sa, std::ptr::null_mut()) } < 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -130,27 +149,6 @@ fn group_id(name: &str) -> std::io::Result<u32> {
     }
     // SAFETY: getgrnam returned a valid group entry.
     Ok(unsafe { (*gr).gr_gid })
-}
-
-/// Local time as `YYYY-MM-DD HH:MM:SS`, for the log.
-#[cfg(target_os = "macos")]
-fn timestamp() -> String {
-    // SAFETY: time(NULL) and localtime_r with a live tm are always safe.
-    let tm = unsafe {
-        let t = libc::time(std::ptr::null_mut());
-        let mut tm: libc::tm = std::mem::zeroed();
-        libc::localtime_r(&t, &mut tm);
-        tm
-    };
-    format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-        tm.tm_year + 1900,
-        tm.tm_mon + 1,
-        tm.tm_mday,
-        tm.tm_hour,
-        tm.tm_min,
-        tm.tm_sec
-    )
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -183,12 +181,5 @@ mod tests {
     fn the_staff_group_exists() {
         assert_eq!(group_id("staff").unwrap(), 20);
         assert!(group_id("no-such-group-cursorjump").is_err());
-    }
-
-    #[test]
-    fn timestamps_look_like_dates() {
-        let t = timestamp();
-        assert_eq!(t.len(), 19, "{t}");
-        assert!(t.starts_with("20"), "{t}");
     }
 }

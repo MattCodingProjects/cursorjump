@@ -3,18 +3,24 @@
 //! goes away. Only a state this daemon caused is undone.
 
 use std::collections::BTreeSet;
+use std::time::Instant;
 
 use crate::iface::Iface;
+use crate::logging::{LOG_EVERY, RateLimit, more};
 use crate::protocol::Command;
 
 /// A connection, numbered by the server.
 pub type ConnId = u64;
 
-pub struct Awdl<I> {
+pub struct Awdl<I: Iface> {
     iface: I,
     holders: BTreeSet<ConnId>,
     /// This daemon took the interface down and has not brought it back up.
     downed: bool,
+    /// Times macOS brought the interface back up during the current hold.
+    redowns: u64,
+    redown_log: RateLimit,
+    check_log: RateLimit,
 }
 
 impl<I: Iface> Awdl<I> {
@@ -23,11 +29,19 @@ impl<I: Iface> Awdl<I> {
             iface,
             holders: BTreeSet::new(),
             downed: false,
+            redowns: 0,
+            redown_log: RateLimit::new(LOG_EVERY),
+            check_log: RateLimit::new(LOG_EVERY),
         }
     }
 
     pub fn is_held(&self) -> bool {
         !self.holders.is_empty()
+    }
+
+    /// Whether `recheck` has work: while held, or while a restore failed.
+    pub fn wants_ticks(&self) -> bool {
+        self.is_held() || self.downed
     }
 
     /// Runs `conn`'s command; Err is the reason for an `err` reply.
@@ -36,6 +50,8 @@ impl<I: Iface> Awdl<I> {
             Command::AwdlDown => {
                 if !self.is_held() {
                     self.take_down().map_err(|e| e.to_string())?;
+                    self.redowns = 0;
+                    self.redown_log = RateLimit::new(LOG_EVERY);
                     log!("AWDL held down");
                 }
                 self.holders.insert(conn);
@@ -57,18 +73,32 @@ impl<I: Iface> Awdl<I> {
     pub fn recheck(&mut self) {
         let result = if self.is_held() {
             match self.iface.is_up() {
-                Ok(true) => {
-                    log!("macOS brought AWDL back up; taking it down again");
-                    self.take_down()
-                }
+                Ok(true) => self.take_down().inspect(|()| self.redowned()),
                 Ok(false) => Ok(()),
                 Err(e) => Err(e),
             }
         } else {
             self.restore()
         };
-        if let Err(e) = result {
-            log!("AWDL check failed: {e}");
+        if let Err(e) = result
+            && let Some(n) = self.check_log.hit(Instant::now())
+        {
+            log!("AWDL check failed: {e}{}", more(n));
+        }
+    }
+
+    /// Logs the first re-down of a hold, then a count at most every LOG_EVERY.
+    fn redowned(&mut self) {
+        self.redowns += 1;
+        match self.redown_log.hit(Instant::now()) {
+            Some(_) if self.redowns == 1 => log!(
+                "macOS brought AWDL back up; taking it down again (repeats are counted, not logged)"
+            ),
+            Some(n) => log!(
+                "macOS brought AWDL back up {} more times; took it down each time",
+                n + 1
+            ),
+            None => {}
         }
     }
 
@@ -85,7 +115,10 @@ impl<I: Iface> Awdl<I> {
         if !self.holders.remove(&conn) || self.is_held() {
             return Ok(());
         }
-        log!("AWDL released");
+        match self.redowns {
+            0 => log!("AWDL released"),
+            n => log!("AWDL released; macOS brought it back up {n} times during the hold"),
+        }
         self.restore().map_err(|e| e.to_string())
     }
 
@@ -104,6 +137,23 @@ impl<I: Iface> Awdl<I> {
             self.downed = false;
         }
         Ok(())
+    }
+}
+
+/// At start, before any client can hold it: brings `iface` up if it is
+/// down (an earlier run may have died holding it). True if it was down.
+pub fn bring_up_if_down<I: Iface>(iface: &mut I) -> std::io::Result<bool> {
+    if iface.is_up()? {
+        return Ok(false);
+    }
+    iface.set_up(true)?;
+    Ok(true)
+}
+
+impl<I: Iface> Drop for Awdl<I> {
+    /// Every way out restores, a panic unwinding out of the loop included.
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -222,6 +272,61 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn dropping_restores_a_held_interface() {
+        let fake = Fake::up();
+        let mut a = Awdl::new(fake.clone());
+        a.command(1, AwdlDown).unwrap();
+        drop(a);
+        assert!(fake.is_up());
+    }
+
+    #[test]
+    fn a_panic_while_held_restores() {
+        let fake = Fake::up();
+        let f = fake.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let mut a = Awdl::new(f);
+            a.command(1, AwdlDown).unwrap();
+            panic!("a bug while held");
+        }));
+        assert!(result.is_err());
+        assert!(fake.is_up(), "unwinding dropped the Awdl, which restored");
+    }
+
+    #[test]
+    fn a_down_interface_is_brought_up_at_start() {
+        let fake = Fake::default();
+        assert!(bring_up_if_down(&mut fake.clone()).unwrap());
+        assert!(fake.is_up());
+        assert_eq!(fake.take_sets(), [true]);
+    }
+
+    #[test]
+    fn an_up_interface_is_left_alone_at_start() {
+        let fake = Fake::up();
+        assert!(!bring_up_if_down(&mut fake.clone()).unwrap());
+        assert_eq!(fake.take_sets(), Vec::<bool>::new());
+    }
+
+    #[test]
+    fn ticks_are_wanted_only_while_held_or_restoring() {
+        let fake = Fake::up();
+        let mut a = Awdl::new(fake.clone());
+        assert!(!a.wants_ticks());
+        a.command(1, AwdlDown).unwrap();
+        assert!(a.wants_ticks());
+        fake.set_failing(true);
+        assert!(a.command(1, AwdlUp).is_err());
+        assert!(a.wants_ticks(), "the failed restore is retried");
+        fake.set_failing(false);
+        a.recheck();
+        assert!(fake.is_up());
+        assert!(!a.wants_ticks());
+    }
+
+    /// Within one run, a state this daemon did not cause is not undone.
+    /// (Across runs, `bring_up_if_down` at start covers an unclean exit.)
     #[test]
     fn an_interface_already_down_is_left_down() {
         let fake = Fake::default();

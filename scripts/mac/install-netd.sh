@@ -20,6 +20,7 @@ helper="/Library/PrivilegedHelperTools/$label"
 plist="/Library/LaunchDaemons/$label.plist"
 socket=/var/run/cursorjump-netd.sock
 log=/var/log/cursorjump-netd.log
+rotation="/etc/newsyslog.d/$label.conf"
 target=aarch64-apple-darwin
 identity="${CJ_SIGN_IDENTITY:-CursorJump Dev}"
 
@@ -55,11 +56,11 @@ if [[ "$mode" == uninstall ]]; then
     cat <<MSG
 About to, with sudo (it may ask for your password):
   - stop the $label LaunchDaemon (launchctl bootout system/$label)
-  - remove $plist and $helper
+  - remove $plist, $helper and $rotation
   - bring awdl0 back up (ifconfig awdl0 up)
 MSG
     stop_daemon
-    sudo rm -f "$plist" "$helper" "$socket"
+    sudo rm -f "$plist" "$helper" "$socket" "$rotation"
     sudo ifconfig awdl0 up
     echo "Uninstalled the Wi-Fi helper. Its log stays at $log."
     exit 0
@@ -85,6 +86,10 @@ work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 sed "s/__ALLOWED_UID__/$uid/g" "$here/$label.plist" >"$work/$label.plist"
 plutil -lint -s "$work/$label.plist"
+# newsyslog: rotate the log at 1 MB, keep 3 (bzip2). N: no signal; the
+# daemon opens the log afresh for each line.
+printf '# logfilename\t[owner:group]\tmode\tcount\tsize(KB)\twhen\tflags\n%s\troot:wheel\t644\t3\t1024\t*\tNJ\n' \
+    "$log" >"$work/$label.conf"
 
 cat <<MSG
 
@@ -92,12 +97,17 @@ About to, with sudo (it may ask for your password):
   - stop $label if it is running
   - install $helper (root:wheel 0755)
   - install $plist (root:wheel 0644), letting only uid $uid ($(id -un)) use the helper
+  - install $rotation (root:wheel 0644): rotate $log at 1 MB, keep 3
   - start it: launchctl bootstrap system $plist
 MSG
 stop_daemon
-sudo install -d -o root -g wheel -m 0755 /Library/PrivilegedHelperTools
+# An existing directory is left exactly as it is.
+[[ -d /Library/PrivilegedHelperTools ]] ||
+    sudo install -d -o root -g wheel -m 0755 /Library/PrivilegedHelperTools
 sudo install -S -o root -g wheel -m 0755 "$built" "$helper"
+sudo codesign --verify --strict -R="identifier \"$label\"" "$helper"
 sudo install -S -o root -g wheel -m 0644 "$work/$label.plist" "$plist"
+sudo install -S -o root -g wheel -m 0644 "$work/$label.conf" "$rotation"
 sudo launchctl bootstrap system "$plist"
 
 for _ in $(seq 1 25); do
@@ -117,6 +127,6 @@ while the PC is connected.
 
 Helper:    $helper
 Daemon:    $plist
-Log:       $log
+Log:       $log (rotated by $rotation)
 Uninstall: $0 --uninstall
 MSG
