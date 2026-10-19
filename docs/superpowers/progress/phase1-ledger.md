@@ -261,3 +261,4 @@ New CI prepared at scratchpad/ci.yml, waiting for a token with workflow scope: f
 Merge gate: CI with the new workflow green on both OSes (or `cargo test -p cursorjump` on the PC), then merge with the user's go-ahead.
 CI with the new workflow (63c5047, run 39279239862): SUCCESS on both OSes. The Windows app tests ran for the first time: 83 passed, 2 ignored (live-clipboard tests). fmt and clippy -D warnings gates pass on both; netd 48 passed on macOS.
 FINAL REVIEW COMPLETE: every Critical/Important/FIX NOW item is fixed and re-reviewed; PHASE 2 items are collected in docs/superpowers/progress/phase2-followups.md. Ready to merge phase1 → main, pending the user's go-ahead.
+MERGED: phase1 → main as f155ecf (user go-ahead, --no-ff). Phase 1 complete.
