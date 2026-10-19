@@ -2,6 +2,8 @@
 // window. Debug builds keep their console for development.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+#[cfg(target_os = "macos")]
+mod mac;
 mod paths;
 mod ui;
 #[cfg(windows)]

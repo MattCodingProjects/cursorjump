@@ -1,0 +1,76 @@
+//! Waking the display and keeping the Mac awake while it is in use.
+
+use std::sync::Mutex;
+
+use objc2_core_foundation::CFString;
+use objc2_io_kit::{
+    IOPMAssertionCreateWithName, IOPMAssertionDeclareUserActivity, IOPMAssertionID,
+    IOPMAssertionRelease, IOPMUserActiveType, kIOPMAssertionLevelOn,
+};
+use tracing::warn;
+
+/// `kIOReturnSuccess`.
+const IO_RETURN_SUCCESS: i32 = 0;
+/// `kIOPMAssertionTypePreventUserIdleSystemSleep` (a CFSTR macro in IOKit).
+const PREVENT_USER_IDLE_SYSTEM_SLEEP: &str = "PreventUserIdleSystemSleep";
+const ACTIVITY_NAME: &str = "CursorJump input from the PC";
+const STAY_AWAKE_NAME: &str = "CursorJump is connected to the PC";
+
+/// The user-activity assertion; reused on each call so repeated wakes
+/// refresh one assertion instead of creating new ones.
+static USER_ACTIVITY: Mutex<IOPMAssertionID> = Mutex::new(0);
+
+/// Tells the system a local user is active: wakes the display and resets
+/// the idle timer.
+pub fn wake_display() {
+    let mut id = USER_ACTIVITY.lock().unwrap_or_else(|e| e.into_inner());
+    let name = CFString::from_static_str(ACTIVITY_NAME);
+    // SAFETY: `name` is a valid CFString and `id` points to a live u32.
+    let ret = unsafe {
+        IOPMAssertionDeclareUserActivity(Some(&name), IOPMUserActiveType::Local, &mut *id)
+    };
+    if ret != IO_RETURN_SUCCESS {
+        warn!("IOPMAssertionDeclareUserActivity failed: {ret:#x}");
+    }
+}
+
+/// Prevents idle system sleep while it exists.
+#[derive(Debug)]
+pub struct StayAwake(IOPMAssertionID);
+
+impl StayAwake {
+    pub fn new() -> anyhow::Result<StayAwake> {
+        let kind = CFString::from_static_str(PREVENT_USER_IDLE_SYSTEM_SLEEP);
+        let name = CFString::from_static_str(STAY_AWAKE_NAME);
+        let mut id: IOPMAssertionID = 0;
+        // SAFETY: both strings are valid CFStrings and `id` is a live u32.
+        let ret = unsafe {
+            IOPMAssertionCreateWithName(Some(&kind), kIOPMAssertionLevelOn, Some(&name), &mut id)
+        };
+        if ret != IO_RETURN_SUCCESS {
+            anyhow::bail!("IOPMAssertionCreateWithName failed: {ret:#x}");
+        }
+        Ok(StayAwake(id))
+    }
+}
+
+impl Drop for StayAwake {
+    fn drop(&mut self) {
+        let ret = IOPMAssertionRelease(self.0);
+        if ret != IO_RETURN_SUCCESS {
+            warn!("IOPMAssertionRelease failed: {ret:#x}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stay_awake_creates_and_releases_an_assertion() {
+        let a = StayAwake::new().expect("power assertion");
+        assert_ne!(a.0, 0);
+        drop(a);
+    }
+}
