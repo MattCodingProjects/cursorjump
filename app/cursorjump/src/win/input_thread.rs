@@ -21,10 +21,14 @@ use cj_core::pc_state::PcEvent;
 use cj_core::proto::{MouseButton, Side};
 use tracing::{debug, error, info, warn};
 use windows::Win32::Foundation::{
-    ERROR_CLASS_ALREADY_EXISTS, ERROR_INVALID_THREAD_ID, HINSTANCE, HWND, LPARAM, LRESULT, POINT,
-    WPARAM,
+    ERROR_CLASS_ALREADY_EXISTS, ERROR_INVALID_THREAD_ID, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT,
+    POINT, WPARAM,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::StationsAndDesktops::{
+    CloseDesktop, DESKTOP_CONTROL_FLAGS, DESKTOP_READOBJECTS, GetUserObjectInformationW,
+    OpenInputDesktop, UOI_NAME,
+};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON,
@@ -36,12 +40,13 @@ use windows::Win32::UI::Input::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos,
-    GetMessageW, HHOOK, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLMHF_INJECTED, MSG,
-    MSLLHOOKSTRUCT, PostThreadMessageW, RegisterClassExW, SetCursorPos, SetWindowsHookExW,
-    UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE, WM_APP, WM_DISPLAYCHANGE,
-    WM_INPUT, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
-    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETTINGCHANGE,
-    WM_SYSKEYDOWN, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSEXW, WS_POPUP, XBUTTON1, XBUTTON2,
+    GetMessageW, HHOOK, KBDLLHOOKSTRUCT, KillTimer, LLKHF_EXTENDED, LLKHF_INJECTED, LLMHF_INJECTED,
+    MSG, MSLLHOOKSTRUCT, PostThreadMessageW, RegisterClassExW, SetCursorPos, SetTimer,
+    SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE, WM_APP,
+    WM_DISPLAYCHANGE, WM_INPUT, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
+    WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    WM_SETTINGCHANGE, WM_SYSKEYDOWN, WM_TIMER, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSEXW, WS_POPUP,
+    XBUTTON1, XBUTTON2,
 };
 use windows::core::w;
 
@@ -65,6 +70,11 @@ const WAKE_RETRY_STEP: Duration = Duration::from_millis(10);
 const WAKE_RETRY_LIMIT: Duration = Duration::from_secs(1);
 /// A single hook move larger than this on either axis is a warp, not motion: dropped.
 const MAX_HOOK_DELTA: i32 = 200;
+
+/// While on the Mac, how often the input desktop is checked (`DESKTOP_TIMER`).
+const DESKTOP_POLL: Duration = Duration::from_millis(150);
+/// The input window's timer id for the desktop check.
+const DESKTOP_TIMER: usize = 1;
 
 /// When set (diagnose mode), log every raw key event and the entry key snapshot.
 static DIAGNOSE_LOG: AtomicBool = AtomicBool::new(false);
@@ -294,6 +304,8 @@ impl RecrossGuard {
 }
 
 struct State {
+    /// The input thread's hidden window (owns the desktop-check timer).
+    hwnd: HWND,
     cfg: Config,
     out: crossbeam_channel::Sender<InputMsg>,
     edge: Option<Rect>,
@@ -347,7 +359,9 @@ fn run(
     }
     let edge = edge_monitor(&monitors(), cfg.mac_side);
     info!(?edge, side = ?cfg.mac_side, "input thread: edge monitor");
-    STATE.with(|cell| *cell.borrow_mut() = Some(State::new(cfg, out, edge)));
+    let mut state = State::new(cfg, out, edge);
+    state.hwnd = hwnd;
+    STATE.with(|cell| *cell.borrow_mut() = Some(state));
 
     if ready.send(unsafe { GetCurrentThreadId() }).is_ok() {
         message_loop(&cmds);
@@ -390,6 +404,7 @@ fn message_loop(cmds: &mpsc::Receiver<InputCmd>) {
 impl State {
     fn new(cfg: Config, out: crossbeam_channel::Sender<InputMsg>, edge: Option<Rect>) -> Self {
         State {
+            hwnd: HWND::default(),
             cfg,
             out,
             edge,
@@ -472,6 +487,32 @@ impl State {
         let center = park_and_read_back(target);
         self.scaler.reset();
         self.mac = Some(MacStay::new(hooks, center, Instant::now()));
+        // SAFETY: `hwnd` is this thread's window; WM_TIMER arrives in `wnd_proc`.
+        let ms = DESKTOP_POLL.as_millis() as u32;
+        if unsafe { SetTimer(Some(self.hwnd), DESKTOP_TIMER, ms, None) } == 0 {
+            warn!(
+                "desktop check: SetTimer failed: {}",
+                windows::core::Error::from_thread()
+            );
+        }
+    }
+
+    /// Ctrl+Alt+Del, Win+L and UAC switch the input desktop: our hooks then
+    /// never see the key-ups for downs already sent to the Mac. Treat it as a
+    /// lost hook, so the app releases everything and returns the cursor.
+    fn check_desktop(&mut self) {
+        let Some(stay) = &mut self.mac else {
+            return;
+        };
+        if stay.hook_lost_sent {
+            return;
+        }
+        let name = input_desktop_name();
+        if desktop_verdict(name.as_deref()) == DesktopVerdict::HookLost {
+            warn!(desktop = ?name, "input desktop switched away; hook lost");
+            stay.hook_lost_sent = true;
+            self.send(InputMsg::Edge(PcEvent::HookLost));
+        }
     }
 
     /// Keys already down at entry: their releases go to Windows, and they count
@@ -540,6 +581,8 @@ impl State {
         };
         remove_hooks(stay.hooks);
         info!("hooks: removed");
+        // SAFETY: kills this thread's own timer; failure means it was not running.
+        let _ = unsafe { KillTimer(Some(self.hwnd), DESKTOP_TIMER) };
         self.recross.disarm();
         if let Some(pt) = park_at {
             park_cursor(pt);
@@ -748,6 +791,9 @@ unsafe extern "system" fn wnd_proc(
         WM_DISPLAYCHANGE | WM_SETTINGCHANGE => {
             with_state(State::refresh_monitors);
         }
+        WM_TIMER if wparam.0 == DESKTOP_TIMER => {
+            with_state(State::check_desktop);
+        }
         _ => {}
     }
     // DefWindowProcW also performs the required WM_INPUT cleanup.
@@ -880,6 +926,45 @@ fn park_cursor((x, y): (i32, i32)) {
     if let Err(e) = unsafe { SetCursorPos(x, y) } {
         warn!("SetCursorPos({x}, {y}) failed: {e}");
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DesktopVerdict {
+    Keep,
+    HookLost,
+}
+
+/// `name` is the input desktop's name, `None` if it could not be opened or
+/// read (the secure desktop denies access). Only "Default" is ours.
+fn desktop_verdict(name: Option<&str>) -> DesktopVerdict {
+    if name.is_some_and(|n| n.eq_ignore_ascii_case("Default")) {
+        DesktopVerdict::Keep
+    } else {
+        DesktopVerdict::HookLost
+    }
+}
+
+/// The name of the desktop receiving user input, if it can be read.
+fn input_desktop_name() -> Option<String> {
+    // SAFETY: no preconditions; the handle is closed below.
+    let desk =
+        unsafe { OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_READOBJECTS) }.ok()?;
+    let mut buf = [0u16; 256];
+    // SAFETY: `buf` is writable for the byte length passed.
+    let read = unsafe {
+        GetUserObjectInformationW(
+            HANDLE(desk.0),
+            UOI_NAME,
+            Some(buf.as_mut_ptr().cast()),
+            size_of_val(&buf) as u32,
+            None,
+        )
+    };
+    // SAFETY: `desk` came from OpenInputDesktop and is closed once.
+    let _ = unsafe { CloseDesktop(desk) };
+    read.ok()?;
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    Some(String::from_utf16_lossy(&buf[..len]))
 }
 
 fn is_down(vk: u16) -> bool {
@@ -1215,6 +1300,26 @@ mod tests {
             drain(&rx)[..],
             [InputMsg::Scroll { dx: 0, dy: 1 }]
         ));
+    }
+
+    #[test]
+    fn desktop_default_is_kept() {
+        assert_eq!(desktop_verdict(Some("Default")), DesktopVerdict::Keep);
+        assert_eq!(desktop_verdict(Some("default")), DesktopVerdict::Keep);
+    }
+
+    #[test]
+    fn desktop_secure_or_screen_saver_is_lost() {
+        assert_eq!(desktop_verdict(Some("Winlogon")), DesktopVerdict::HookLost);
+        assert_eq!(
+            desktop_verdict(Some("Screen-saver")),
+            DesktopVerdict::HookLost
+        );
+    }
+
+    #[test]
+    fn desktop_open_failure_is_lost() {
+        assert_eq!(desktop_verdict(None), DesktopVerdict::HookLost);
     }
 
     fn ms(n: u64) -> Duration {
