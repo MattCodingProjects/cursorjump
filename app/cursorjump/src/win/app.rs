@@ -3,15 +3,15 @@
 //! `PcMachine`: it feeds it events and carries out the actions it returns.
 //!
 //! The input thread and the clipboard watcher are started once and outlive
-//! every reconnect. Two bridge threads (`bridges.rs`) move their output into
-//! the loop; the session itself lives in `link.rs`.
+//! every reconnect. Two bridge threads (`bridges.rs` and
+//! `common::clipboard_bridge`) move their output into the loop; the session
+//! itself lives in `link.rs`.
 
 use std::collections::VecDeque;
-use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use cj_core::clipboard::ClipboardData;
@@ -28,11 +28,14 @@ use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::core::w;
 
-use super::bridges::{ClipboardLink, bridge_clipboard, bridge_input};
-use super::clipboard::spawn_clipboard_watcher;
+use super::bridges::bridge_input;
+use super::clipboard::{read_clipboard, spawn_clipboard_watcher, write_clipboard};
 use super::input_thread::{InputCmd, InputMsg, spawn_input_thread};
 use super::link::{Backoff, Established, Live, NetEv, establish, paired_fingerprint};
-use super::settings_window::SettingsWindow;
+use super::settings_window::bring_to_front;
+use crate::common::clipboard_bridge::{ClipboardLink, bridge_clipboard};
+use crate::common::config_file::ConfigFile;
+use crate::common::settings_window::SettingsWindow;
 use crate::paths;
 use crate::ui::dialogs;
 use crate::ui::tray::{TrayCmd, TrayLoop, TrayModel, latency_text};
@@ -53,11 +56,11 @@ pub fn run_pc() -> Result<()> {
         return Ok(());
     };
     let dir = paths::config_dir()?;
-    let mut config_file = ConfigFile::new(paths::config_path()?);
+    let mut config_file = ConfigFile::new(paths::config_path()?, dialogs::notify_error);
     let identity = Identity::load_or_create(&dir).context("loading this PC's identity")?;
     let cfg = config_file.load_initial();
     info!(
-        config = %config_file.path.display(),
+        config = %config_file.path().display(),
         fingerprint = %identity.fingerprint().to_hex(),
         "CursorJump starting"
     );
@@ -68,8 +71,14 @@ pub fn run_pc() -> Result<()> {
     let (events, events_rx) = unbounded_channel();
     bridge_input(input_rx, events.clone())?;
     let clip_link = Arc::new(ClipboardLink::new(cfg.clipboard_max_bytes));
-    let clip_write =
-        bridge_clipboard(spawn_clipboard_watcher(), events.clone(), clip_link.clone())?;
+    let clip_events = events.clone();
+    let clip_write = bridge_clipboard(
+        spawn_clipboard_watcher(),
+        clip_link.clone(),
+        read_clipboard,
+        write_clipboard,
+        move |d| clip_events.send(Ev::LocalClipboard(d)).is_ok(),
+    )?;
     let (model_tx, model_rx) = std::sync::mpsc::channel();
 
     let app = App::new(
@@ -166,16 +175,6 @@ fn computer_name() -> String {
     std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows PC".into())
 }
 
-/// Shows an error box without blocking the caller.
-fn notify_user(text: String) {
-    let spawned = std::thread::Builder::new()
-        .name("cj-error-box".into())
-        .spawn(move || dialogs::show_error(&text));
-    if let Err(e) = spawned {
-        error!("could not show an error box: {e}");
-    }
-}
-
 /// Both pairing answers for the current pairing session. `PcMachine` needs
 /// the local answer with every `PairAnswered`, so a Mac answer that arrives
 /// first is held until this PC's user has answered.
@@ -206,76 +205,6 @@ impl PairAnswers {
     fn declined(&self) -> bool {
         self.local == Some(false) || self.remote == Some(false)
     }
-}
-
-/// The settings file as the loop sees it. A file that cannot be parsed is
-/// never applied and never written over.
-struct ConfigFile {
-    path: PathBuf,
-    stamp: Option<SystemTime>,
-}
-
-impl ConfigFile {
-    fn new(path: PathBuf) -> Self {
-        ConfigFile {
-            stamp: modified(&path),
-            path,
-        }
-    }
-
-    /// The config to start with. An unreadable file is reported and the
-    /// defaults are used in memory only.
-    fn load_initial(&mut self) -> Config {
-        match Config::try_load(&self.path) {
-            Ok(cfg) => cfg.unwrap_or_default(),
-            Err(e) => {
-                warn!("{e:#}; using default settings until the file is fixed");
-                notify_user(format!(
-                    "CursorJump's settings file can't be read:\n\n{e:#}\n\n\
-                     It is using default settings and won't change the file until \
-                     it is fixed or deleted."
-                ));
-                Config::default()
-            }
-        }
-    }
-
-    /// The new config if the file changed and parses. None keeps the current one.
-    fn poll(&mut self) -> Option<Config> {
-        let stamp = modified(&self.path);
-        if stamp == self.stamp {
-            return None;
-        }
-        self.stamp = stamp;
-        match Config::try_load(&self.path) {
-            Ok(Some(cfg)) => Some(cfg),
-            Ok(None) => {
-                info!("settings file removed; keeping the current settings");
-                None
-            }
-            Err(e) => {
-                warn!("{e:#}; keeping the current settings");
-                None
-            }
-        }
-    }
-
-    /// Applies `change` to the file as it is on disk (the settings window
-    /// may have written it) and saves it. A missing file starts from
-    /// `current`. Errs, leaving the file untouched, if it cannot be parsed.
-    fn update(&mut self, current: &Config, change: impl FnOnce(&mut Config)) -> Result<Config> {
-        let mut cfg = Config::try_load(&self.path)?.unwrap_or_else(|| current.clone());
-        change(&mut cfg);
-        let cfg = cfg.clamped();
-        cfg.save(&self.path)
-            .with_context(|| format!("saving {}", self.path.display()))?;
-        self.stamp = modified(&self.path);
-        Ok(cfg)
-    }
-}
-
-fn modified(path: &Path) -> Option<SystemTime> {
-    std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
 /// The loop's connections to the other threads.
@@ -711,20 +640,8 @@ impl App {
     /// cannot be parsed it is left alone: the change applies in memory only
     /// and the user is told.
     fn update_config(&mut self, change: impl FnOnce(&mut Config) + Clone) {
-        match self.config_file.update(&self.cfg, change.clone()) {
-            Ok(cfg) => self.apply_config(cfg),
-            Err(e) => {
-                warn!("not saving the settings file: {e:#}");
-                notify_user(format!(
-                    "CursorJump could not save this change, because its settings file \
-                     can't be read:\n\n{e:#}\n\nThe change applies until CursorJump \
-                     restarts. Fix or delete the file to save settings again."
-                ));
-                let mut cfg = self.cfg.clone();
-                change(&mut cfg);
-                self.apply_config(cfg.clamped());
-            }
-        }
+        let cfg = self.config_file.change(&self.cfg, change);
+        self.apply_config(cfg);
     }
 
     fn apply_config(&mut self, cfg: Config) {
@@ -771,9 +688,10 @@ impl App {
     }
 
     fn open_settings(&mut self) {
-        self.settings.open(|| {
-            std::env::current_exe().and_then(|exe| Command::new(exe).arg("--settings").spawn())
-        });
+        self.settings.open(
+            || std::env::current_exe().and_then(|exe| Command::new(exe).arg("--settings").spawn()),
+            bring_to_front,
+        );
     }
 
     /// Puts the cursor back on the PC, then stops the input thread; the loop
@@ -884,63 +802,5 @@ mod tests {
         let mut p = PairAnswers::default();
         let _ = p.local(false);
         assert!(p.declined());
-    }
-
-    fn file_with(dir: &tempfile::TempDir, text: &str) -> ConfigFile {
-        let path = dir.path().join("config.toml");
-        std::fs::write(&path, text).unwrap();
-        ConfigFile { path, stamp: None }
-    }
-
-    #[test]
-    fn config_poll_applies_a_valid_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut f = file_with(&dir, "paused = true\n");
-        assert!(f.poll().is_some_and(|c| c.paused));
-        assert!(f.poll().is_none(), "unchanged file is not re-applied");
-    }
-
-    #[test]
-    fn config_poll_keeps_current_on_a_corrupt_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut f = file_with(&dir, "paired_peer = \"ab\npaused = ");
-        assert!(f.poll().is_none());
-    }
-
-    #[test]
-    fn config_update_never_overwrites_a_corrupt_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let broken = "paired_peer = \"ab\npaused = ";
-        let mut f = file_with(&dir, broken);
-        let current = Config {
-            paired_peer: Some("ab".into()),
-            ..Config::default()
-        };
-        assert!(f.update(&current, |c| c.paused = true).is_err());
-        assert_eq!(std::fs::read_to_string(&f.path).unwrap(), broken);
-    }
-
-    #[test]
-    fn config_update_merges_onto_the_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut f = file_with(&dir, "mac_side = \"Left\"\n");
-        let cfg = f.update(&Config::default(), |c| c.paused = true).unwrap();
-        assert!(cfg.paused);
-        assert_eq!(cfg.mac_side, cj_core::proto::Side::Left);
-        assert_eq!(Config::try_load(&f.path).unwrap(), Some(cfg));
-    }
-
-    #[test]
-    fn config_update_without_a_file_starts_from_current() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        let mut f = ConfigFile::new(path);
-        let current = Config {
-            pointer_speed: 2.0,
-            ..Config::default()
-        };
-        let cfg = f.update(&current, |c| c.paused = true).unwrap();
-        assert_eq!(cfg.pointer_speed, 2.0);
-        assert!(cfg.paused);
     }
 }

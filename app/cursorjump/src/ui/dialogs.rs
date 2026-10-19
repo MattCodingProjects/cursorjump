@@ -93,3 +93,13 @@ pub fn show_error(text: &str) {
         .set_buttons(MessageButtons::Ok)
         .show();
 }
+
+/// Shows an error box on its own thread, without blocking the caller.
+pub fn notify_error(text: String) {
+    let spawned = std::thread::Builder::new()
+        .name("cj-error-box".into())
+        .spawn(move || show_error(&text));
+    if let Err(e) = spawned {
+        tracing::error!("could not show an error box: {e}");
+    }
+}
