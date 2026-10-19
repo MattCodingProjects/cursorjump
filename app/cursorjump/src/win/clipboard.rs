@@ -188,8 +188,10 @@ fn trim_nul(mut b: Vec<u8>) -> Vec<u8> {
 fn read_text() -> Option<String> {
     let b = get_bytes(CF_UNICODETEXT)?;
     let units: Vec<u16> = b
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&c| u16::from_le_bytes(c))
         .take_while(|&u| u != 0)
         .collect();
     Some(String::from_utf16_lossy(&units)).filter(|s| !s.is_empty())
