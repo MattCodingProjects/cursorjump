@@ -1,9 +1,11 @@
 //! Windows platform layer.
 pub mod app;
 pub mod autostart;
+mod bridges;
 pub mod clipboard;
 pub mod cursor;
 pub mod input_thread;
+mod link;
 pub mod monitors;
 pub mod probe;
 

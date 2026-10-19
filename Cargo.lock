@@ -527,6 +527,7 @@ dependencies = [
  "embed-manifest",
  "rfd",
  "tao",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

@@ -3,41 +3,39 @@
 //! `PcMachine`: it feeds it events and carries out the actions it returns.
 //!
 //! The input thread and the clipboard watcher are started once and outlive
-//! every reconnect. Two bridge threads move their output into the loop.
+//! every reconnect. Two bridge threads (`bridges.rs`) move their output into
+//! the loop; the session itself lives in `link.rs`.
 
 use std::collections::VecDeque;
-use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime};
 
-use anyhow::{Context, Result, bail};
-use cj_core::clipboard::{ClipboardData, EchoGuard, within_limit};
+use anyhow::{Context, Result};
+use cj_core::clipboard::ClipboardData;
 use cj_core::config::Config;
 use cj_core::latency::LatencyStats;
 use cj_core::pc_state::{Link, PcAction, PcEvent, PcMachine, Where};
 use cj_core::proto::{Control, Datagram};
-use cj_net::discovery::{DISCOVERY_PORT, QUIC_PORT, choose_peer, discover};
-use cj_net::session::{Session, connect};
-use cj_net::{Fingerprint, Identity, Trust};
+use cj_net::Identity;
+use cj_net::session::Session;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
-use tokio::sync::watch;
-use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior, interval, sleep_until};
 use tracing::{debug, error, info, warn};
 use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE};
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::core::w;
 
-use super::clipboard::{read_clipboard, spawn_clipboard_watcher, write_clipboard};
+use super::bridges::{ClipboardLink, bridge_clipboard, bridge_input};
+use super::clipboard::spawn_clipboard_watcher;
 use super::input_thread::{InputCmd, InputMsg, spawn_input_thread};
+use super::link::{Backoff, Established, Live, NetEv, establish, paired_fingerprint};
 use crate::paths;
 use crate::ui::dialogs;
 use crate::ui::tray::{TrayCmd, TrayLoop, TrayModel, latency_text};
 
-/// `discover` needs at least 3 s to get through mDNS and the broadcast fallback.
-const DISCOVER_TIMEOUT: Duration = Duration::from_secs(3);
 const PING_EVERY: Duration = Duration::from_millis(100);
 const CONFIG_POLL: Duration = Duration::from_millis(500);
 /// The latency readout is recomputed this often.
@@ -46,8 +44,6 @@ const LATENCY_REFRESH: Duration = Duration::from_secs(1);
 const PAIR_DECLINED_RETRY: Duration = Duration::from_secs(30);
 /// How long Quit waits for the input thread to put the cursor back.
 const QUIT_TIMEOUT: Duration = Duration::from_secs(2);
-/// Pongs reporting a longer round trip are ignored as bogus.
-const MAX_RTT: Duration = Duration::from_secs(10);
 
 /// Runs the PC app until Quit. Exits early (Ok) if another instance is running.
 pub fn run_pc() -> Result<()> {
@@ -56,11 +52,11 @@ pub fn run_pc() -> Result<()> {
         return Ok(());
     };
     let dir = paths::config_dir()?;
-    let cfg_path = paths::config_path()?;
+    let mut config_file = ConfigFile::new(paths::config_path()?);
     let identity = Identity::load_or_create(&dir).context("loading this PC's identity")?;
-    let cfg = Config::load(&cfg_path);
+    let cfg = config_file.load_initial();
     info!(
-        config = %cfg_path.display(),
+        config = %config_file.path.display(),
         fingerprint = %identity.fingerprint().to_hex(),
         "CursorJump starting"
     );
@@ -70,17 +66,22 @@ pub fn run_pc() -> Result<()> {
     let (input, input_rx) = spawn_input_thread(cfg.clone());
     let (events, events_rx) = unbounded_channel();
     bridge_input(input_rx, events.clone())?;
-    let clip_write = bridge_clipboard(spawn_clipboard_watcher(), events.clone())?;
+    let clip_link = Arc::new(ClipboardLink::new(cfg.clipboard_max_bytes));
+    let clip_write =
+        bridge_clipboard(spawn_clipboard_watcher(), events.clone(), clip_link.clone())?;
     let (model_tx, model_rx) = std::sync::mpsc::channel();
 
     let app = App::new(
         cfg,
-        cfg_path,
+        config_file,
         identity,
-        input,
-        clip_write,
-        model_tx,
-        events.clone(),
+        Channels {
+            input,
+            clip_write,
+            clip_link,
+            tray: model_tx,
+            events: events.clone(),
+        },
     );
     std::thread::Builder::new()
         .name("cj-link".into())
@@ -128,13 +129,11 @@ impl Drop for SingleInstance {
 }
 
 /// Everything the loop reacts to, apart from its own timers.
-enum Ev {
+pub(super) enum Ev {
     Input(InputMsg),
     InputGone,
-    /// The user copied something on this PC.
+    /// A local copy that passed the clipboard gate.
     LocalClipboard(ClipboardData),
-    /// Clipboard data from the Mac was written here; this is its local hash.
-    ClipboardApplied(u64),
     Tray(TrayCmd),
     ForgetConfirmed(bool),
     Established(Result<Established>),
@@ -146,44 +145,6 @@ enum Ev {
         sid: u64,
         ev: NetEv,
     },
-}
-
-enum NetEv {
-    Control(Control),
-    Pong { sent_us: u64 },
-    Clipboard(ClipboardData),
-    Closed(String),
-}
-
-struct Established {
-    session: Session,
-    /// The pairing code when the session was made in pairing mode.
-    code: Option<String>,
-}
-
-/// Reconnect delays: 250 ms, 500 ms, 1 s, then 2 s until a connection succeeds.
-#[derive(Debug, Default)]
-struct Backoff {
-    failures: usize,
-}
-
-impl Backoff {
-    const STEPS: [Duration; 3] = [
-        Duration::from_millis(250),
-        Duration::from_millis(500),
-        Duration::from_secs(1),
-    ];
-    const CAP: Duration = Duration::from_secs(2);
-
-    fn next_delay(&mut self) -> Duration {
-        let d = Self::STEPS.get(self.failures).copied().unwrap_or(Self::CAP);
-        self.failures = self.failures.saturating_add(1);
-        d
-    }
-
-    fn reset(&mut self) {
-        self.failures = 0;
-    }
 }
 
 /// The tray's status line.
@@ -200,173 +161,139 @@ fn status_text(link: &Link, peer_name: Option<&str>, paused: bool) -> String {
     }
 }
 
-/// `manual_peer_addr` as "ip:port", or a bare IP on the default port.
-fn manual_addr(s: &str) -> Option<SocketAddr> {
-    let s = s.trim();
-    s.parse().ok().or_else(|| {
-        s.parse::<IpAddr>()
-            .ok()
-            .map(|ip| SocketAddr::new(ip, QUIC_PORT))
-    })
-}
-
-fn paired_fingerprint(cfg: &Config) -> Option<Fingerprint> {
-    let hex = cfg.paired_peer.as_deref()?;
-    let fp = Fingerprint::from_hex(hex);
-    if fp.is_none() {
-        warn!("paired_peer in the config is not a fingerprint; treating as unpaired");
-    }
-    fp
-}
-
-fn modified(path: &std::path::Path) -> Option<SystemTime> {
-    std::fs::metadata(path).and_then(|m| m.modified()).ok()
-}
-
 fn computer_name() -> String {
     std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows PC".into())
 }
 
-/// Discovery, then connect: pinned to the paired Mac, or in pairing mode
-/// (running the pairing exchange before anything else uses the session).
-async fn establish(id: &Identity, cfg: &Config, name: &str) -> Result<Established> {
-    let paired = paired_fingerprint(cfg);
-    let peers = discover(DISCOVER_TIMEOUT, DISCOVERY_PORT)
-        .await
-        .context("discovery")?;
-    let addr = match choose_peer(&peers, paired.as_ref()) {
-        Some(peer) => peer.addr,
-        None => match cfg.manual_peer_addr.as_deref() {
-            Some(s) => manual_addr(s).with_context(|| format!("bad manual_peer_addr {s:?}"))?,
-            None => bail!("no Mac found ({} other device(s) answered)", peers.len()),
-        },
-    };
-    let trust = paired.map_or(Trust::PairingMode, Trust::Pinned);
-    let session = connect(id, trust, addr, name).await?;
-    let code = match paired {
-        Some(_) => None,
-        None => Some(session.pair().await.context("pairing exchange")?),
-    };
-    Ok(Established { session, code })
-}
-
-/// The current session and the tasks serving it. Dropping it closes the session.
-struct Live {
-    sid: u64,
-    session: Session,
-    peer_name: String,
-    /// Latest local clipboard item to send; a newer one replaces an unsent one.
-    clip_out: watch::Sender<Option<Arc<ClipboardData>>>,
-    tasks: Vec<JoinHandle<()>>,
-}
-
-impl Live {
-    /// Starts the readers. Only call once any pairing exchange is done.
-    fn start(sid: u64, session: Session, clip_max: u64, events: &UnboundedSender<Ev>) -> Live {
-        let net = move |ev| Ev::Net { sid, ev };
-        let mut tasks = Vec::new();
-
-        let (s, tx) = (session.clone(), events.clone());
-        tasks.push(tokio::spawn(async move {
-            let reason = loop {
-                match s.recv_control().await {
-                    Ok(c) => {
-                        if tx.send(net(NetEv::Control(c))).is_err() {
-                            return;
-                        }
-                    }
-                    Err(e) => break format!("control stream: {e:#}"),
-                }
-            };
-            let _ = tx.send(net(NetEv::Closed(reason)));
-        }));
-
-        let (s, tx) = (session.clone(), events.clone());
-        tasks.push(tokio::spawn(async move {
-            let reason = loop {
-                match s.recv_datagram().await {
-                    Ok(Datagram::Pong { sent_us, .. }) => {
-                        if tx.send(net(NetEv::Pong { sent_us })).is_err() {
-                            return;
-                        }
-                    }
-                    // The Mac measures latency too.
-                    Ok(Datagram::Ping { seq, sent_us }) => {
-                        let _ = s.send_datagram(&Datagram::Pong { seq, sent_us });
-                    }
-                    Ok(_) => {}
-                    Err(e) => break format!("connection: {e:#}"),
-                }
-            };
-            let _ = tx.send(net(NetEv::Closed(reason)));
-        }));
-
-        let (s, tx) = (session.clone(), events.clone());
-        tasks.push(tokio::spawn(async move {
-            loop {
-                match s.recv_clipboard(clip_max).await {
-                    Ok(d) => {
-                        if tx.send(net(NetEv::Clipboard(d))).is_err() {
-                            return;
-                        }
-                    }
-                    // A closed session is reported by the other readers.
-                    Err(_) if is_closed(&s).await => return,
-                    Err(e) => warn!("clipboard from the Mac not accepted: {e:#}"),
-                }
-            }
-        }));
-
-        let (clip_out, mut clip_rx) = watch::channel(None::<Arc<ClipboardData>>);
-        let s = session.clone();
-        tasks.push(tokio::spawn(async move {
-            while clip_rx.changed().await.is_ok() {
-                let item = clip_rx.borrow_and_update().clone();
-                if let Some(d) = item
-                    && let Err(e) = s.send_clipboard(&d).await
-                {
-                    debug!("clipboard not sent: {e:#}");
-                }
-            }
-        }));
-
-        Live {
-            sid,
-            peer_name: session.peer_name(),
-            session,
-            clip_out,
-            tasks,
-        }
+/// Shows an error box without blocking the caller.
+fn notify_user(text: String) {
+    let spawned = std::thread::Builder::new()
+        .name("cj-error-box".into())
+        .spawn(move || dialogs::show_error(&text));
+    if let Err(e) = spawned {
+        error!("could not show an error box: {e}");
     }
 }
 
-impl Drop for Live {
-    fn drop(&mut self) {
-        for t in &self.tasks {
-            t.abort();
+/// Both pairing answers for the current pairing session. `PcMachine` needs
+/// the local answer with every `PairAnswered`, so a Mac answer that arrives
+/// first is held until this PC's user has answered.
+#[derive(Debug, Default)]
+struct PairAnswers {
+    local: Option<bool>,
+    remote: Option<bool>,
+}
+
+impl PairAnswers {
+    fn local(&mut self, accepted: bool) -> PcEvent {
+        self.local = Some(accepted);
+        PcEvent::PairAnswered {
+            local: accepted,
+            remote: self.remote,
         }
-        self.session.close();
+    }
+
+    /// None until the local answer is known.
+    fn remote(&mut self, accepted: bool) -> Option<PcEvent> {
+        self.remote = Some(accepted);
+        self.local.map(|local| PcEvent::PairAnswered {
+            local,
+            remote: Some(accepted),
+        })
+    }
+
+    fn declined(&self) -> bool {
+        self.local == Some(false) || self.remote == Some(false)
     }
 }
 
-async fn is_closed(s: &Session) -> bool {
-    tokio::time::timeout(Duration::ZERO, s.closed())
-        .await
-        .is_ok()
+/// The settings file as the loop sees it. A file that cannot be parsed is
+/// never applied and never written over.
+struct ConfigFile {
+    path: PathBuf,
+    stamp: Option<SystemTime>,
+}
+
+impl ConfigFile {
+    fn new(path: PathBuf) -> Self {
+        ConfigFile {
+            stamp: modified(&path),
+            path,
+        }
+    }
+
+    /// The config to start with. An unreadable file is reported and the
+    /// defaults are used in memory only.
+    fn load_initial(&mut self) -> Config {
+        match Config::try_load(&self.path) {
+            Ok(cfg) => cfg.unwrap_or_default(),
+            Err(e) => {
+                warn!("{e:#}; using default settings until the file is fixed");
+                notify_user(format!(
+                    "CursorJump's settings file can't be read:\n\n{e:#}\n\n\
+                     It is using default settings and won't change the file until \
+                     it is fixed or deleted."
+                ));
+                Config::default()
+            }
+        }
+    }
+
+    /// The new config if the file changed and parses. None keeps the current one.
+    fn poll(&mut self) -> Option<Config> {
+        let stamp = modified(&self.path);
+        if stamp == self.stamp {
+            return None;
+        }
+        self.stamp = stamp;
+        match Config::try_load(&self.path) {
+            Ok(Some(cfg)) => Some(cfg),
+            Ok(None) => {
+                info!("settings file removed; keeping the current settings");
+                None
+            }
+            Err(e) => {
+                warn!("{e:#}; keeping the current settings");
+                None
+            }
+        }
+    }
+
+    /// Applies `change` to the file as it is on disk (the settings window
+    /// may have written it) and saves it. A missing file starts from
+    /// `current`. Errs, leaving the file untouched, if it cannot be parsed.
+    fn update(&mut self, current: &Config, change: impl FnOnce(&mut Config)) -> Result<Config> {
+        let mut cfg = Config::try_load(&self.path)?.unwrap_or_else(|| current.clone());
+        change(&mut cfg);
+        let cfg = cfg.clamped();
+        cfg.save(&self.path)
+            .with_context(|| format!("saving {}", self.path.display()))?;
+        self.stamp = modified(&self.path);
+        Ok(cfg)
+    }
+}
+
+fn modified(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// The loop's connections to the other threads.
+struct Channels {
+    input: std::sync::mpsc::Sender<InputCmd>,
+    clip_write: crossbeam_channel::Sender<ClipboardData>,
+    clip_link: Arc<ClipboardLink>,
+    tray: std::sync::mpsc::Sender<TrayModel>,
+    events: UnboundedSender<Ev>,
 }
 
 struct App {
     machine: PcMachine,
     cfg: Config,
-    cfg_path: PathBuf,
-    cfg_stamp: Option<SystemTime>,
+    config_file: ConfigFile,
     identity: Arc<Identity>,
     name: String,
-    input: std::sync::mpsc::Sender<InputCmd>,
-    clip_write: crossbeam_channel::Sender<ClipboardData>,
-    tray: std::sync::mpsc::Sender<TrayModel>,
+    ch: Channels,
     last_model: Option<TrayModel>,
-    events: UnboundedSender<Ev>,
     /// Machine actions not carried out yet.
     pending: VecDeque<PcAction>,
     link: Option<Live>,
@@ -377,10 +304,7 @@ struct App {
     retry_at: Option<Instant>,
     backoff: Backoff,
     pair_dialog_open: bool,
-    pair_local: Option<bool>,
-    pair_remote: Option<bool>,
-    pair_declined: bool,
-    echo: EchoGuard,
+    pair: PairAnswers,
     latency: LatencyStats,
     latency_text: String,
     ping_seq: u32,
@@ -392,28 +316,16 @@ struct App {
 }
 
 impl App {
-    fn new(
-        cfg: Config,
-        cfg_path: PathBuf,
-        identity: Identity,
-        input: std::sync::mpsc::Sender<InputCmd>,
-        clip_write: crossbeam_channel::Sender<ClipboardData>,
-        tray: std::sync::mpsc::Sender<TrayModel>,
-        events: UnboundedSender<Ev>,
-    ) -> App {
+    fn new(cfg: Config, config_file: ConfigFile, identity: Identity, ch: Channels) -> App {
         let latency = LatencyStats::new();
         App {
             machine: PcMachine::new(cfg.clone()),
-            cfg_stamp: modified(&cfg_path),
             cfg,
-            cfg_path,
+            config_file,
             identity: Arc::new(identity),
             name: computer_name(),
-            input,
-            clip_write,
-            tray,
+            ch,
             last_model: None,
-            events,
             pending: VecDeque::new(),
             link: None,
             dead: None,
@@ -422,10 +334,7 @@ impl App {
             retry_at: Some(Instant::now()),
             backoff: Backoff::default(),
             pair_dialog_open: false,
-            pair_local: None,
-            pair_remote: None,
-            pair_declined: false,
-            echo: EchoGuard::new(),
+            pair: PairAnswers::default(),
             latency_text: latency_text(&latency),
             latency,
             ping_seq: 0,
@@ -454,7 +363,11 @@ impl App {
                     self.start_connect();
                 }
                 _ = ping.tick() => self.ping(),
-                _ = config_poll.tick() => self.poll_config(),
+                _ = config_poll.tick() => {
+                    if let Some(cfg) = self.config_file.poll() {
+                        self.apply_config(cfg);
+                    }
+                }
                 _ = latency_refresh.tick() => self.latency_text = latency_text(&self.latency),
                 _ = sleep_until(quit_by.unwrap_or_else(Instant::now)), if quit_by.is_some() => {
                     warn!("input thread did not stop in time");
@@ -521,8 +434,14 @@ impl App {
                 }
                 self.done = true;
             }
-            Ev::LocalClipboard(d) => self.send_clipboard(d),
-            Ev::ClipboardApplied(hash) => self.echo.mark_applied(hash),
+            Ev::LocalClipboard(d) => {
+                // The bridge already gated it; the link may have dropped since.
+                if self.paired_session().is_some()
+                    && let Some(live) = &self.link
+                {
+                    live.send_clipboard(d);
+                }
+            }
             Ev::Tray(cmd) => self.on_tray(cmd).await,
             Ev::ForgetConfirmed(yes) => {
                 if yes {
@@ -581,18 +500,11 @@ impl App {
                 self.on_remote_pair_answer(accepted)
             }
             NetEv::Control(other) => debug!(?other, "ignoring unexpected control message"),
-            NetEv::Pong { sent_us } => {
-                let now_us = self.epoch.elapsed().as_micros() as u64;
-                if let Some(rtt) = now_us.checked_sub(sent_us).map(Duration::from_micros)
-                    && rtt <= MAX_RTT
-                {
-                    self.latency.record(std::time::Instant::now(), rtt);
-                }
-            }
+            NetEv::Pong { rtt, at } => self.latency.record(at, rtt),
             NetEv::Clipboard(d) => {
                 if self.paired_session().is_some()
                     && !d.is_empty()
-                    && self.clip_write.send(d).is_err()
+                    && self.ch.clip_write.send(d).is_err()
                 {
                     warn!("clipboard bridge is gone; clipboard from the Mac dropped");
                 }
@@ -614,7 +526,7 @@ impl App {
         }
         self.connecting = true;
         let (id, cfg, name) = (self.identity.clone(), self.cfg.clone(), self.name.clone());
-        let tx = self.events.clone();
+        let tx = self.ch.events.clone();
         tokio::spawn(async move {
             let result = establish(&id, &cfg, &name).await;
             let _ = tx.send(Ev::Established(result));
@@ -639,7 +551,13 @@ impl App {
         self.backoff.reset();
         let sid = self.next_sid;
         self.next_sid += 1;
-        let live = Live::start(sid, session, self.cfg.clipboard_max_bytes, &self.events);
+        let live = Live::start(
+            sid,
+            session,
+            self.cfg.clipboard_max_bytes,
+            self.epoch,
+            &self.ch.events,
+        );
         info!(peer = %live.peer_name, paired = code.is_none(), "connected");
         self.link = Some(live);
         self.reset_latency();
@@ -649,8 +567,7 @@ impl App {
                 code: String::new(),
             }),
             Some(code) => {
-                self.pair_local = None;
-                self.pair_remote = None;
+                self.pair = PairAnswers::default();
                 self.feed(PcEvent::Connected {
                     paired: false,
                     code,
@@ -664,7 +581,7 @@ impl App {
         self.link = None;
         self.dead = None;
         self.reset_latency();
-        let delay = if std::mem::take(&mut self.pair_declined) {
+        let delay = if std::mem::take(&mut self.pair).declined() {
             PAIR_DECLINED_RETRY
         } else {
             self.backoff.next_delay()
@@ -683,7 +600,7 @@ impl App {
         let Some(live) = &self.link else {
             return;
         };
-        let (sid, peer, tx) = (live.sid, live.peer_name.clone(), self.events.clone());
+        let (sid, peer, tx) = (live.sid, live.peer_name.clone(), self.ch.events.clone());
         info!(peer = %peer, "pairing: confirm the code on both screens");
         self.pair_dialog_open = true;
         tokio::spawn(async move {
@@ -709,12 +626,8 @@ impl App {
             // The Mac never heard the answer: do not persist a pairing it may lack.
             return;
         }
-        self.pair_local = Some(accepted);
-        self.pair_declined |= !accepted;
-        self.feed(PcEvent::PairAnswered {
-            local: accepted,
-            remote: self.pair_remote,
-        });
+        let ev = self.pair.local(accepted);
+        self.feed(ev);
     }
 
     fn on_remote_pair_answer(&mut self, accepted: bool) {
@@ -722,15 +635,8 @@ impl App {
             return;
         }
         info!(accepted, "pairing: answered on the Mac");
-        self.pair_remote = Some(accepted);
-        self.pair_declined |= !accepted;
-        // The machine takes both answers together; until this PC's user has
-        // answered, the Mac's answer waits here.
-        if let Some(local) = self.pair_local {
-            self.feed(PcEvent::PairAnswered {
-                local,
-                remote: Some(accepted),
-            });
+        if let Some(ev) = self.pair.remote(accepted) {
+            self.feed(ev);
         }
     }
 
@@ -779,7 +685,7 @@ impl App {
     }
 
     fn send_input(&self, cmd: InputCmd) {
-        if self.input.send(cmd).is_err() {
+        if self.ch.input.send(cmd).is_err() {
             error!("input thread is gone");
         }
     }
@@ -796,49 +702,26 @@ impl App {
         });
     }
 
-    /// Skip empty, enforce the size limit, suppress echoes and repeats, then send.
-    fn send_clipboard(&mut self, d: ClipboardData) {
-        if self.paired_session().is_none() || d.is_empty() {
-            return;
-        }
-        if !within_limit(&d, self.cfg.clipboard_max_bytes) {
-            info!(
-                bytes = d.byte_len(),
-                limit = self.cfg.clipboard_max_bytes,
-                "clipboard too large to send; skipped"
-            );
-            return;
-        }
-        if !self.echo.should_send(d.content_hash()) {
-            return;
-        }
-        if let Some(live) = &self.link {
-            live.clip_out.send_replace(Some(Arc::new(d)));
-        }
-    }
-
     // ----------------------------------------------------------------- config
 
-    fn poll_config(&mut self) {
-        let stamp = modified(&self.cfg_path);
-        if stamp == self.cfg_stamp {
-            return;
+    /// Saves `change` to the settings file and applies it. If the file
+    /// cannot be parsed it is left alone: the change applies in memory only
+    /// and the user is told.
+    fn update_config(&mut self, change: impl FnOnce(&mut Config) + Clone) {
+        match self.config_file.update(&self.cfg, change.clone()) {
+            Ok(cfg) => self.apply_config(cfg),
+            Err(e) => {
+                warn!("not saving the settings file: {e:#}");
+                notify_user(format!(
+                    "CursorJump could not save this change, because its settings file \
+                     can't be read:\n\n{e:#}\n\nThe change applies until CursorJump \
+                     restarts. Fix or delete the file to save settings again."
+                ));
+                let mut cfg = self.cfg.clone();
+                change(&mut cfg);
+                self.apply_config(cfg.clamped());
+            }
         }
-        self.cfg_stamp = stamp;
-        self.apply_config(Config::load(&self.cfg_path));
-    }
-
-    /// Changes the file as it is on disk (the settings window may have
-    /// written it), then applies the result.
-    fn update_config(&mut self, change: impl FnOnce(&mut Config)) {
-        let mut cfg = Config::load(&self.cfg_path);
-        change(&mut cfg);
-        let cfg = cfg.clamped();
-        match cfg.save(&self.cfg_path) {
-            Ok(()) => self.cfg_stamp = modified(&self.cfg_path),
-            Err(e) => warn!("saving {}: {e}", self.cfg_path.display()),
-        }
-        self.apply_config(cfg);
     }
 
     fn apply_config(&mut self, cfg: Config) {
@@ -848,6 +731,10 @@ impl App {
         info!("settings changed");
         let pairing_changed = cfg.paired_peer != self.cfg.paired_peer;
         self.cfg = cfg.clone();
+        self.ch
+            .clip_link
+            .max_bytes
+            .store(cfg.clipboard_max_bytes, Ordering::Relaxed);
         self.send_input(InputCmd::ApplyConfig(cfg.clone()));
         self.feed(PcEvent::ConfigChanged(cfg));
         // A session pinned to a computer that is no longer the paired one must go.
@@ -867,11 +754,11 @@ impl App {
             TrayCmd::TogglePause => {
                 let paused = !self.cfg.paused;
                 info!(paused, "pause toggled");
-                self.update_config(|c| c.paused = paused);
+                self.update_config(move |c| c.paused = paused);
             }
             TrayCmd::OpenSettings => self.open_settings(),
             TrayCmd::ForgetPairing => {
-                let tx = self.events.clone();
+                let tx = self.ch.events.clone();
                 tokio::spawn(async move {
                     let _ = tx.send(Ev::ForgetConfirmed(dialogs::confirm_forget().await));
                 });
@@ -909,7 +796,12 @@ impl App {
         self.quit_by = Some(Instant::now() + QUIT_TIMEOUT);
     }
 
+    /// Updates the tray, and tells the clipboard bridge whether copies are wanted.
     fn publish(&mut self) {
+        self.ch
+            .clip_link
+            .connected
+            .store(self.paired_session().is_some(), Ordering::Relaxed);
         let peer = self.link.as_ref().map(|l| l.peer_name.as_str());
         let model = TrayModel {
             status: status_text(self.machine.link(), peer, self.cfg.paused),
@@ -917,105 +809,15 @@ impl App {
             paused: self.cfg.paused,
         };
         if self.last_model.as_ref() != Some(&model) {
-            let _ = self.tray.send(model.clone());
+            let _ = self.ch.tray.send(model.clone());
             self.last_model = Some(model);
         }
     }
 }
 
-/// Moves input-thread messages into the loop.
-fn bridge_input(
-    rx: crossbeam_channel::Receiver<InputMsg>,
-    events: UnboundedSender<Ev>,
-) -> Result<()> {
-    std::thread::Builder::new()
-        .name("cj-input-bridge".into())
-        .spawn(move || {
-            for msg in rx {
-                if events.send(Ev::Input(msg)).is_err() {
-                    return;
-                }
-            }
-            let _ = events.send(Ev::InputGone);
-        })
-        .context("starting the input bridge")?;
-    Ok(())
-}
-
-/// Moves local clipboard changes into the loop, and writes clipboard data
-/// from the Mac (sent on the returned channel). Writing on this thread keeps
-/// the order right: `ClipboardApplied` reaches the loop before the watcher's
-/// report of the same write, so the echo guard always suppresses it.
-fn bridge_clipboard(
-    watch: crossbeam_channel::Receiver<ClipboardData>,
-    events: UnboundedSender<Ev>,
-) -> Result<crossbeam_channel::Sender<ClipboardData>> {
-    let (write_tx, write_rx) = crossbeam_channel::unbounded::<ClipboardData>();
-    let apply = move |d: ClipboardData, events: &UnboundedSender<Ev>| {
-        if let Err(e) = write_clipboard(&d) {
-            warn!("clipboard from the Mac not applied: {e:#}");
-            return;
-        }
-        // Hash what this PC now holds: that is what the watcher will report.
-        let hash = read_clipboard().map_or_else(|_| d.content_hash(), |back| back.content_hash());
-        let _ = events.send(Ev::ClipboardApplied(hash));
-    };
-    std::thread::Builder::new()
-        .name("cj-clipboard-bridge".into())
-        .spawn(move || {
-            loop {
-                crossbeam_channel::select! {
-                    recv(watch) -> d => match d {
-                        Ok(d) => {
-                            if events.send(Ev::LocalClipboard(d)).is_err() {
-                                return;
-                            }
-                        }
-                        Err(_) => break,
-                    },
-                    recv(write_rx) -> d => match d {
-                        Ok(d) => apply(d, &events),
-                        Err(_) => return,
-                    },
-                }
-            }
-            warn!("clipboard watcher stopped; copies on this PC are no longer sent");
-            for d in write_rx {
-                apply(d, &events);
-            }
-        })
-        .context("starting the clipboard bridge")?;
-    Ok(write_tx)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn ms(n: u64) -> Duration {
-        Duration::from_millis(n)
-    }
-
-    #[test]
-    fn backoff_schedule() {
-        let mut b = Backoff::default();
-        let delays: Vec<Duration> = (0..6).map(|_| b.next_delay()).collect();
-        assert_eq!(
-            delays,
-            [ms(250), ms(500), ms(1000), ms(2000), ms(2000), ms(2000)]
-        );
-    }
-
-    #[test]
-    fn backoff_resets_after_connect() {
-        let mut b = Backoff::default();
-        for _ in 0..10 {
-            b.next_delay();
-        }
-        b.reset();
-        assert_eq!(b.next_delay(), ms(250));
-        assert_eq!(b.next_delay(), ms(500));
-    }
 
     #[test]
     fn status_searching() {
@@ -1048,32 +850,102 @@ mod tests {
         );
     }
 
-    #[test]
-    fn manual_addr_with_and_without_port() {
-        assert_eq!(
-            manual_addr("192.168.1.20:47800"),
-            Some(([192, 168, 1, 20], 47800).into())
-        );
-        assert_eq!(
-            manual_addr(" 192.168.1.20 "),
-            Some(([192, 168, 1, 20], QUIC_PORT).into())
-        );
-        assert_eq!(manual_addr("macbook.local"), None);
+    fn pairing_machine() -> PcMachine {
+        let mut m = PcMachine::new(Config::default());
+        m.on(PcEvent::Connected {
+            paired: false,
+            code: "123 456".into(),
+        });
+        m
     }
 
     #[test]
-    fn paired_fingerprint_parses_hex_only() {
-        let fp = Fingerprint([0xab; 32]);
-        let cfg = Config {
-            paired_peer: Some(fp.to_hex()),
+    fn pair_answers_mac_first_waits_for_local() {
+        let mut m = pairing_machine();
+        let mut p = PairAnswers::default();
+        assert!(p.remote(true).is_none(), "nothing to feed yet");
+        let ev = p.local(true);
+        assert_eq!(m.on(ev), vec![PcAction::PersistPairing]);
+        assert!(!p.declined());
+    }
+
+    #[test]
+    fn pair_answers_local_first_then_mac() {
+        let mut m = pairing_machine();
+        let mut p = PairAnswers::default();
+        assert_eq!(m.on(p.local(true)), vec![]);
+        let ev = p.remote(true).expect("local answer known");
+        assert_eq!(m.on(ev), vec![PcAction::PersistPairing]);
+    }
+
+    #[test]
+    fn pair_answers_decline_on_either_side() {
+        let mut m = pairing_machine();
+        let mut p = PairAnswers::default();
+        assert!(p.remote(false).is_none());
+        assert!(p.declined());
+        assert_eq!(m.on(p.local(true)), vec![PcAction::Reconnect]);
+
+        let mut p = PairAnswers::default();
+        let _ = p.local(false);
+        assert!(p.declined());
+    }
+
+    fn file_with(dir: &tempfile::TempDir, text: &str) -> ConfigFile {
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, text).unwrap();
+        ConfigFile { path, stamp: None }
+    }
+
+    #[test]
+    fn config_poll_applies_a_valid_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut f = file_with(&dir, "paused = true\n");
+        assert!(f.poll().is_some_and(|c| c.paused));
+        assert!(f.poll().is_none(), "unchanged file is not re-applied");
+    }
+
+    #[test]
+    fn config_poll_keeps_current_on_a_corrupt_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut f = file_with(&dir, "paired_peer = \"ab\npaused = ");
+        assert!(f.poll().is_none());
+    }
+
+    #[test]
+    fn config_update_never_overwrites_a_corrupt_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let broken = "paired_peer = \"ab\npaused = ";
+        let mut f = file_with(&dir, broken);
+        let current = Config {
+            paired_peer: Some("ab".into()),
             ..Config::default()
         };
-        assert_eq!(paired_fingerprint(&cfg), Some(fp));
-        let bad = Config {
-            paired_peer: Some("not hex".into()),
+        assert!(f.update(&current, |c| c.paused = true).is_err());
+        assert_eq!(std::fs::read_to_string(&f.path).unwrap(), broken);
+    }
+
+    #[test]
+    fn config_update_merges_onto_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut f = file_with(&dir, "mac_side = \"Left\"\n");
+        let cfg = f.update(&Config::default(), |c| c.paused = true).unwrap();
+        assert!(cfg.paused);
+        assert_eq!(cfg.mac_side, cj_core::proto::Side::Left);
+        assert_eq!(Config::try_load(&f.path).unwrap(), Some(cfg));
+    }
+
+    #[test]
+    fn config_update_without_a_file_starts_from_current() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut f = ConfigFile::new(path);
+        let current = Config {
+            pointer_speed: 2.0,
             ..Config::default()
         };
-        assert_eq!(paired_fingerprint(&bad), None);
-        assert_eq!(paired_fingerprint(&Config::default()), None);
+        let cfg = f.update(&current, |c| c.paused = true).unwrap();
+        assert_eq!(cfg.pointer_speed, 2.0);
+        assert!(cfg.paused);
     }
 }

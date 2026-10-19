@@ -12,6 +12,8 @@ use cj_core::proto::Side;
 use eframe::egui;
 use tracing::warn;
 
+use crate::ui::dialogs;
+
 /// How often the window re-reads the file for changes made elsewhere.
 const DISK_POLL: Duration = Duration::from_millis(500);
 
@@ -82,7 +84,10 @@ struct SettingsApp {
 
 impl SettingsApp {
     fn new(path: PathBuf, is_mac: bool) -> Self {
-        let cfg = load(&path);
+        let (cfg, error) = match load(&path) {
+            Ok(cfg) => (cfg, None),
+            Err(e) => (Config::default(), Some(unreadable(&e))),
+        };
         SettingsApp {
             stamp: modified(&path),
             path,
@@ -91,35 +96,54 @@ impl SettingsApp {
             edit: cfg,
             next_poll: Instant::now() + DISK_POLL,
             confirm_forget: false,
-            error: None,
+            error,
         }
     }
 
     /// Writes pending edits once no pointer button is down (so a slider drag
-    /// saves once, on release).
+    /// saves once, on release). A failure is shown in the window and in a box.
     fn save_if_edited(&mut self, ctx: &egui::Context) {
         if self.edit == self.saved || ctx.input(|i| i.pointer.any_down()) {
             return;
         }
+        if let Err(msg) = self.save_edits() {
+            self.error = Some(msg.clone());
+            dialogs::show_error(&msg);
+        }
+    }
+
+    /// Merges the edits onto the file as it is on disk and saves it. A file
+    /// that cannot be parsed is never written over: the edits are dropped.
+    fn save_edits(&mut self) -> Result<(), String> {
+        let disk = match load(&self.path) {
+            Ok(disk) => disk,
+            Err(e) => {
+                warn!("not saving settings: {e:#}");
+                // Do not retry every frame: go back to what was shown before.
+                self.edit = self.saved.clone();
+                return Err(unreadable(&e));
+            }
+        };
+        let mut result = Ok(());
         if self.edit.autostart != self.saved.autostart
             && let Err(e) = apply_autostart(self.edit.autostart)
         {
-            self.error = Some(format!("Could not change start at login: {e:#}"));
+            result = Err(format!("Could not change start at login: {e:#}"));
             self.edit.autostart = self.saved.autostart;
         }
-        let merged = merge_edits(&self.saved, &self.edit, load(&self.path)).clamped();
+        let merged = merge_edits(&self.saved, &self.edit, disk).clamped();
         match merged.save(&self.path) {
             Ok(()) => {
                 self.stamp = modified(&self.path);
                 self.saved = merged.clone();
                 self.edit = merged;
+                result
             }
             Err(e) => {
                 warn!("saving settings: {e}");
-                self.error = Some(format!("Could not save settings: {e}"));
-                // Do not retry every frame; show what is on disk.
-                self.saved = load(&self.path);
+                // Do not retry every frame; show what was there before.
                 self.edit = self.saved.clone();
+                Err(format!("Could not save settings: {e}"))
             }
         }
     }
@@ -133,8 +157,14 @@ impl SettingsApp {
         let stamp = modified(&self.path);
         if stamp != self.stamp && self.edit == self.saved {
             self.stamp = stamp;
-            self.saved = load(&self.path);
-            self.edit = self.saved.clone();
+            match load(&self.path) {
+                Ok(cfg) => {
+                    self.saved = cfg;
+                    self.edit = self.saved.clone();
+                    self.error = None;
+                }
+                Err(e) => self.error = Some(unreadable(&e)),
+            }
         }
     }
 
@@ -226,15 +256,23 @@ fn speed_slider(v: &mut f32) -> egui::Slider<'_> {
         .fixed_decimals(2)
 }
 
-/// The file's config, with "start at login" read from where it really lives.
-fn load(path: &Path) -> Config {
+/// The file's config (defaults if there is no file), with "start at login"
+/// read from where it really lives. Errs if the file cannot be parsed.
+fn load(path: &Path) -> anyhow::Result<Config> {
     #[allow(unused_mut, reason = "only Windows reads the real autostart state")]
-    let mut cfg = Config::load(path);
+    let mut cfg = Config::try_load(path)?.unwrap_or_default();
     #[cfg(windows)]
     {
         cfg.autostart = crate::win::autostart::autostart_enabled();
     }
-    cfg
+    Ok(cfg)
+}
+
+fn unreadable(e: &anyhow::Error) -> String {
+    format!(
+        "The settings file can't be read, so changes are not saved:\n{e:#}\n\n\
+         Fix or delete the file, then reopen this window."
+    )
 }
 
 fn apply_autostart(enabled: bool) -> anyhow::Result<()> {
@@ -300,6 +338,43 @@ mod tests {
         };
         let merged = merge_edits(&before, &after, before.clone());
         assert_eq!(merged.paired_peer, None);
+    }
+
+    #[test]
+    fn save_never_overwrites_a_corrupt_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let broken = "paired_peer = \"ab\npaused = ";
+        std::fs::write(&path, broken).unwrap();
+        let mut app = SettingsApp::new(path.clone(), false);
+        assert!(
+            app.error.is_some(),
+            "the window says the file is unreadable"
+        );
+        app.edit.pointer_speed = 2.0;
+        assert!(app.save_edits().is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), broken);
+        assert_eq!(
+            app.edit, app.saved,
+            "edits dropped, not retried every frame"
+        );
+    }
+
+    #[test]
+    fn save_merges_edits_onto_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "pointer_speed = 1.5\n").unwrap();
+        let mut app = SettingsApp::new(path.clone(), false);
+        assert_eq!(app.error, None);
+        // Meanwhile the app pauses crossing.
+        std::fs::write(&path, "pointer_speed = 1.5\npaused = true\n").unwrap();
+        app.edit.scroll_speed = 2.0;
+        app.save_edits().unwrap();
+        let on_disk = Config::try_load(&path).unwrap().unwrap();
+        assert_eq!(on_disk.scroll_speed, 2.0);
+        assert_eq!(on_disk.pointer_speed, 1.5);
+        assert!(on_disk.paused);
     }
 
     #[test]

@@ -15,18 +15,28 @@ use tracing_subscriber::EnvFilter;
 /// The app's log file is moved aside at startup once it is this large.
 const LOG_ROTATE_BYTES: u64 = 4 * 1024 * 1024;
 
+/// Every option; no option runs the app.
+const FLAGS: [&str; 5] = [
+    "--diagnose",
+    "--diagnose-seconds",
+    "--settings",
+    "--enable-autostart",
+    "--disable-autostart",
+];
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let has = |flag: &str| args.iter().any(|a| a == flag);
-    let tool_mode = [
-        "--diagnose",
-        "--settings",
-        "--enable-autostart",
-        "--disable-autostart",
-    ]
-    .into_iter()
-    .any(has);
+    let tool_mode = args.iter().any(|a| a.starts_with("--"));
     init_logging(!tool_mode);
+
+    if let Some(flag) = unknown_flag(&args) {
+        fail(&format!(
+            "Unknown option {flag}. Options: --settings, --diagnose [--diagnose-seconds N], \
+             --enable-autostart, --disable-autostart (none starts CursorJump)."
+        ));
+        std::process::exit(2);
+    }
 
     if has("--diagnose") {
         #[cfg(windows)]
@@ -51,11 +61,27 @@ fn main() {
     } else if has("--enable-autostart") || has("--disable-autostart") {
         set_autostart(has("--enable-autostart"))
     } else {
-        run_app()
+        // Errors here all happen before the tray exists.
+        run_app().inspect_err(|e| fail(&format!("CursorJump could not start.\n\n{e:#}")))
     };
     if let Err(e) = result {
         error!("{e:#}");
         std::process::exit(1);
+    }
+}
+
+/// The first `--` argument that is not a known option.
+fn unknown_flag(args: &[String]) -> Option<&str> {
+    args.iter()
+        .map(String::as_str)
+        .find(|a| a.starts_with("--") && !FLAGS.contains(a))
+}
+
+/// Logs an error; release builds, which have no console, also show it in a box.
+fn fail(text: &str) {
+    error!("{text}");
+    if cfg!(not(debug_assertions)) {
+        ui::dialogs::show_error(text);
     }
 }
 
@@ -118,4 +144,32 @@ fn diagnose_seconds(args: &[String]) -> u64 {
         .and_then(|i| args.get(i + 1))
         .and_then(|n| n.parse().ok())
         .unwrap_or(120)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn known_flags_and_values_pass() {
+        assert_eq!(unknown_flag(&args(&[])), None);
+        assert_eq!(unknown_flag(&args(&["--settings"])), None);
+        assert_eq!(
+            unknown_flag(&args(&["--diagnose", "--diagnose-seconds", "30"])),
+            None
+        );
+    }
+
+    #[test]
+    fn unknown_flag_is_reported() {
+        assert_eq!(unknown_flag(&args(&["--setting"])), Some("--setting"));
+        assert_eq!(
+            unknown_flag(&args(&["--enable-autostart", "--bogus"])),
+            Some("--bogus")
+        );
+    }
 }

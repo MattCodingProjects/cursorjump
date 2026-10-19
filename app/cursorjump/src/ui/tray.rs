@@ -246,6 +246,9 @@ impl TrayLoop {
                 Event::NewEvents(StartCause::ResumeTimeReached { .. }) => {
                     if quit_by.is_some_and(|t| Instant::now() >= t) {
                         warn!("app did not stop in time; exiting anyway");
+                        // The input thread may be stuck with the cursor hidden.
+                        #[cfg(windows)]
+                        crate::win::cursor::restore_system_cursors();
                         tray.take();
                         *control_flow = ControlFlow::Exit;
                     }
