@@ -18,7 +18,7 @@ use cj_core::input::{scale_motion, wheel_to_pixels};
 use cj_core::keymap::{KeyRouter, PcKey, Route, is_return_hotkey, pc_to_mac};
 use cj_core::layout::{Rect, edge_frac, is_pushing_out, point_on_edge};
 use cj_core::pc_state::PcEvent;
-use cj_core::proto::MouseButton;
+use cj_core::proto::{MouseButton, Side};
 use tracing::{debug, error, info, warn};
 use windows::Win32::Foundation::{
     ERROR_CLASS_ALREADY_EXISTS, ERROR_INVALID_THREAD_ID, HINSTANCE, HWND, LPARAM, LRESULT, POINT,
@@ -52,6 +52,10 @@ use super::probe::probe_game;
 const WATCHDOG: Duration = Duration::from_millis(250);
 /// After an `EdgePush`, further pushes are suppressed until a command arrives or this passes.
 const EDGE_DEBOUNCE: Duration = Duration::from_millis(250);
+
+/// After a return to the PC, the cursor must get this far inside the Mac edge
+/// (physical pixels, along the crossing axis) before the edge crosses again.
+const REARM_DISTANCE_PX: i32 = 8;
 
 /// After a failed `EnterMac`, edge pushes are suppressed for this long.
 const ENTER_FAILED_DEBOUNCE: Duration = Duration::from_secs(1);
@@ -248,6 +252,46 @@ impl MacStay {
     }
 }
 
+/// Stops an instant re-cross after a return while the user keeps pushing at the
+/// edge: a return disarms it, moving `REARM_DISTANCE_PX` inward re-arms it.
+struct RecrossGuard {
+    armed: bool,
+    logged: bool,
+}
+
+impl RecrossGuard {
+    fn new() -> Self {
+        RecrossGuard {
+            armed: true,
+            logged: false,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+        self.logged = false;
+    }
+
+    /// Feed a cursor position; returns whether the edge is armed now.
+    fn observe(&mut self, edge: &Rect, side: Side, x: i32, y: i32) -> bool {
+        if !self.armed {
+            let inward = match side {
+                Side::Right => edge.right - 1 - x,
+                Side::Left => x - edge.left,
+                Side::Top => y - edge.top,
+                Side::Bottom => edge.bottom - 1 - y,
+            };
+            self.armed = inward >= REARM_DISTANCE_PX;
+        }
+        self.armed
+    }
+
+    /// True the first time it is called after each `disarm`.
+    fn first_swallow(&mut self) -> bool {
+        !std::mem::replace(&mut self.logged, true)
+    }
+}
+
 struct State {
     cfg: Config,
     out: crossbeam_channel::Sender<InputMsg>,
@@ -257,6 +301,7 @@ struct State {
     edge_quiet_until: Option<Instant>,
     /// Debounce after a failed `EnterMac`; not cleared by commands.
     enter_failed_until: Option<Instant>,
+    recross: RecrossGuard,
     router: KeyRouter,
     /// Physical keys currently held, for the return hotkey.
     held: HashSet<PcKey>,
@@ -348,6 +393,7 @@ impl State {
             mac: None,
             edge_quiet_until: None,
             enter_failed_until: None,
+            recross: RecrossGuard::new(),
             router: KeyRouter::new(),
             held: HashSet::with_capacity(32),
             entry_twins: HashSet::with_capacity(8),
@@ -465,6 +511,7 @@ impl State {
     /// Tell the app the crossing failed and keep the edge quiet for a while.
     fn enter_failed(&mut self) {
         self.enter_failed_until = Some(Instant::now() + ENTER_FAILED_DEBOUNCE);
+        self.recross.disarm();
         self.send(InputMsg::Edge(PcEvent::HookLost));
     }
 
@@ -488,6 +535,7 @@ impl State {
         };
         remove_hooks(stay.hooks);
         info!("hooks: removed");
+        self.recross.disarm();
         if let Some(pt) = park_at {
             park_cursor(pt);
         }
@@ -528,7 +576,14 @@ impl State {
             return;
         };
         let side = self.cfg.mac_side;
+        let armed = self.recross.observe(&edge, side, x, y);
         if !is_pushing_out(&edge, side, x, y, dx, dy) {
+            return;
+        }
+        if !armed {
+            if self.recross.first_swallow() {
+                info!("re-cross guard: move away from the edge to cross again");
+            }
             return;
         }
         self.edge_quiet_until = Some(now + EDGE_DEBOUNCE);
@@ -893,6 +948,56 @@ fn entry_keys(vk: u16, sc: u32) -> (Option<PcKey>, Option<PcKey>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const GEDGE: Rect = Rect {
+        left: 0,
+        top: 0,
+        right: 1920,
+        bottom: 1080,
+    };
+
+    #[test]
+    fn recross_guard_armed_initially() {
+        let mut g = RecrossGuard::new();
+        assert!(g.observe(&GEDGE, Side::Right, 1919, 500));
+    }
+
+    #[test]
+    fn recross_guard_disarmed_until_eight_px_inward() {
+        let mut g = RecrossGuard::new();
+        g.disarm();
+        assert!(!g.observe(&GEDGE, Side::Right, 1919, 500));
+        assert!(!g.observe(&GEDGE, Side::Right, 1919 - 7, 500));
+        assert!(g.observe(&GEDGE, Side::Right, 1919 - 8, 500));
+        // Stays armed once re-armed, even back at the edge.
+        assert!(g.observe(&GEDGE, Side::Right, 1919, 500));
+    }
+
+    #[test]
+    fn recross_guard_mirrors_all_sides() {
+        for (side, edge_pt, near, far) in [
+            (Side::Right, (1919, 500), (1912, 500), (1911, 500)),
+            (Side::Left, (0, 500), (7, 500), (8, 500)),
+            (Side::Top, (500, 0), (500, 7), (500, 8)),
+            (Side::Bottom, (500, 1079), (500, 1072), (500, 1071)),
+        ] {
+            let mut g = RecrossGuard::new();
+            g.disarm();
+            assert!(!g.observe(&GEDGE, side, edge_pt.0, edge_pt.1), "{side:?}");
+            assert!(!g.observe(&GEDGE, side, near.0, near.1), "{side:?}");
+            assert!(g.observe(&GEDGE, side, far.0, far.1), "{side:?}");
+        }
+    }
+
+    #[test]
+    fn recross_guard_logs_once_per_disarm() {
+        let mut g = RecrossGuard::new();
+        g.disarm();
+        assert!(g.first_swallow());
+        assert!(!g.first_swallow());
+        g.disarm();
+        assert!(g.first_swallow());
+    }
     use windows::Win32::UI::WindowsAndMessaging::{KBDLLHOOKSTRUCT_FLAGS, WM_KEYUP};
 
     const CENTER: (i32, i32) = (960, 540);
