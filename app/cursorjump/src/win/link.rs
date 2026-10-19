@@ -65,7 +65,7 @@ pub(super) fn manual_addr(s: &str) -> Option<SocketAddr> {
 /// (running the pairing exchange before anything else uses the session).
 pub(super) async fn establish(id: &Identity, cfg: &Config, name: &str) -> Result<Established> {
     let paired = paired_fingerprint(cfg);
-    let peers = discover(DISCOVER_TIMEOUT, DISCOVERY_PORT)
+    let peers = discover(DISCOVER_TIMEOUT, DISCOVERY_PORT, paired.as_ref())
         .await
         .context("discovery")?;
     let addr = match choose_peer(&peers, paired.as_ref()) {

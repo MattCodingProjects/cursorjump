@@ -779,7 +779,7 @@ async fn broadcast_fallback_finds_responder() {
     let fp = ident().fingerprint();
     let responder_port = free_udp_port();
     let _adv = Advertiser::start_responder_only("test-mac", 47800, &fp, responder_port).unwrap();
-    let peers = discover(Duration::from_secs(3), responder_port)
+    let peers = discover(Duration::from_secs(3), responder_port, Some(&fp))
         .await
         .unwrap();
     let found = peers

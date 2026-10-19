@@ -133,12 +133,19 @@ fn sanitize(name: &str) -> String {
     if s.is_empty() { "cursorjump".into() } else { s }
 }
 
-/// Finds Macs on the LAN: mDNS first, then UDP broadcast for the remaining time.
-pub async fn discover(timeout: Duration, broadcast_port: u16) -> Result<Vec<Peer>> {
+/// Finds Macs on the LAN: mDNS first, then UDP broadcast for the remaining
+/// time unless mDNS already found the one `choose_peer(.., want)` would pick.
+pub async fn discover(
+    timeout: Duration,
+    broadcast_port: u16,
+    want: Option<&Fingerprint>,
+) -> Result<Vec<Peer>> {
     let deadline = Instant::now() + timeout;
     let mut peers = discover_mdns(timeout.min(MDNS_PHASE)).await;
-    if peers.is_empty() {
-        peers = discover_broadcast(deadline, broadcast_port).await?;
+    if choose_peer(&peers, want).is_none() {
+        for peer in discover_broadcast(deadline, broadcast_port).await? {
+            push_unique(&mut peers, peer);
+        }
     }
     Ok(peers)
 }
