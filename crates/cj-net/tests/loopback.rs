@@ -382,6 +382,27 @@ async fn oversized_control_frame_is_error() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hello_from_a_pre_mac_ready_peer_is_rejected() {
+    // Protocol v1 peers predate Control::MacReady: a v1 PC would drop the
+    // session on the Mac's first MacReady, so it is refused at Hello.
+    const { assert!(PROTOCOL_VERSION >= 2) };
+    let (a, b) = (ident(), ident());
+    let listener = Listener::bind(&a, Trust::PairingMode, localhost_any_port(), "A")
+        .await
+        .unwrap();
+    let addr = listener.local_addr();
+    let (accepted, reply) = tokio::join!(
+        timeout(QUIET, listener.accept()),
+        timeout(
+            T,
+            raw_hello(client_config(&b, Trust::PairingMode).unwrap(), addr, 1)
+        )
+    );
+    assert!(reply.expect("should fail, not hang").is_err());
+    assert!(accepted.is_err(), "accept must not surface a v1 Hello");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hello_version_mismatch_is_rejected() {
     let (a, b) = (ident(), ident());
     let listener = Listener::bind(&a, Trust::PairingMode, localhost_any_port(), "A")

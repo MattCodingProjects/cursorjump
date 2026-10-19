@@ -196,8 +196,8 @@ pub struct Router<I: Inject> {
     sid: Option<u64>,
     /// Whether events may be posted (Accessibility), kept up to date by the loop.
     access: Arc<AtomicBool>,
-    /// For the "no Accessibility" bounce, which an older PC repeats while
-    /// the user keeps pushing at its edge.
+    /// For the "no Accessibility" bounce, which serves races (an Enter sent
+    /// before the PC got `MacReady { ready: false }`) and can repeat.
     no_access_log: LogLimit,
 }
 

@@ -2,7 +2,9 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 1;
+/// Peers must match exactly. 2: `Control::MacReady`, which a v1 peer
+/// cannot decode (an undecodable message ends the session).
+pub const PROTOCOL_VERSION: u16 = 2;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MouseButton {

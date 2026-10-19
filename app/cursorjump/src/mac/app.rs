@@ -9,7 +9,7 @@
 
 use std::fs::{File, OpenOptions, TryLockError};
 use std::net::{Ipv4Addr, SocketAddr};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -36,8 +36,8 @@ use super::control::{
 use super::inject::Injector;
 use super::link::{Live, run_pairing};
 use super::permissions::{
-    AccessState, access_state, may_relaunch, read_relaunch_stamp, request_post_event_access,
-    write_relaunch_stamp,
+    AccessState, RelaunchVia, access_state, may_relaunch, read_relaunch_stamp, relaunch_via,
+    reopen_command, request_post_event_access, write_relaunch_stamp,
 };
 use super::power::KeepAwake;
 use crate::common::clipboard_bridge::{ClipboardLink, bridge_clipboard};
@@ -58,6 +58,9 @@ const ACCESS_POLL: Duration = Duration::from_secs(2);
 /// In the config directory: when CursorJump last relaunched itself to pick
 /// up the Accessibility permission.
 const RELAUNCH_STAMP: &str = "relaunch.stamp";
+/// No new Accessibility poll while this many are still running (a hung
+/// tccd must not pile up blocking threads).
+const MAX_ACCESS_POLLS: u32 = 3;
 /// How long Quit waits for the injection thread to release everything.
 const QUIT_TIMEOUT: Duration = Duration::from_secs(2);
 /// At quit, time for the endpoint to send CONNECTION_CLOSE, so the PC takes
@@ -260,6 +263,40 @@ fn status_text(link: LinkStatus, needs_accessibility: bool) -> String {
     }
 }
 
+/// Bookkeeping for the Accessibility polls running off the loop.
+#[derive(Debug, Default)]
+struct AccessPolls {
+    /// The latest poll started.
+    started: u64,
+    /// The latest poll applied.
+    applied: u64,
+    /// Polls started but not finished.
+    outstanding: u32,
+}
+
+impl AccessPolls {
+    /// The number of a new poll; None while `MAX_ACCESS_POLLS` are running.
+    fn start(&mut self) -> Option<u64> {
+        if self.outstanding >= MAX_ACCESS_POLLS {
+            return None;
+        }
+        self.outstanding += 1;
+        self.started += 1;
+        Some(self.started)
+    }
+
+    /// Poll `seq` finished; true if its result is to be applied (a late
+    /// result must not undo a newer one).
+    fn finish(&mut self, seq: u64) -> bool {
+        self.outstanding = self.outstanding.saturating_sub(1);
+        if seq <= self.applied {
+            return false;
+        }
+        self.applied = seq;
+        true
+    }
+}
+
 /// A pairing in progress. Dropping it stops the pairing and closes the session.
 struct Pairing {
     sid: u64,
@@ -320,14 +357,16 @@ struct App {
     epoch: std::time::Instant,
     settings: SettingsWindow,
     last_model: Option<TrayModel>,
-    /// The latest Accessibility poll started, and the latest one applied.
-    access_polls: (u64, u64),
+    access_polls: AccessPolls,
     quit_by: Option<Instant>,
     done: bool,
     /// Exit non-zero so launchd (KeepAlive SuccessfulExit=false) starts a
     /// fresh copy: the injection thread stopped without Quit, or the
     /// Accessibility grant needs a new process.
     restart: bool,
+    /// Started by hand, and the Accessibility grant needs a new process:
+    /// open this app bundle again on the way out.
+    reopen: Option<PathBuf>,
 }
 
 impl App {
@@ -355,10 +394,11 @@ impl App {
             epoch: std::time::Instant::now(),
             settings: SettingsWindow::default(),
             last_model: None,
-            access_polls: (0, 0),
+            access_polls: AccessPolls::default(),
             quit_by: None,
             done: false,
             restart: false,
+            reopen: None,
         }
     }
 
@@ -417,6 +457,12 @@ impl App {
         if self.restart {
             error!("exiting with an error so that CursorJump restarts");
             std::process::exit(1);
+        }
+        if let Some(bundle) = self.reopen.take() {
+            match reopen_command(&bundle, std::process::id()).spawn() {
+                Ok(_) => info!(bundle = %bundle.display(), "reopening once this copy has quit"),
+                Err(e) => warn!("could not reopen CursorJump: {e}; open it again by hand"),
+            }
         }
         info!("stopped");
     }
@@ -682,8 +728,11 @@ impl App {
     /// Asks the system about the Accessibility permission off this thread:
     /// the queries take milliseconds, which must not delay a `Leave`.
     fn poll_access(&mut self) {
-        self.access_polls.0 += 1;
-        let (seq, tx) = (self.access_polls.0, self.ch.events.clone());
+        let Some(seq) = self.access_polls.start() else {
+            warn!("Accessibility checks are not answering; skipping one");
+            return;
+        };
+        let tx = self.ch.events.clone();
         tokio::task::spawn_blocking(move || {
             let _ = tx.send(Ev::Access {
                 seq,
@@ -693,38 +742,48 @@ impl App {
     }
 
     /// Applies a poll's result: the injection thread's view (losing the
-    /// permission sends the PC's cursor back), the PC's, and a relaunch if
-    /// the grant needs a new process.
+    /// permission sends the PC's cursor back), a relaunch if the grant needs
+    /// a new process, and otherwise the PC's view.
     async fn on_access(&mut self, seq: u64, state: AccessState) {
-        // A late result must not undo a newer one.
-        if seq <= self.access_polls.1 {
+        if !self.access_polls.finish(seq) {
             return;
         }
-        self.access_polls.1 = seq;
         let ready = state.ready();
         if !update_access(&self.ch.access, ready, &self.ch.inject) {
             return;
         }
         info!(granted = ready, ?state, "Accessibility permission changed");
-        self.send_mac_ready().await;
-        if ready && !state.can_post {
-            self.relaunch_for_access();
+        // Relaunching: the PC must not lift its wall for a copy about to quit.
+        if ready && !state.can_post && self.relaunch_for_access() {
+            return;
         }
+        self.send_mac_ready().await;
     }
 
     /// Accessibility was just switched on, but this process may still be
-    /// refused posting events until it restarts: quit so that launchd
-    /// starts a new copy, unless that was done less than a minute ago.
-    fn relaunch_for_access(&mut self) {
+    /// refused posting events until it restarts: quit, to be started again
+    /// by launchd or by reopening the app, unless that was done less than a
+    /// minute ago. True if quitting.
+    fn relaunch_for_access(&mut self) -> bool {
         warn!("Accessibility granted, but posting events is not allowed yet");
         if self.quit_by.is_some() {
-            return;
+            return false;
         }
+        let service = std::env::var("XPC_SERVICE_NAME").ok();
+        let via = std::env::current_exe()
+            .ok()
+            .and_then(|exe| relaunch_via(service.as_deref(), &exe));
+        let Some(via) = via else {
+            warn!(
+                "not restarting: not running from the app; if the PC's input does not arrive, quit and reopen CursorJump"
+            );
+            return false;
+        };
         let stamp = match paths::config_dir() {
             Ok(dir) => dir.join(RELAUNCH_STAMP),
             Err(e) => {
                 warn!("not restarting: {e:#}");
-                return;
+                return false;
             }
         };
         let now = SystemTime::now();
@@ -732,16 +791,23 @@ impl App {
             warn!(
                 "not restarting again so soon; if the PC's input does not arrive, quit and reopen CursorJump"
             );
-            return;
+            return false;
         }
         if let Err(e) = write_relaunch_stamp(&stamp, now) {
             // Without the stamp a relaunch loop is possible: do not risk it.
             warn!("not restarting: could not write {}: {e}", stamp.display());
-            return;
+            return false;
         }
-        info!("restarting CursorJump to pick up the Accessibility permission");
-        self.restart = true;
+        info!(
+            ?via,
+            "restarting CursorJump to pick up the Accessibility permission"
+        );
+        match via {
+            RelaunchVia::Launchd => self.restart = true,
+            RelaunchVia::Reopen(bundle) => self.reopen = Some(bundle),
+        }
         self.begin_quit();
+        true
     }
 
     // ----------------------------------------------------------------- config
@@ -908,6 +974,32 @@ mod tests {
             again.is_some(),
             "free again once the first instance is gone"
         );
+    }
+
+    #[test]
+    fn access_polls_are_capped_while_outstanding() {
+        let mut p = AccessPolls::default();
+        let seqs: Vec<_> = (0..3).map(|_| p.start().expect("room")).collect();
+        assert_eq!(seqs, [1, 2, 3]);
+        assert_eq!(
+            p.start(),
+            None,
+            "three outstanding: a hung tccd piles up no more"
+        );
+        assert!(p.finish(1));
+        assert_eq!(p.start(), Some(4));
+    }
+
+    #[test]
+    fn a_late_access_poll_is_not_applied() {
+        let mut p = AccessPolls::default();
+        let (a, b) = (p.start().unwrap(), p.start().unwrap());
+        assert!(p.finish(b));
+        assert!(!p.finish(a), "older than the one applied");
+        assert_eq!(p.start(), Some(3), "both finished: room again");
+        assert_eq!(p.start(), Some(4));
+        assert_eq!(p.start(), Some(5));
+        assert_eq!(p.start(), None);
     }
 
     #[test]

@@ -1,7 +1,8 @@
-//! The Accessibility permission that posting input events needs, and the
-//! guard on relaunching to pick it up.
+//! The Accessibility permission that posting input events needs, and
+//! relaunching to pick it up (how, and the guard against a loop).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime};
 
 use objc2_core_graphics::{CGPreflightPostEventAccess, CGRequestPostEventAccess};
@@ -12,6 +13,11 @@ const ACCESSIBILITY_PANE: &str =
 
 /// No relaunch for the permission within this long of the previous one.
 const RELAUNCH_GUARD: Duration = Duration::from_secs(60);
+/// `XPC_SERVICE_NAME` of the process launchd runs for the LaunchAgent.
+const AGENT_SERVICE_NAME: &str = super::autostart::AGENT_LABEL;
+/// Waits (up to 10 s) for process `$1` to end, then opens a new copy of the
+/// app bundle `$2`; a copy opened earlier would find the instance lock held.
+const REOPEN_SCRIPT: &str = "i=0; while kill -0 \"$1\" 2>/dev/null && [ \"$i\" -lt 100 ]; do sleep 0.1; i=$((i+1)); done; exec /usr/bin/open -n \"$2\"";
 
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
@@ -24,15 +30,16 @@ unsafe extern "C" {
 pub struct AccessState {
     /// `AXIsProcessTrusted`: follows the switch in System Settings live.
     pub trusted: bool,
-    /// `CGPreflightPostEventAccess`: may stay false after the switch is
-    /// turned on until the process restarts.
+    /// `CGPreflightPostEventAccess`: cached per process, so it can be stale
+    /// either way. Only used to decide whether a grant needs a relaunch.
     pub can_post: bool,
 }
 
 impl AccessState {
-    /// The PC can control this Mac.
+    /// The PC can control this Mac. `trusted` alone: a stale `can_post`
+    /// true after a revocation would strand the PC's cursor here.
     pub fn ready(self) -> bool {
-        self.trusted || self.can_post
+        self.trusted
     }
 }
 
@@ -58,6 +65,50 @@ pub fn request_post_event_access() {
         Ok(s) => warn!("opening the Accessibility settings failed: {s}"),
         Err(e) => warn!("could not open the Accessibility settings: {e}"),
     }
+}
+
+/// How this process is started again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelaunchVia {
+    /// launchd runs it (KeepAlive SuccessfulExit=false): exit non-zero.
+    Launchd,
+    /// Started by hand: open this app bundle again, then exit normally.
+    Reopen(PathBuf),
+}
+
+/// How to relaunch, from `XPC_SERVICE_NAME` and the executable's path; None
+/// if it cannot be (started by hand, outside an app bundle).
+pub fn relaunch_via(xpc_service_name: Option<&str>, exe: &Path) -> Option<RelaunchVia> {
+    if xpc_service_name == Some(AGENT_SERVICE_NAME) {
+        return Some(RelaunchVia::Launchd);
+    }
+    app_bundle(exe).map(|b| RelaunchVia::Reopen(b.to_path_buf()))
+}
+
+/// The `.app` bundle holding `exe` (`X.app/Contents/MacOS/exe`).
+fn app_bundle(exe: &Path) -> Option<&Path> {
+    let macos = exe
+        .parent()
+        .filter(|d| d.file_name().is_some_and(|n| n == "MacOS"))?;
+    let contents = macos
+        .parent()
+        .filter(|d| d.file_name().is_some_and(|n| n == "Contents"))?;
+    contents
+        .parent()
+        .filter(|b| b.extension().is_some_and(|e| e == "app"))
+}
+
+/// A detached command that opens `bundle` again once process `pid` (this
+/// one) has ended.
+pub fn reopen_command(bundle: &Path, pid: u32) -> Command {
+    let mut cmd = Command::new("/bin/sh");
+    cmd.args(["-c", REOPEN_SCRIPT, "cursorjump-reopen"])
+        .arg(pid.to_string())
+        .arg(bundle)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    cmd
 }
 
 /// Whether to relaunch for the permission at `now`, given when this app
@@ -126,18 +177,80 @@ mod tests {
     }
 
     #[test]
-    fn access_state_answers_without_prompting() {
+    fn access_state_ffi_links_and_returns() {
         // Read-only TCC queries; the answer depends on the test binary's grant.
         let state = access_state();
-        assert_eq!(state.ready(), state.trusted || state.can_post);
+        assert_eq!(state.ready(), state.trusted);
     }
 
     #[test]
-    fn ready_if_either_signal_says_so() {
+    fn ready_follows_ax_trust_alone() {
         let state = |trusted, can_post| AccessState { trusted, can_post };
         assert!(!state(false, false).ready());
-        assert!(state(true, false).ready());
-        assert!(state(false, true).ready());
+        assert!(state(true, false).ready(), "a stale preflight false");
+        assert!(
+            !state(false, true).ready(),
+            "a stale preflight true must not hide a revocation"
+        );
         assert!(state(true, true).ready());
+    }
+
+    const EXE: &str = "/Applications/CursorJump.app/Contents/MacOS/cursorjump";
+
+    #[test]
+    fn under_launchd_relaunch_by_exiting() {
+        assert_eq!(
+            relaunch_via(Some("com.cursorjump.agent"), Path::new(EXE)),
+            Some(RelaunchVia::Launchd)
+        );
+        assert_eq!(
+            relaunch_via(Some("com.cursorjump.agent"), Path::new("/tmp/cursorjump")),
+            Some(RelaunchVia::Launchd),
+            "launchd restarts whatever it runs"
+        );
+    }
+
+    #[test]
+    fn started_by_hand_relaunch_by_reopening_the_bundle() {
+        let bundle = Some(RelaunchVia::Reopen(PathBuf::from(
+            "/Applications/CursorJump.app",
+        )));
+        assert_eq!(relaunch_via(None, Path::new(EXE)), bundle);
+        // Opened from Finder or `open`: another launchd job name.
+        assert_eq!(
+            relaunch_via(
+                Some("application.com.cursorjump.app.123.456"),
+                Path::new(EXE)
+            ),
+            bundle
+        );
+    }
+
+    #[test]
+    fn started_by_hand_outside_a_bundle_no_relaunch() {
+        assert_eq!(
+            relaunch_via(None, Path::new("/Users/me/target/release/cursorjump")),
+            None
+        );
+        assert_eq!(
+            relaunch_via(None, Path::new("/x/Contents/MacOS/cursorjump")),
+            None
+        );
+        assert_eq!(
+            relaunch_via(None, Path::new("/x/Foo.app/MacOS/cursorjump")),
+            None
+        );
+        assert_eq!(relaunch_via(None, Path::new("cursorjump")), None);
+    }
+
+    #[test]
+    fn reopen_waits_for_this_process_then_opens_a_new_copy() {
+        let cmd = reopen_command(Path::new("/Applications/CursorJump.app"), 4242);
+        assert_eq!(cmd.get_program(), "/bin/sh");
+        let args: Vec<_> = cmd.get_args().map(|a| a.to_str().unwrap()).collect();
+        assert_eq!(args[0], "-c");
+        assert!(args[1].contains("kill -0 \"$1\""), "{}", args[1]);
+        assert!(args[1].contains("/usr/bin/open -n \"$2\""), "{}", args[1]);
+        assert_eq!(args[3..], ["4242", "/Applications/CursorJump.app"]);
     }
 }

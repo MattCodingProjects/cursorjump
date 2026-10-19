@@ -76,8 +76,8 @@ pub struct PcMachine {
     entry_offset: f32,
     local_ans: Option<bool>,
     remote_ans: Option<bool>,
-    /// Whether the Mac can take the cursor. True until it says otherwise,
-    /// so a Mac that never sends `MacReady` is not walled off.
+    /// Whether the Mac can take the cursor. True until it says otherwise:
+    /// a crossing before its first `MacReady` arrives is bounced back by the Mac.
     mac_ready: bool,
 }
 
@@ -465,7 +465,7 @@ mod tests {
     #[test]
     fn pc_mac_ready_starts_true() {
         let m = PcMachine::new(Config::default());
-        assert!(m.mac_ready(), "an older Mac never sends MacReady");
+        assert!(m.mac_ready(), "true until the Mac says otherwise");
         let mut m = connected(Config::default());
         assert!(m.mac_ready());
         assert_enter(&m.on(push(0.3, free(), false)), Side::Left, 0.3);
