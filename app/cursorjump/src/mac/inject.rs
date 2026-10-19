@@ -3,6 +3,7 @@
 //! Decisions (which events to post, where the cursor goes) live in pure
 //! helpers that are unit-tested; `Injector` only turns them into CGEvents.
 
+use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,10 +17,10 @@ use cj_core::proto::{MouseButton, Side};
 use objc2_app_kit::NSEvent;
 use objc2_core_foundation::{CFRetained, CGPoint};
 use objc2_core_graphics::{
-    CGDirectDisplayID, CGDisplayBounds, CGDisplayChangeSummaryFlags,
-    CGDisplayRegisterReconfigurationCallback, CGError, CGEvent, CGEventField, CGEventFlags,
-    CGEventSource, CGEventSourceStateID, CGEventTapLocation, CGEventType, CGMainDisplayID,
-    CGMouseButton, CGScrollEventUnit, CGWarpMouseCursorPosition,
+    CGAssociateMouseAndMouseCursorPosition, CGDirectDisplayID, CGDisplayBounds,
+    CGDisplayChangeSummaryFlags, CGDisplayRegisterReconfigurationCallback, CGError, CGEvent,
+    CGEventField, CGEventFlags, CGEventSource, CGEventSourceStateID, CGEventTapLocation,
+    CGEventType, CGMainDisplayID, CGMouseButton, CGScrollEventUnit, CGWarpMouseCursorPosition,
 };
 use tracing::warn;
 
@@ -27,8 +28,17 @@ use tracing::warn;
 const WARP_INSET: i32 = 2;
 /// Clicks further apart than this (points) do not count as a double click.
 const CLICK_MAX_DIST: f64 = 4.0;
-/// Keycode for the closing flagsChanged when no modifier was held (Left Shift).
+/// Keycode of the closing flagsChanged in `release_all` (Left Shift).
 const KC_SHIFT: u16 = 0x38;
+/// A system cursor reading this close (points) to a position we posted is lag.
+const LAG_TOLERANCE: f64 = 0.5;
+/// How long a posted position counts as possibly not yet applied.
+const RECENT_WINDOW: Duration = Duration::from_millis(100);
+/// At most this many recently posted positions are remembered.
+const RECENT_MAX: usize = 32;
+/// Display bounds are re-read at least this often while moving, in case the
+/// reconfiguration callback is not delivered.
+const BOUNDS_MAX_AGE: Duration = Duration::from_millis(500);
 
 /// Set by the display reconfiguration callback; the Injector re-reads its
 /// display bounds before the next motion.
@@ -152,7 +162,7 @@ fn release_plan(keys: &[u16], buttons: &[MouseButton], mods: &mut ModifierState)
         });
     }
     plan.push(Post::Flags {
-        kc: modifiers.last().copied().unwrap_or(KC_SHIFT),
+        kc: KC_SHIFT,
         flags: mods.flags() & FLAG_CAPS,
     });
     plan.extend(buttons.iter().map(|&b| Post::ButtonUp(b)));
@@ -192,6 +202,23 @@ fn scroll_wheels(dx: i32, dy: i32) -> (i32, i32) {
     (dy, dx.saturating_neg())
 }
 
+/// The cursor position to continue from. `virt` is where our own posts put
+/// the cursor; `sys` is the system's reading, which can lag behind recent
+/// posts (`recent`). A reading near `virt` or a recent post is lag, so `virt`
+/// stands; any other reading means something else (the Mac trackpad) moved
+/// the cursor, so it is adopted.
+fn reconcile(virt: (f64, f64), sys: Option<(f64, f64)>, recent: &[(f64, f64)]) -> (f64, f64) {
+    let Some(sys) = sys else {
+        return virt;
+    };
+    let near = |p: &(f64, f64)| (p.0 - sys.0).hypot(p.1 - sys.1) <= LAG_TOLERANCE;
+    if near(&virt) || recent.iter().any(near) {
+        virt
+    } else {
+        sys
+    }
+}
+
 fn button_index(b: MouseButton) -> usize {
     match b {
         MouseButton::Left => 0,
@@ -202,14 +229,27 @@ fn button_index(b: MouseButton) -> usize {
     }
 }
 
+/// The event source handle, which can move between threads.
+struct SendSource(CFRetained<CGEventSource>);
+
+// SAFETY: Core Foundation objects may be used from any thread as long as
+// they are not used from two threads at once. A SendSource is owned by one
+// Injector, never shared or cloned, and only used through `&self`/`&mut self`
+// of that Injector, so moving it to another thread moves sole access with
+// it. It is deliberately not Sync.
+unsafe impl Send for SendSource {}
+
 /// Posts mouse and keyboard events on the main display.
 pub struct Injector {
-    source: CFRetained<CGEventSource>,
+    source: SendSource,
     bounds: Rectf,
+    bounds_read_at: Instant,
     /// The edge the cursor came in through; set by `warp_to`.
     entry: Option<Side>,
-    /// Last known cursor position, used when the system position is unavailable.
+    /// The virtual cursor: where our posts put the cursor.
     pos: (f64, f64),
+    /// Positions posted in the last `RECENT_WINDOW`, oldest first.
+    recent: VecDeque<(Instant, (f64, f64))>,
     mods: ModifierState,
     held: Held,
     clicks: ClickTracker,
@@ -217,27 +257,23 @@ pub struct Injector {
     click_state: [i64; 5],
 }
 
-// SAFETY: the only non-Send field is the CGEventSource handle. Core
-// Foundation objects may be used from any thread as long as they are not
-// used from two threads at once; the Injector owns its source exclusively,
-// never shares it, and only touches it through `&self`/`&mut self`, so moving
-// the Injector to another thread moves sole access with it. It is not Sync.
-unsafe impl Send for Injector {}
-
 impl Injector {
     pub fn new() -> anyhow::Result<Injector> {
         let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
             .context("CGEventSourceCreate(HIDSystemState) failed")?;
-        // Without this, posting a warp freezes the Mac's own trackpad for 250 ms.
+        // Events posted from this source would otherwise suppress the Mac's
+        // own mouse and keyboard for 250 ms each.
         CGEventSource::set_local_events_suppression_interval(Some(&source), 0.0);
         register_display_callback();
         let interval = NSEvent::doubleClickInterval();
         let interval = Duration::try_from_secs_f64(interval).unwrap_or(Duration::from_millis(500));
         Ok(Injector {
-            source,
+            source: SendSource(source),
             bounds: main_display_bounds(),
+            bounds_read_at: Instant::now(),
             entry: None,
             pos: cursor_location().unwrap_or((0.0, 0.0)),
+            recent: VecDeque::with_capacity(RECENT_MAX),
             mods: ModifierState::new(),
             held: Held::new(),
             clicks: ClickTracker::new(interval, CLICK_MAX_DIST),
@@ -247,8 +283,7 @@ impl Injector {
 
     /// Puts the cursor 2 pt inside `edge` at fraction `frac` along it.
     pub fn warp_to(&mut self, edge: Side, frac: f32) {
-        DISPLAYS_CHANGED.store(false, Ordering::Relaxed);
-        self.bounds = main_display_bounds();
+        self.refresh_bounds();
         self.entry = Some(edge);
         let (x, y) = point_on_edge(&self.bounds.to_rect(), edge, frac, WARP_INSET);
         let target = (f64::from(x), f64::from(y));
@@ -256,18 +291,27 @@ impl Injector {
         if err != CGError::Success {
             warn!("CGWarpMouseCursorPosition failed: {err:?}");
         }
-        self.pos = cursor_location().unwrap_or(target);
+        // A warp briefly disconnects the Mac's own mouse from the cursor;
+        // reconnect it at once.
+        let err = CGAssociateMouseAndMouseCursorPosition(true);
+        if err != CGError::Success {
+            warn!("CGAssociateMouseAndMouseCursorPosition failed: {err:?}");
+        }
+        self.pos = target;
+        self.recent.clear();
         // A moved event so apps under the cursor see it arrive.
         let (ty, button) = motion_event_type(self.held.first_button());
-        self.post_mouse(ty, button, self.pos, (0, 0), 0);
+        self.post_mouse(ty, button, target, (0, 0), 0);
     }
 
-    /// Moves the cursor by (dx, dy) points, starting from where the system
-    /// cursor is now (so Mac trackpad moves in between count). Returns the
-    /// fraction along the entry edge when the move pushes out through it.
+    /// Moves the cursor by (dx, dy) points from the virtual cursor (or from
+    /// where a Mac trackpad move left it). Returns the fraction along the
+    /// entry edge when the move pushes out through it.
     pub fn motion(&mut self, dx: i16, dy: i16) -> Option<f32> {
-        if DISPLAYS_CHANGED.swap(false, Ordering::Relaxed) {
-            self.bounds = main_display_bounds();
+        if DISPLAYS_CHANGED.swap(false, Ordering::Relaxed)
+            || self.bounds_read_at.elapsed() >= BOUNDS_MAX_AGE
+        {
+            self.refresh_bounds();
         }
         let from = self.current_pos();
         let entry = self.entry.unwrap_or(Side::Left);
@@ -293,7 +337,7 @@ impl Injector {
         }
         let (wheel1, wheel2) = scroll_wheels(dx, dy);
         let Some(ev) = CGEvent::new_scroll_wheel_event2(
-            Some(&self.source),
+            Some(&self.source.0),
             CGScrollEventUnit::Pixel,
             2,
             wheel1,
@@ -340,12 +384,38 @@ impl Injector {
         self.held.any_button()
     }
 
-    /// The system cursor position, falling back to the last known one.
+    fn refresh_bounds(&mut self) {
+        DISPLAYS_CHANGED.store(false, Ordering::Relaxed);
+        self.bounds = main_display_bounds();
+        self.bounds_read_at = Instant::now();
+    }
+
+    /// The virtual cursor, after adopting the system position if something
+    /// other than our own posts moved the cursor.
     fn current_pos(&mut self) -> (f64, f64) {
-        if let Some(p) = cursor_location() {
-            self.pos = p;
+        let now = Instant::now();
+        while self
+            .recent
+            .front()
+            .is_some_and(|&(at, _)| now.duration_since(at) > RECENT_WINDOW)
+        {
+            self.recent.pop_front();
+        }
+        let recent: Vec<(f64, f64)> = self.recent.iter().map(|&(_, p)| p).collect();
+        let pos = reconcile(self.pos, cursor_location(), &recent);
+        if pos != self.pos {
+            self.pos = pos;
+            self.recent.clear();
         }
         self.pos
+    }
+
+    /// Remembers a posted position until the system has surely applied it.
+    fn record_post(&mut self, at: (f64, f64)) {
+        if self.recent.len() == RECENT_MAX {
+            self.recent.pop_front();
+        }
+        self.recent.push_back((Instant::now(), at));
     }
 
     fn post(&mut self, post: Post) {
@@ -356,7 +426,7 @@ impl Injector {
                 flags,
                 repeat,
             } => {
-                let Some(ev) = CGEvent::new_keyboard_event(Some(&self.source), kc, down) else {
+                let Some(ev) = CGEvent::new_keyboard_event(Some(&self.source.0), kc, down) else {
                     warn!("CGEventCreateKeyboardEvent failed for keycode {kc:#x}");
                     return;
                 };
@@ -370,7 +440,7 @@ impl Injector {
                 self.post_with_flags(&ev, flags);
             }
             Post::Flags { kc, flags } => {
-                let Some(ev) = CGEvent::new_keyboard_event(Some(&self.source), kc, true) else {
+                let Some(ev) = CGEvent::new_keyboard_event(Some(&self.source.0), kc, true) else {
                     warn!("CGEventCreateKeyboardEvent failed for keycode {kc:#x}");
                     return;
                 };
@@ -387,7 +457,7 @@ impl Injector {
 
     /// Posts a mouse event carrying the current modifier flags.
     fn post_mouse(
-        &self,
+        &mut self,
         ty: CGEventType,
         button: CGMouseButton,
         at: (f64, f64),
@@ -395,7 +465,7 @@ impl Injector {
         click_state: i64,
     ) {
         let point = CGPoint::new(at.0, at.1);
-        let Some(ev) = CGEvent::new_mouse_event(Some(&self.source), ty, point, button) else {
+        let Some(ev) = CGEvent::new_mouse_event(Some(&self.source.0), ty, point, button) else {
             warn!("CGEventCreateMouseEvent failed for {ty:?}");
             return;
         };
@@ -407,6 +477,7 @@ impl Injector {
             set(CGEventField::MouseEventClickState, click_state);
         }
         self.post_with_flags(&ev, self.mods.flags());
+        self.record_post(at);
     }
 
     fn post_with_flags(&self, ev: &CGEvent, flags: u64) {
@@ -629,7 +700,7 @@ mod tests {
                     flags: FLAG_CAPS
                 },
                 Post::Flags {
-                    kc: 0x39,
+                    kc: 0x38,
                     flags: FLAG_CAPS
                 },
                 Post::ButtonUp(MouseButton::Left),
@@ -704,6 +775,45 @@ mod tests {
             motion_event_type(Some(MouseButton::Back)),
             (CGEventType::OtherMouseDragged, CGMouseButton(3))
         );
+    }
+
+    #[test]
+    fn reconcile_keeps_virtual_position_when_system_reading_is_stale() {
+        let recent = [(100.0, 50.0), (103.0, 50.0)];
+        assert_eq!(
+            reconcile((106.0, 50.0), Some((103.0, 50.0)), &recent),
+            (106.0, 50.0)
+        );
+        assert_eq!(
+            reconcile((106.0, 50.0), Some((100.3, 50.2)), &recent),
+            (106.0, 50.0)
+        );
+        assert_eq!(
+            reconcile((106.0, 50.0), Some((106.0, 50.0)), &recent),
+            (106.0, 50.0)
+        );
+    }
+
+    #[test]
+    fn reconcile_adopts_a_foreign_system_position() {
+        let recent = [(100.0, 50.0), (103.0, 50.0)];
+        assert_eq!(
+            reconcile((106.0, 50.0), Some((400.0, 300.0)), &recent),
+            (400.0, 300.0)
+        );
+        assert_eq!(
+            reconcile((106.0, 50.0), Some((101.5, 50.0)), &recent),
+            (101.5, 50.0)
+        );
+        assert_eq!(
+            reconcile((106.0, 50.0), Some((90.0, 50.0)), &[]),
+            (90.0, 50.0)
+        );
+    }
+
+    #[test]
+    fn reconcile_without_a_system_reading_keeps_virtual() {
+        assert_eq!(reconcile((106.0, 50.0), None, &[(1.0, 1.0)]), (106.0, 50.0));
     }
 
     #[test]
