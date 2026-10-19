@@ -198,8 +198,11 @@ pub fn dib_to_png(dib: &[u8]) -> Result<Vec<u8>> {
         }
     }
     // Many Windows apps leave the alpha channel zeroed: treat as opaque.
-    if bpp == 32 && rgba.chunks_exact(4).all(|p| p[3] == 0) {
-        rgba.chunks_exact_mut(4).for_each(|p| p[3] = 255);
+    if bpp == 32 && rgba.as_chunks::<4>().0.iter().all(|p| p[3] == 0) {
+        rgba.as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .for_each(|p| p[3] = 255);
     }
 
     let img = image::RgbaImage::from_raw(w as u32, h as u32, rgba)
