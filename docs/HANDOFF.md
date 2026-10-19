@@ -1,6 +1,6 @@
 # CursorJump — Handoff
 
-Last updated: 2026-10-19 (end of session 2, on the PC)
+Last updated: 2026-10-19 (session 3, on the Mac)
 
 ## What this is
 
@@ -38,8 +38,8 @@ The controller should:
 | 12b | Reachable return hotkey **Ctrl+Alt+Shift+H** (the user's 60 % keyboard has no Home), safer diagnose | ✅ done |
 | 13 | Windows clipboard | ✅ done, manual check passed (snip → PNG, text) |
 | 14 | Windows app: tray, settings, pairing dialog, autostart, wiring | ✅ done (2 fix rounds), manual pass with user passed |
-| 15–18 | Mac side (run by Claude Code **on the MacBook**) | ⏭ next |
-| 19 | Acceptance pass (latency, Valorant/Roblox, feel) | pending |
+| 15–18 | Mac side: injection, clipboard, app + bundle/signing/autostart (17a/17b), Mac-readiness wall + protocol v2 (17c), Wi-Fi hiccup helper `cursorjump-netd` (18) | ✅ done (session 3, on the Mac); end-to-end, lock screen, Wi-Fi off/on and sleep checks passed; remaining hardening checks deferred to Task 19 |
+| 19 | Acceptance pass (latency, Valorant/Roblox, feel) + the deferred Task 18 checks (deep sleep, reboots, monitor unplug, 150 % scaling) | ⏭ next |
 
 Tests at handoff: `cargo test --workspace` passes (184), clippy and fmt are clean, and CI is green on Windows and macOS (commit `2fae075`).
 
@@ -76,3 +76,12 @@ The PC app is installed for testing at `%LOCALAPPDATA%\CursorJump\cursorjump.exe
   ```
   The next time CursorJump starts, tick **Private** and click **Allow**.
 - On the Mac, Tasks 15/17 will need the user to grant **Accessibility** (and possibly Input Monitoring) to CursorJump in System Settings → Privacy & Security.
+
+## Session 3 notes (Mac)
+
+- Both apps speak **protocol v2** now (Task 17c). Update the PC and the Mac together, or they refuse each other at Hello.
+- Mac install: `./scripts/mac/install.sh` (app + LaunchAgent, Accessibility survives re-signs), and optionally `./scripts/mac/install-netd.sh` in Terminal (root AWDL helper for "Reduce Wi-Fi hiccups"). Both are installed on the user's Mac.
+- Mac logs: `~/Library/Application Support/CursorJump/cursorjump.log`; helper log: `/var/log/cursorjump-netd.log`.
+- Both the PC and the Mac sessions append to the ledger: pull before writing and append, never overwrite.
+- Pending housekeeping: push `cargo test -p cursorjump --no-run` for the Windows CI job (needs a GitHub token with the `workflow` scope).
+- After Task 19: the final whole-branch review triages every `minor (deferred)` in the ledger, then merge `phase1` → `main`.
