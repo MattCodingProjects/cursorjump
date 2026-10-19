@@ -11,6 +11,7 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use cj_core::mac_state::{MacAction, MacEvent, MacMachine};
@@ -19,6 +20,9 @@ use tracing::{error, warn};
 
 use super::inject::Injector;
 use super::power;
+
+/// The "no Accessibility" bounce is logged at most this often.
+const NO_ACCESS_LOG_EVERY: Duration = Duration::from_secs(10);
 
 /// What the thread needs from the Injector; a trait so the routing can be
 /// tested without posting real events.
@@ -34,6 +38,8 @@ pub trait Inject {
     fn buttons_held(&self) -> bool;
     fn button_held(&self, b: MouseButton) -> bool;
     fn key_held(&self, mac_keycode: u16) -> bool;
+    /// Where the cursor is now, as a fraction along the entry edge.
+    fn entry_frac(&self) -> f32;
 }
 
 impl Inject for Injector {
@@ -66,6 +72,9 @@ impl Inject for Injector {
     }
     fn key_held(&self, mac_keycode: u16) -> bool {
         Injector::key_held(self, mac_keycode)
+    }
+    fn entry_frac(&self) -> f32 {
+        Injector::entry_frac(self)
     }
 }
 
@@ -120,7 +129,7 @@ pub enum InjectMsg {
 }
 
 /// Records whether this process may post events (`has`, from
-/// `has_post_event_access`) for the injection thread, which reads `access`
+/// `AccessState::ready`) for the injection thread, which reads `access`
 /// instead of asking the system (a TCC query, milliseconds) on every Enter.
 /// When the permission goes away, tells the thread. True if it changed.
 pub fn update_access(
@@ -135,6 +144,37 @@ pub fn update_access(
         let _ = inject.send(InjectMsg::AccessLost);
     }
     true
+}
+
+/// Lets a repeated log line through at most once per period, counting the
+/// lines held back meanwhile.
+pub struct LogLimit {
+    every: Duration,
+    last: Option<Instant>,
+    suppressed: u32,
+}
+
+impl LogLimit {
+    pub fn new(every: Duration) -> Self {
+        LogLimit {
+            every,
+            last: None,
+            suppressed: 0,
+        }
+    }
+
+    /// Some(lines held back since the last one) if a line may be logged at `now`.
+    pub fn allow(&mut self, now: Instant) -> Option<u32> {
+        if self
+            .last
+            .is_some_and(|t| now.saturating_duration_since(t) < self.every)
+        {
+            self.suppressed = self.suppressed.saturating_add(1);
+            return None;
+        }
+        self.last = Some(now);
+        Some(std::mem::take(&mut self.suppressed))
+    }
 }
 
 /// What the thread reports to the app's loop.
@@ -156,8 +196,9 @@ pub struct Router<I: Inject> {
     sid: Option<u64>,
     /// Whether events may be posted (Accessibility), kept up to date by the loop.
     access: Arc<AtomicBool>,
-    /// Where the PC's cursor came in, for sending it back without a push.
-    enter_frac: f32,
+    /// For the "no Accessibility" bounce, which an older PC repeats while
+    /// the user keeps pushing at its edge.
+    no_access_log: LogLimit,
 }
 
 impl<I: Inject> Router<I> {
@@ -167,7 +208,7 @@ impl<I: Inject> Router<I> {
             machine: MacMachine::new(),
             sid: None,
             access,
-            enter_frac: 0.5,
+            no_access_log: LogLimit::new(NO_ACCESS_LOG_EVERY),
         }
     }
 
@@ -190,7 +231,8 @@ impl<I: Inject> Router<I> {
             InjectMsg::AccessLost => match self.sid {
                 Some(sid) if self.machine.controlled() => {
                     warn!("Accessibility permission revoked: sending the cursor back to the PC");
-                    self.bounce(sid)
+                    let frac = self.inj.entry_frac();
+                    self.bounce(sid, frac)
                 }
                 _ => Vec::new(),
             },
@@ -214,13 +256,19 @@ impl<I: Inject> Router<I> {
         match input {
             Input::Enter { edge, frac } => {
                 // The cached state: asking the system costs milliseconds.
-                let allowed = self.access.load(Ordering::Relaxed);
-                self.enter_frac = frac;
-                let mut out = self.feed(sid, MacEvent::Enter { edge, frac });
-                if !allowed {
-                    warn!("no Accessibility permission: sending the cursor back to the PC");
-                    out.extend(self.bounce(sid));
+                if self.access.load(Ordering::Relaxed) {
+                    return self.feed(sid, MacEvent::Enter { edge, frac });
                 }
+                if let Some(suppressed) = self.no_access_log.allow(Instant::now()) {
+                    warn!(
+                        suppressed,
+                        "no Accessibility permission: sending the cursor back to the PC"
+                    );
+                }
+                // Neither wake nor warp: the Mac's cursor must not jump to
+                // the edge for a crossing that is undone at once.
+                let mut out = self.feed_quietly(sid, MacEvent::Enter { edge, frac });
+                out.extend(self.bounce(sid, frac));
                 out
             }
             Input::Motion { dx, dy } if controlled => match self.inj.motion(dx, dy) {
@@ -251,10 +299,9 @@ impl<I: Inject> Router<I> {
         }
     }
 
-    /// Sends the PC's cursor back where it came in, as if pushed out: never
-    /// strand it on a Mac that cannot be controlled.
-    fn bounce(&mut self, sid: u64) -> Vec<InjectEv> {
-        let frac = self.enter_frac;
+    /// Sends the PC's cursor back at `frac` along the entry edge, as if
+    /// pushed out: never strand it on a Mac that cannot be controlled.
+    fn bounce(&mut self, sid: u64, frac: f32) -> Vec<InjectEv> {
         self.feed(
             sid,
             MacEvent::PushOut {
@@ -266,9 +313,19 @@ impl<I: Inject> Router<I> {
 
     /// Feeds the machine and carries out its actions.
     fn feed(&mut self, sid: u64, ev: MacEvent) -> Vec<InjectEv> {
+        self.carry_out(sid, ev, true)
+    }
+
+    /// Like `feed`, but neither wakes the display nor moves the cursor.
+    fn feed_quietly(&mut self, sid: u64, ev: MacEvent) -> Vec<InjectEv> {
+        self.carry_out(sid, ev, false)
+    }
+
+    fn carry_out(&mut self, sid: u64, ev: MacEvent, move_cursor: bool) -> Vec<InjectEv> {
         let mut out = Vec::new();
         for action in self.machine.on(ev) {
             match action {
+                MacAction::WakeDisplay | MacAction::WarpTo { .. } if !move_cursor => {}
                 MacAction::WakeDisplay => self.inj.wake_display(),
                 MacAction::WarpTo { edge, frac } => self.inj.warp_to(edge, frac),
                 MacAction::SendLeave { frac } => out.push(InjectEv::SendLeave { sid, frac }),
@@ -357,6 +414,8 @@ pub(super) mod tests {
         key_panics: bool,
         /// What every `motion` returns.
         push_out: Option<f32>,
+        /// What `entry_frac` returns: where the cursor is along the entry edge.
+        at_frac: f32,
         keys: BTreeSet<u16>,
         buttons: Vec<MouseButton>,
     }
@@ -368,6 +427,7 @@ pub(super) mod tests {
                 calls: calls.clone(),
                 key_panics: false,
                 push_out: None,
+                at_frac: 0.5,
                 keys: BTreeSet::new(),
                 buttons: Vec::new(),
             };
@@ -422,6 +482,9 @@ pub(super) mod tests {
         }
         fn key_held(&self, kc: u16) -> bool {
             self.keys.contains(&kc)
+        }
+        fn entry_frac(&self) -> f32 {
+            self.at_frac
         }
     }
 
@@ -659,7 +722,8 @@ pub(super) mod tests {
         r.handle(input(1, key(0x00, true)));
         assert_eq!(
             take(&calls),
-            vec![Call::Wake, Call::Warp(Side::Left, 0.7), Call::ReleaseAll]
+            vec![Call::ReleaseAll],
+            "no wake and no warp: the Mac's cursor does not jump"
         );
     }
 
@@ -681,7 +745,8 @@ pub(super) mod tests {
 
     #[test]
     fn losing_access_while_controlled_sends_the_cursor_back() {
-        let (fake, calls) = Fake::new();
+        let (mut fake, calls) = Fake::new();
+        fake.at_frac = 0.8;
         let access = granted();
         let mut r = begun_with(fake, access.clone());
         r.handle(input(1, enter(0.3)));
@@ -691,12 +756,30 @@ pub(super) mod tests {
         assert_eq!(
             r.handle(InjectMsg::AccessLost),
             vec![
-                InjectEv::SendLeave { sid: 1, frac: 0.3 },
+                // Where the cursor is now along the entry edge, not where it came in.
+                InjectEv::SendLeave { sid: 1, frac: 0.8 },
                 InjectEv::Controlled { sid: 1, on: false },
             ]
         );
         assert_eq!(take(&calls), vec![Call::ReleaseAll]);
         assert_eq!(r.handle(InjectMsg::AccessLost), vec![], "already gone");
+    }
+
+    #[test]
+    fn log_limit_lets_one_line_through_per_period_and_counts_the_rest() {
+        let t0 = std::time::Instant::now();
+        let mut l = LogLimit::new(Duration::from_secs(10));
+        assert_eq!(l.allow(t0), Some(0), "the first line goes through");
+        assert_eq!(l.allow(t0 + Duration::from_secs(1)), None);
+        assert_eq!(l.allow(t0 + Duration::from_millis(9_999)), None);
+        assert_eq!(
+            l.allow(t0 + Duration::from_secs(10)),
+            Some(2),
+            "after the period, with the count of lines held back"
+        );
+        assert_eq!(l.allow(t0 + Duration::from_secs(11)), None);
+        assert_eq!(l.allow(t0 + Duration::from_secs(25)), Some(1));
+        assert_eq!(l.allow(t0 + Duration::from_secs(40)), Some(0));
     }
 
     #[test]

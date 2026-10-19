@@ -392,6 +392,20 @@ impl Injector {
         self.held.is_key_down(mac_keycode)
     }
 
+    /// Where the cursor is now (the virtual cursor, or where something else
+    /// moved it), as a fraction along the entry edge.
+    pub fn entry_frac(&self) -> f32 {
+        let recent: Vec<(f64, f64)> = self.recent.iter().map(|&(_, p)| p).collect();
+        let (x, y) = reconcile(self.pos, cursor_location(), &recent);
+        let entry = self.entry.unwrap_or(Side::Left);
+        edge_frac(
+            &self.bounds.to_rect(),
+            entry,
+            x.floor() as i32,
+            y.floor() as i32,
+        )
+    }
+
     fn refresh_bounds(&mut self) {
         DISPLAYS_CHANGED.store(false, Ordering::Relaxed);
         self.bounds = main_display_bounds();

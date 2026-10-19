@@ -13,7 +13,7 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 use cj_core::clipboard::ClipboardData;
@@ -35,7 +35,10 @@ use super::control::{
 };
 use super::inject::Injector;
 use super::link::{Live, run_pairing};
-use super::permissions::{has_post_event_access, request_post_event_access};
+use super::permissions::{
+    AccessState, access_state, may_relaunch, read_relaunch_stamp, request_post_event_access,
+    write_relaunch_stamp,
+};
 use super::power::KeepAwake;
 use crate::common::clipboard_bridge::{ClipboardLink, bridge_clipboard};
 use crate::common::config_file::ConfigFile;
@@ -50,8 +53,11 @@ const PING_EVERY: Duration = Duration::from_millis(100);
 const CONFIG_POLL: Duration = Duration::from_millis(500);
 /// The latency readout is recomputed this often.
 const LATENCY_REFRESH: Duration = Duration::from_secs(1);
-/// How often the Accessibility permission is checked for the menu.
+/// How often the Accessibility permission is checked (menu, PC, injection).
 const ACCESS_POLL: Duration = Duration::from_secs(2);
+/// In the config directory: when CursorJump last relaunched itself to pick
+/// up the Accessibility permission.
+const RELAUNCH_STAMP: &str = "relaunch.stamp";
 /// How long Quit waits for the injection thread to release everything.
 const QUIT_TIMEOUT: Duration = Duration::from_secs(2);
 /// At quit, time for the endpoint to send CONNECTION_CLOSE, so the PC takes
@@ -102,10 +108,16 @@ pub fn run_mac() -> Result<()> {
 
     let (events, events_rx) = unbounded_channel();
     let inject_events = events.clone();
-    let access = Arc::new(AtomicBool::new(has_post_event_access()));
-    if !access.load(Ordering::Relaxed) {
+    let state = access_state();
+    let access = Arc::new(AtomicBool::new(state.ready()));
+    if !state.ready() {
         warn!(
             "no Accessibility permission yet: the PC cannot control this Mac until it is granted"
+        );
+    } else if !state.can_post {
+        warn!(
+            ?state,
+            "Accessibility is on, but posting events is not confirmed"
         );
     }
     let inject = spawn_inject_thread(Injector::new()?, access.clone(), move |ev| {
@@ -211,6 +223,11 @@ pub(super) enum Ev {
     Inject(InjectEv),
     /// A local copy that passed the clipboard gate.
     LocalClipboard(ClipboardData),
+    /// The result of Accessibility poll number `seq`.
+    Access {
+        seq: u64,
+        state: AccessState,
+    },
 }
 
 /// Resolves when SIGTERM arrives (launchctl bootout, logout); never without a handler.
@@ -303,11 +320,14 @@ struct App {
     epoch: std::time::Instant,
     settings: SettingsWindow,
     last_model: Option<TrayModel>,
+    /// The latest Accessibility poll started, and the latest one applied.
+    access_polls: (u64, u64),
     quit_by: Option<Instant>,
     done: bool,
-    /// The injection thread stopped without Quit: exit non-zero so launchd
-    /// (KeepAlive SuccessfulExit=false) starts a fresh copy.
-    failed: bool,
+    /// Exit non-zero so launchd (KeepAlive SuccessfulExit=false) starts a
+    /// fresh copy: the injection thread stopped without Quit, or the
+    /// Accessibility grant needs a new process.
+    restart: bool,
 }
 
 impl App {
@@ -335,9 +355,10 @@ impl App {
             epoch: std::time::Instant::now(),
             settings: SettingsWindow::default(),
             last_model: None,
+            access_polls: (0, 0),
             quit_by: None,
             done: false,
-            failed: false,
+            restart: false,
         }
     }
 
@@ -393,8 +414,8 @@ impl App {
             tokio::time::sleep(CLOSE_FLUSH),
             tokio::task::spawn_blocking(move || drop(advertiser)),
         );
-        if self.failed {
-            error!("exiting with an error");
+        if self.restart {
+            error!("exiting with an error so that CursorJump restarts");
             std::process::exit(1);
         }
         info!("stopped");
@@ -429,8 +450,8 @@ impl App {
                     self.update_config(|c| c.paired_peer = None);
                 }
             }
-            Ev::Accepted(session) => self.on_accepted(session),
-            Ev::PairDone { sid, result } => self.on_pair_done(sid, result),
+            Ev::Accepted(session) => self.on_accepted(session).await,
+            Ev::PairDone { sid, result } => self.on_pair_done(sid, result).await,
             Ev::Net { sid, ev } => {
                 if self.live().is_some_and(|l| l.sid == sid) {
                     self.on_net(ev);
@@ -443,6 +464,7 @@ impl App {
                     live.send_clipboard(d);
                 }
             }
+            Ev::Access { seq, state } => self.on_access(seq, state).await,
         }
     }
 
@@ -488,7 +510,7 @@ impl App {
             InjectEv::Stopped => {
                 if self.quit_by.is_none() {
                     error!("injection thread stopped; quitting so that CursorJump restarts");
-                    self.failed = true;
+                    self.restart = true;
                 }
                 self.done = true;
             }
@@ -530,7 +552,7 @@ impl App {
         self.latency_text = latency_text(&self.latency);
     }
 
-    fn on_accepted(&mut self, session: Session) {
+    async fn on_accepted(&mut self, session: Session) {
         if self.quit_by.is_some() {
             session.close();
             return;
@@ -540,7 +562,7 @@ impl App {
             Some(fp) if peer == fp => {
                 // A newer session replaces the current one.
                 self.set_conn(Conn::Waiting);
-                self.start_live(session);
+                self.start_live(session).await;
             }
             Some(_) => {
                 // The listener's trust lagged a change of the paired computer.
@@ -558,7 +580,7 @@ impl App {
         }
     }
 
-    fn start_live(&mut self, session: Session) {
+    async fn start_live(&mut self, session: Session) {
         let sid = self.take_sid();
         let live = Live::start(
             sid,
@@ -570,6 +592,20 @@ impl App {
         );
         info!(peer = %live.peer_name, "connected");
         self.set_conn(Conn::Live(live));
+        self.send_mac_ready().await;
+    }
+
+    /// Tells the PC whether it can take the cursor here.
+    async fn send_mac_ready(&mut self) {
+        let Some(session) = self.live().map(|l| l.session.clone()) else {
+            return;
+        };
+        let ready = self.has_access();
+        // Awaited here, outside any select!: send_control is not cancel-safe.
+        if let Err(e) = session.send_control(&Control::MacReady { ready }).await {
+            info!("disconnected: control stream: {e:#}");
+            self.set_conn(Conn::Waiting);
+        }
     }
 
     fn start_pairing(&mut self, session: Session) {
@@ -601,7 +637,7 @@ impl App {
         }));
     }
 
-    fn on_pair_done(&mut self, sid: u64, result: Result<bool>) {
+    async fn on_pair_done(&mut self, sid: u64, result: Result<bool>) {
         if !matches!(&self.conn, Conn::Pairing(p) if p.sid == sid) {
             return;
         }
@@ -622,7 +658,7 @@ impl App {
                     session.close();
                 } else {
                     // The PC goes on using the same session.
-                    self.start_live(session);
+                    self.start_live(session).await;
                 }
             }
             // Dropping `pairing` closes the session; the PC retries on its own schedule.
@@ -643,13 +679,69 @@ impl App {
         self.ping_seq = seq;
     }
 
-    /// Refreshes the injection thread's view of the Accessibility
-    /// permission; losing it sends the PC's cursor back.
+    /// Asks the system about the Accessibility permission off this thread:
+    /// the queries take milliseconds, which must not delay a `Leave`.
     fn poll_access(&mut self) {
-        let has = has_post_event_access();
-        if update_access(&self.ch.access, has, &self.ch.inject) {
-            info!(granted = has, "Accessibility permission changed");
+        self.access_polls.0 += 1;
+        let (seq, tx) = (self.access_polls.0, self.ch.events.clone());
+        tokio::task::spawn_blocking(move || {
+            let _ = tx.send(Ev::Access {
+                seq,
+                state: access_state(),
+            });
+        });
+    }
+
+    /// Applies a poll's result: the injection thread's view (losing the
+    /// permission sends the PC's cursor back), the PC's, and a relaunch if
+    /// the grant needs a new process.
+    async fn on_access(&mut self, seq: u64, state: AccessState) {
+        // A late result must not undo a newer one.
+        if seq <= self.access_polls.1 {
+            return;
         }
+        self.access_polls.1 = seq;
+        let ready = state.ready();
+        if !update_access(&self.ch.access, ready, &self.ch.inject) {
+            return;
+        }
+        info!(granted = ready, ?state, "Accessibility permission changed");
+        self.send_mac_ready().await;
+        if ready && !state.can_post {
+            self.relaunch_for_access();
+        }
+    }
+
+    /// Accessibility was just switched on, but this process may still be
+    /// refused posting events until it restarts: quit so that launchd
+    /// starts a new copy, unless that was done less than a minute ago.
+    fn relaunch_for_access(&mut self) {
+        warn!("Accessibility granted, but posting events is not allowed yet");
+        if self.quit_by.is_some() {
+            return;
+        }
+        let stamp = match paths::config_dir() {
+            Ok(dir) => dir.join(RELAUNCH_STAMP),
+            Err(e) => {
+                warn!("not restarting: {e:#}");
+                return;
+            }
+        };
+        let now = SystemTime::now();
+        if !may_relaunch(read_relaunch_stamp(&stamp), now) {
+            warn!(
+                "not restarting again so soon; if the PC's input does not arrive, quit and reopen CursorJump"
+            );
+            return;
+        }
+        if let Err(e) = write_relaunch_stamp(&stamp, now) {
+            // Without the stamp a relaunch loop is possible: do not risk it.
+            warn!("not restarting: could not write {}: {e}", stamp.display());
+            return;
+        }
+        info!("restarting CursorJump to pick up the Accessibility permission");
+        self.restart = true;
+        self.begin_quit();
     }
 
     // ----------------------------------------------------------------- config
