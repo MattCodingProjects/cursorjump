@@ -39,7 +39,8 @@ The controller should:
 | 13 | Windows clipboard | ✅ done, manual check passed (snip → PNG, text) |
 | 14 | Windows app: tray, settings, pairing dialog, autostart, wiring | ✅ done (2 fix rounds), manual pass with user passed |
 | 15–18 | Mac side: injection, clipboard, app + bundle/signing/autostart (17a/17b), Mac-readiness wall + protocol v2 (17c), Wi-Fi hiccup helper `cursorjump-netd` (18) | ✅ done (session 3, on the Mac); end-to-end, lock screen, Wi-Fi off/on and sleep checks passed; remaining hardening checks deferred to Task 19 |
-| 19 | Acceptance pass (latency, Valorant/Roblox, feel) + the deferred Task 18 checks (deep sleep, reboots, monitor unplug, 150 % scaling) | ⏭ next |
+| 19 | Acceptance pass: checklist and latency done (median ≈3.5 ms on Wi-Fi, 0 spikes); games, feel and hardening leftovers deferred by the user | ✅ done (partly deferred) |
+| — | Final whole-branch review + fixes; **phase1 merged to main** (f155ecf) | ✅ done |
 
 Tests at handoff: `cargo test --workspace` passes (184), clippy and fmt are clean, and CI is green on Windows and macOS (commit `2fae075`).
 
@@ -83,5 +84,4 @@ The PC app is installed for testing at `%LOCALAPPDATA%\CursorJump\cursorjump.exe
 - Mac install: `./scripts/mac/install.sh` (app + LaunchAgent, Accessibility survives re-signs), and optionally `./scripts/mac/install-netd.sh` in Terminal (root AWDL helper for "Reduce Wi-Fi hiccups"). Both are installed on the user's Mac.
 - Mac logs: `~/Library/Application Support/CursorJump/cursorjump.log`; helper log: `/var/log/cursorjump-netd.log`.
 - Both the PC and the Mac sessions append to the ledger: pull before writing and append, never overwrite.
-- Pending housekeeping: push `cargo test -p cursorjump --no-run` for the Windows CI job (needs a GitHub token with the `workflow` scope).
-- After Task 19: the final whole-branch review triages every `minor (deferred)` in the ledger, then merge `phase1` → `main`.
+- Phase 1 is merged to `main`. Open follow-ups, including the deferred hands-on checks, are in `docs/superpowers/progress/phase2-followups.md`. Phase 2 (file drag-and-drop) needs its own design pass first.
