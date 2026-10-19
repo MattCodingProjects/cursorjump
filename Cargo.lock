@@ -226,6 +226,7 @@ dependencies = [
 name = "cursorjump"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "cj-core",
  "crossbeam-channel",
  "embed-manifest",

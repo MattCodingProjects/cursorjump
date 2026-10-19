@@ -1,4 +1,5 @@
 //! Windows platform layer.
+pub mod clipboard;
 pub mod cursor;
 pub mod input_thread;
 pub mod monitors;
@@ -43,6 +44,7 @@ pub fn run_diagnose(run_for: Duration) {
         seconds = run_for.as_secs(),
         "diagnose: push against the Mac edge to cross; Ctrl+Alt+Home returns"
     );
+    spawn_clipboard_logger();
     let mut diag = Diagnose {
         cmd_tx,
         on_mac_since: None,
@@ -82,6 +84,28 @@ pub fn run_diagnose(run_for: Duration) {
     let until = Instant::now() + Duration::from_secs(2);
     while msg_rx.recv_deadline(until).is_ok() {}
     info!("diagnose: done");
+}
+
+/// Log a one-line summary per clipboard change (never the data itself).
+fn spawn_clipboard_logger() {
+    let rx = clipboard::spawn_clipboard_watcher();
+    let spawned = std::thread::Builder::new()
+        .name("cj-clipboard-log".into())
+        .spawn(move || {
+            let field = |len: Option<usize>| len.map_or("-".to_string(), |n| format!("{n}B"));
+            for d in rx {
+                info!(
+                    "clipboard: text={} html={} rtf={} png={}",
+                    field(d.text.as_ref().map(|v| v.len())),
+                    field(d.html.as_ref().map(|v| v.len())),
+                    field(d.rtf.as_ref().map(|v| v.len())),
+                    field(d.png.as_ref().map(|v| v.len())),
+                );
+            }
+        });
+    if let Err(e) = spawned {
+        error!("clipboard log thread failed to start: {e}");
+    }
 }
 
 struct Diagnose {
