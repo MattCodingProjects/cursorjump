@@ -12,6 +12,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo build --workspace --locked
       - run: cargo test -p cj-core -p cj-net --locked
+      # The root AWDL helper's tests are hermetic (fake interface, temp sockets).
+      - if: matrix.os == 'macos-latest'
+        run: cargo test -p cursorjump-netd --locked
+      # App tests: Windows runs them all (tests that touch the live clipboard
+      # are #[ignore]d); on macOS they need Accessibility and the user's
+      # pasteboard, so CI only compiles them there.
+      - if: matrix.os == 'windows-latest'
+        run: cargo test -p cursorjump --locked
+      - if: matrix.os == 'macos-latest'
+        run: cargo test -p cursorjump --no-run --locked
