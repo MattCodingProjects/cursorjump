@@ -7,5 +7,6 @@ pub mod clipboard;
 pub mod control;
 pub mod inject;
 mod link;
+mod netd;
 pub mod permissions;
 pub mod power;

@@ -550,6 +550,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "cursorjump-netd"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "tempfile",
+]
+
+[[package]]
 name = "dbus"
 version = "0.9.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"

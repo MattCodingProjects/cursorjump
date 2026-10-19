@@ -1,0 +1,15 @@
+[package]
+name = "cursorjump-netd"
+version.workspace = true
+edition.workspace = true
+description = "Root helper for CursorJump's Reduce Wi-Fi hiccups: holds the AWDL interface down while asked to"
+
+[[bin]]
+name = "cursorjump-netd"
+path = "src/main.rs"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2.191"
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+tempfile = "3"

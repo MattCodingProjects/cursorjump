@@ -35,6 +35,7 @@ use super::control::{
 };
 use super::inject::Injector;
 use super::link::{Live, run_pairing};
+use super::netd::AwdlKeeper;
 use super::permissions::{
     AccessState, RelaunchVia, access_state, may_relaunch, read_relaunch_stamp, relaunch_via,
     reopen_command, request_post_event_access, write_relaunch_stamp,
@@ -251,15 +252,21 @@ enum LinkStatus<'a> {
     Connected(&'a str),
 }
 
-/// The menu's status line.
-fn status_text(link: LinkStatus, needs_accessibility: bool) -> String {
-    match link {
+/// The menu's status line. `wifi_helper_missing`: Reduce Wi-Fi hiccups is
+/// on, but its helper is not installed.
+fn status_text(link: LinkStatus, needs_accessibility: bool, wifi_helper_missing: bool) -> String {
+    let status = match link {
         // The pairing dialog is up; that comes first.
         LinkStatus::Pairing => "Pairing…".into(),
         // Nothing works without it; the menu offers "Grant Accessibility…".
         _ if needs_accessibility => "Accessibility needed".into(),
         LinkStatus::Waiting => "Waiting for your PC".into(),
         LinkStatus::Connected(name) => format!("Connected to {name}"),
+    };
+    if wifi_helper_missing {
+        format!("{status} — Wi-Fi helper not installed")
+    } else {
+        status
     }
 }
 
@@ -347,6 +354,10 @@ struct App {
     conn: Conn,
     /// Held while a paired session is live.
     awake: Option<KeepAwake>,
+    /// Holds AWDL down while a paired session is live and Reduce Wi-Fi
+    /// hiccups is on. Dropped off the async path at quit (it may wait for
+    /// the helper).
+    awdl: Option<AwdlKeeper>,
     next_sid: u64,
     /// Set while a pairing dialog is on screen, which can outlive its session.
     pair_dialog_open: Arc<AtomicBool>,
@@ -378,6 +389,9 @@ impl App {
         ch: Channels,
     ) -> App {
         let latency = LatencyStats::new();
+        let awdl = AwdlKeeper::spawn()
+            .inspect_err(|e| warn!("Reduce Wi-Fi hiccups is unavailable: {e:#}"))
+            .ok();
         App {
             cfg,
             config_file,
@@ -386,6 +400,7 @@ impl App {
             ch,
             conn: Conn::Waiting,
             awake: None,
+            awdl,
             next_sid: 0,
             pair_dialog_open: Arc::new(AtomicBool::new(false)),
             latency_text: latency_text(&latency),
@@ -450,9 +465,12 @@ impl App {
         // async workers; meanwhile the endpoint sends the session's
         // CONNECTION_CLOSE before the process ends.
         let advertiser = self.advertiser.take();
+        // Releases the AWDL hold, if any, before the process ends.
+        let awdl = self.awdl.take();
         let _ = tokio::join!(
             tokio::time::sleep(CLOSE_FLUSH),
             tokio::task::spawn_blocking(move || drop(advertiser)),
+            tokio::task::spawn_blocking(move || drop(awdl)),
         );
         if self.restart {
             error!("exiting with an error so that CursorJump restarts");
@@ -594,8 +612,18 @@ impl App {
             (Conn::Live(_), Some(_)) => {}
             _ => self.awake = None,
         }
+        self.update_awdl();
         self.latency = LatencyStats::new();
         self.latency_text = latency_text(&self.latency);
+    }
+
+    /// AWDL is held down exactly while a paired session is live and Reduce
+    /// Wi-Fi hiccups is on.
+    fn update_awdl(&mut self) {
+        let wanted = self.cfg.reduce_wifi_hiccups && self.live().is_some();
+        if let Some(awdl) = &mut self.awdl {
+            awdl.hold(wanted);
+        }
     }
 
     async fn on_accepted(&mut self, session: Session) {
@@ -824,6 +852,7 @@ impl App {
         info!("settings changed");
         let pairing_changed = cfg.paired_peer != self.cfg.paired_peer;
         self.cfg = cfg;
+        self.update_awdl();
         self.ch
             .clip_link
             .max_bytes
@@ -906,8 +935,10 @@ impl App {
             Conn::Pairing(_) => LinkStatus::Pairing,
             Conn::Live(l) => LinkStatus::Connected(&l.peer_name),
         };
+        let wifi_helper_missing =
+            self.cfg.reduce_wifi_hiccups && self.awdl.as_ref().is_some_and(|a| a.helper_missing());
         let model = TrayModel {
-            status: status_text(link, !self.has_access()),
+            status: status_text(link, !self.has_access(), wifi_helper_missing),
             latency: self.latency_text.clone(),
             paused: false,
             needs_accessibility: !self.has_access(),
@@ -926,12 +957,12 @@ mod tests {
     #[test]
     fn status_follows_the_connection() {
         assert_eq!(
-            status_text(LinkStatus::Waiting, false),
+            status_text(LinkStatus::Waiting, false, false),
             "Waiting for your PC"
         );
-        assert_eq!(status_text(LinkStatus::Pairing, false), "Pairing…");
+        assert_eq!(status_text(LinkStatus::Pairing, false, false), "Pairing…");
         assert_eq!(
-            status_text(LinkStatus::Connected("GAMING-PC"), false),
+            status_text(LinkStatus::Connected("GAMING-PC"), false, false),
             "Connected to GAMING-PC"
         );
     }
@@ -939,14 +970,26 @@ mod tests {
     #[test]
     fn status_asks_for_accessibility_except_while_pairing() {
         assert_eq!(
-            status_text(LinkStatus::Waiting, true),
+            status_text(LinkStatus::Waiting, true, false),
             "Accessibility needed"
         );
         assert_eq!(
-            status_text(LinkStatus::Connected("GAMING-PC"), true),
+            status_text(LinkStatus::Connected("GAMING-PC"), true, false),
             "Accessibility needed"
         );
-        assert_eq!(status_text(LinkStatus::Pairing, true), "Pairing…");
+        assert_eq!(status_text(LinkStatus::Pairing, true, false), "Pairing…");
+    }
+
+    #[test]
+    fn status_notes_a_missing_wifi_helper() {
+        assert_eq!(
+            status_text(LinkStatus::Connected("GAMING-PC"), false, true),
+            "Connected to GAMING-PC — Wi-Fi helper not installed"
+        );
+        assert_eq!(
+            status_text(LinkStatus::Waiting, true, true),
+            "Accessibility needed — Wi-Fi helper not installed"
+        );
     }
 
     #[test]

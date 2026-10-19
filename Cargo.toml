@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/cj-core", "crates/cj-net", "app/cursorjump"]
+members = ["crates/cj-core", "crates/cj-net", "app/cursorjump", "app/cursorjump-netd"]
 
 [workspace.package]
 version = "0.1.0"

@@ -49,4 +49,6 @@ macOS asks for two permissions; allow both:
 Settings and pairing: ~/Library/Application Support/CursorJump/
 Start at login:       ~/Library/LaunchAgents/$label.plist
 Logs:                 ~/Library/Application Support/CursorJump/cursorjump.log
+
+Optional: "Reduce Wi-Fi hiccups" also needs a helper; run scripts/mac/install-netd.sh (asks for your password).
 MSG
