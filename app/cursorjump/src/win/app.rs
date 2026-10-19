@@ -8,7 +8,7 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime};
@@ -32,6 +32,7 @@ use super::bridges::{ClipboardLink, bridge_clipboard, bridge_input};
 use super::clipboard::spawn_clipboard_watcher;
 use super::input_thread::{InputCmd, InputMsg, spawn_input_thread};
 use super::link::{Backoff, Established, Live, NetEv, establish, paired_fingerprint};
+use super::settings_window::SettingsWindow;
 use crate::paths;
 use crate::ui::dialogs;
 use crate::ui::tray::{TrayCmd, TrayLoop, TrayModel, latency_text};
@@ -310,7 +311,7 @@ struct App {
     ping_seq: u32,
     /// Zero point for ping timestamps.
     epoch: std::time::Instant,
-    settings: Option<Child>,
+    settings: SettingsWindow,
     quit_by: Option<Instant>,
     done: bool,
 }
@@ -339,7 +340,7 @@ impl App {
             latency,
             ping_seq: 0,
             epoch: std::time::Instant::now(),
-            settings: None,
+            settings: SettingsWindow::default(),
             quit_by: None,
             done: false,
         }
@@ -381,6 +382,8 @@ impl App {
             self.publish();
         }
         self.link = None;
+        // Every way out (Quit, input thread gone) closes the settings window.
+        self.settings.close();
         info!("stopped");
     }
 
@@ -768,18 +771,9 @@ impl App {
     }
 
     fn open_settings(&mut self) {
-        if let Some(child) = &mut self.settings
-            && matches!(child.try_wait(), Ok(None))
-        {
-            info!("settings window is already open");
-            return;
-        }
-        let spawned =
-            std::env::current_exe().and_then(|exe| Command::new(exe).arg("--settings").spawn());
-        match spawned {
-            Ok(child) => self.settings = Some(child),
-            Err(e) => error!("opening settings: {e}"),
-        }
+        self.settings.open(|| {
+            std::env::current_exe().and_then(|exe| Command::new(exe).arg("--settings").spawn())
+        });
     }
 
     /// Puts the cursor back on the PC, then stops the input thread; the loop
@@ -792,6 +786,7 @@ impl App {
         self.feed(PcEvent::ReturnHotkey);
         self.settle().await;
         self.send_input(InputCmd::Quit);
+        self.settings.close();
         self.retry_at = None;
         self.quit_by = Some(Instant::now() + QUIT_TIMEOUT);
     }

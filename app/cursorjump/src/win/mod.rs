@@ -8,6 +8,7 @@ pub mod input_thread;
 mod link;
 pub mod monitors;
 pub mod probe;
+mod settings_window;
 
 use std::time::{Duration, Instant};
 
