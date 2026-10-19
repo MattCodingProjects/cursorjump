@@ -42,6 +42,8 @@ pub enum PcEvent {
     ReturnHotkey,
     HookLost,
     ConfigChanged(Config),
+    /// The Mac said whether it can take the cursor (`Control::MacReady`).
+    MacReady(bool),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -74,6 +76,9 @@ pub struct PcMachine {
     entry_offset: f32,
     local_ans: Option<bool>,
     remote_ans: Option<bool>,
+    /// Whether the Mac can take the cursor. True until it says otherwise,
+    /// so a Mac that never sends `MacReady` is not walled off.
+    mac_ready: bool,
 }
 
 impl PcMachine {
@@ -86,6 +91,7 @@ impl PcMachine {
             entry_offset: 0.0,
             local_ans: None,
             remote_ans: None,
+            mac_ready: true,
         }
     }
 
@@ -93,6 +99,7 @@ impl PcMachine {
         match ev {
             PcEvent::Connected { paired: true, .. } => {
                 self.link = Link::Connected;
+                self.mac_ready = true;
                 vec![]
             }
             PcEvent::Connected {
@@ -100,6 +107,7 @@ impl PcMachine {
                 code,
             } => {
                 self.link = Link::Pairing { code: code.clone() };
+                self.mac_ready = true;
                 self.clear_answers();
                 vec![PcAction::ShowPairDialog { code }]
             }
@@ -129,6 +137,7 @@ impl PcMachine {
             } => {
                 if self.link != Link::Connected
                     || self.where_ != Where::Pc
+                    || !self.mac_ready
                     || self.cfg.paused
                     || buttons_held
                     || game_locked(&game)
@@ -162,6 +171,7 @@ impl PcMachine {
                 actions.push(PcAction::Reconnect);
                 self.where_ = Where::Pc;
                 self.link = Link::Searching;
+                self.mac_ready = true;
                 self.clear_answers();
                 actions
             }
@@ -172,6 +182,15 @@ impl PcMachine {
                     self.force_return()
                 } else {
                     vec![]
+                }
+            }
+            PcEvent::MacReady(ready) => {
+                self.mac_ready = ready;
+                if ready {
+                    vec![]
+                } else {
+                    // The Mac can no longer be controlled: never strand the cursor there.
+                    self.force_return()
                 }
             }
         }
@@ -202,6 +221,11 @@ impl PcMachine {
 
     pub fn where_(&self) -> &Where {
         &self.where_
+    }
+
+    /// Whether the Mac can take the cursor (it has Accessibility).
+    pub fn mac_ready(&self) -> bool {
+        self.mac_ready
     }
 }
 
@@ -436,6 +460,72 @@ mod tests {
         };
         assert_eq!(m.on(PcEvent::ConfigChanged(cfg)), vec![]);
         assert_eq!(m.where_(), &Where::Mac);
+    }
+
+    #[test]
+    fn pc_mac_ready_starts_true() {
+        let m = PcMachine::new(Config::default());
+        assert!(m.mac_ready(), "an older Mac never sends MacReady");
+        let mut m = connected(Config::default());
+        assert!(m.mac_ready());
+        assert_enter(&m.on(push(0.3, free(), false)), Side::Left, 0.3);
+    }
+
+    #[test]
+    fn pc_mac_not_ready_is_a_wall() {
+        let mut m = connected(Config::default());
+        assert_eq!(m.on(PcEvent::MacReady(false)), vec![]);
+        assert!(!m.mac_ready());
+        assert_eq!(m.on(push(0.3, free(), false)), vec![]);
+        assert_eq!(m.where_(), &Where::Pc);
+        assert_eq!(m.on(PcEvent::MacReady(true)), vec![]);
+        assert!(m.mac_ready());
+        assert_enter(&m.on(push(0.3, free(), false)), Side::Left, 0.3);
+    }
+
+    #[test]
+    fn pc_mac_not_ready_while_on_mac_returns() {
+        let mut m = connected(Config::default());
+        m.on(push(0.3, free(), false));
+        assert_eq!(
+            m.on(PcEvent::MacReady(false)),
+            vec![
+                PcAction::SendReleaseAll,
+                PcAction::ReturnToPc { pc_frac: 0.3 }
+            ]
+        );
+        assert_eq!(m.where_(), &Where::Pc);
+        assert_eq!(m.on(PcEvent::MacReady(false)), vec![], "already back");
+    }
+
+    #[test]
+    fn pc_mac_ready_while_on_mac_changes_nothing() {
+        let mut m = connected(Config::default());
+        m.on(push(0.3, free(), false));
+        assert_eq!(m.on(PcEvent::MacReady(true)), vec![]);
+        assert_eq!(m.where_(), &Where::Mac);
+    }
+
+    #[test]
+    fn pc_mac_ready_resets_on_disconnect_and_connect() {
+        let mut m = connected(Config::default());
+        m.on(PcEvent::MacReady(false));
+        m.on(PcEvent::Disconnected);
+        assert!(m.mac_ready(), "reset on disconnect");
+
+        m.on(PcEvent::MacReady(false));
+        m.on(PcEvent::Connected {
+            paired: true,
+            code: String::new(),
+        });
+        assert!(m.mac_ready(), "reset on a paired connect");
+
+        m.on(PcEvent::MacReady(false));
+        m.on(PcEvent::Connected {
+            paired: false,
+            code: "1".into(),
+        });
+        assert!(m.mac_ready(), "reset on a pairing connect");
     }
 
     #[test]

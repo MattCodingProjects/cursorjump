@@ -86,6 +86,13 @@ pub enum Control {
     /// PC to Mac: the PC took the cursor back (return hotkey, hook lost,
     /// pause or quit). The Mac releases everything held and stops being controlled.
     ReleaseAll,
+    /// Mac to PC: whether the Mac can take the cursor (it has the
+    /// Accessibility permission). Sent when a paired session starts and
+    /// whenever it changes. Must stay the last variant: postcard encodes the
+    /// variant index.
+    MacReady {
+        ready: bool,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -186,6 +193,8 @@ mod tests {
                 down: false,
             },
             Control::ReleaseAll,
+            Control::MacReady { ready: false },
+            Control::MacReady { ready: true },
         ];
         for c in all {
             let enc = encode_control(&c);
@@ -195,6 +204,16 @@ mod tests {
             );
             assert_eq!(decode_control_body(&enc[4..]).unwrap(), c);
         }
+    }
+
+    /// Postcard encodes the variant index: appending keeps older ones stable.
+    #[test]
+    fn control_variant_indices_are_stable() {
+        assert_eq!(encode_control(&Control::ReleaseAll)[4], 9);
+        assert_eq!(
+            &encode_control(&Control::MacReady { ready: true })[4..],
+            &[10, 1]
+        );
     }
 
     #[test]
