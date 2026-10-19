@@ -32,6 +32,7 @@ fn main() {
     let has = |flag: &str| args.iter().any(|a| a == flag);
     let tool_mode = args.iter().any(|a| a.starts_with("--"));
     init_logging(!tool_mode);
+    log_panics();
 
     if let Some(flag) = unknown_flag(&args) {
         fail(&format!(
@@ -110,6 +111,22 @@ fn init_logging(app: bool) {
             builder.init();
         }
     }
+}
+
+/// Logs every panic through `tracing` too: release builds have no stderr
+/// to read (macOS discards it, Windows has none). The default hook still runs.
+fn log_panics() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info
+            .location()
+            .map_or_else(|| "unknown location".to_string(), ToString::to_string);
+        let message = info.payload_as_str().unwrap_or("(not a string)");
+        let thread = std::thread::current();
+        let thread = thread.name().unwrap_or("unnamed");
+        error!(%location, thread, "panic: {message}");
+        default(info);
+    }));
 }
 
 fn open_log_file() -> Option<File> {
