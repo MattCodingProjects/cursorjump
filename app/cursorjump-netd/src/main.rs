@@ -44,6 +44,8 @@ fn main() {
             std::process::exit(2);
         }
     };
+    let _ = logging::LOG_FILE.set(LOG_FILE.into());
+    log_panics();
     if let Err(e) = run(allowed_uid) {
         log!("stopping: {e}");
         std::process::exit(1);
@@ -81,7 +83,6 @@ fn parse_args(args: &[String]) -> Result<u32, String> {
 
 #[cfg(target_os = "macos")]
 fn run(allowed_uid: u32) -> std::io::Result<()> {
-    let _ = logging::LOG_FILE.set(LOG_FILE.into());
     let stop = server::Stop::new().map_err(ctx("creating the stop pipe"))?;
     let stop = STOP.get_or_init(|| stop);
     stop_on_signals().map_err(ctx("installing the signal handlers"))?;
@@ -103,6 +104,22 @@ fn run(allowed_uid: u32) -> std::io::Result<()> {
     let _ = std::fs::remove_file(SOCKET);
     log!("stopped");
     result
+}
+
+/// Panics go to the log file too: the default hook writes to launchd's
+/// stderr, which after a rotation is the old, unlinked file. The default
+/// hook still runs (and the unwind still restores AWDL).
+#[cfg(target_os = "macos")]
+fn log_panics() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info
+            .location()
+            .map_or_else(|| "unknown location".to_string(), ToString::to_string);
+        let message = info.payload_as_str().unwrap_or("(not a string)");
+        log!("panic at {location}: {message}");
+        default(info);
+    }));
 }
 
 /// Prefixes an error with what was being done.

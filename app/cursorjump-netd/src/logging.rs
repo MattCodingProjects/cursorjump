@@ -32,6 +32,7 @@ fn emit(line: &str) {
             .create(true)
             .append(true)
             .mode(0o644)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(path);
         if let Ok(mut f) = file {
             let _ = f.write_all(line.as_bytes());
@@ -41,10 +42,23 @@ fn emit(line: &str) {
     let _ = std::io::stderr().write_all(line.as_bytes());
 }
 
-/// The test harness captures only the print macros.
+/// The test harness captures only the print macros. The lines a thread
+/// wrote are also kept for `take_lines`.
 #[cfg(test)]
 fn emit(line: &str) {
     eprint!("{line}");
+    LINES.with(|l| l.borrow_mut().push(line.to_string()));
+}
+
+#[cfg(test)]
+thread_local! {
+    static LINES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The lines this thread logged since the last call.
+#[cfg(test)]
+pub fn take_lines() -> Vec<String> {
+    LINES.with(|l| std::mem::take(&mut *l.borrow_mut()))
 }
 
 /// Lets an event through at most once per `every`, counting the rest.
@@ -76,6 +90,32 @@ impl RateLimit {
         }
         self.last = Some(now);
         Some(std::mem::take(&mut self.suppressed))
+    }
+}
+
+/// Several kinds of line under one `RateLimit`, except that the first line
+/// of each kind always shows (and is not counted against the limit).
+#[derive(Debug)]
+pub struct KindLimit<const K: usize> {
+    seen: [bool; K],
+    limit: RateLimit,
+}
+
+impl<const K: usize> KindLimit<K> {
+    pub fn new(every: Duration) -> KindLimit<K> {
+        KindLimit {
+            seen: [false; K],
+            limit: RateLimit::new(every),
+        }
+    }
+
+    /// A line of kind `kind` (< K) at `now`: like `RateLimit::hit`.
+    pub fn hit(&mut self, kind: usize, now: Instant) -> Option<u64> {
+        if !self.seen[kind] {
+            self.seen[kind] = true;
+            return Some(0);
+        }
+        self.limit.hit(now)
     }
 }
 
@@ -133,6 +173,24 @@ mod tests {
         let mut r = RateLimit::new(600 * S);
         assert_eq!(r.hit(t0), Some(0));
         assert_eq!(r.hit(t0 + 5000 * S), Some(0));
+    }
+
+    #[test]
+    fn the_first_line_of_each_kind_shows_then_all_share_one_limit() {
+        let t0 = Instant::now();
+        let mut k = KindLimit::<3>::new(600 * S);
+        assert_eq!(k.hit(0, t0), Some(0), "first of kind 0");
+        assert_eq!(k.hit(1, t0), Some(0), "first of kind 1");
+        assert_eq!(k.hit(0, t0), Some(0), "the limit itself starts open");
+        assert_eq!(k.hit(1, t0 + S), None);
+        assert_eq!(k.hit(0, t0 + 2 * S), None);
+        assert_eq!(k.hit(2, t0 + 3 * S), Some(0), "first of kind 2, uncounted");
+        assert_eq!(k.hit(2, t0 + 4 * S), None);
+        assert_eq!(
+            k.hit(1, t0 + 600 * S),
+            Some(3),
+            "three suppressed, any kind"
+        );
     }
 
     #[test]

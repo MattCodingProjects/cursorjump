@@ -105,7 +105,12 @@ stop_daemon
 [[ -d /Library/PrivilegedHelperTools ]] ||
     sudo install -d -o root -g wheel -m 0755 /Library/PrivilegedHelperTools
 sudo install -S -o root -g wheel -m 0755 "$built" "$helper"
-sudo codesign --verify --strict -R="identifier \"$label\"" "$helper"
+if ! sudo codesign --verify --strict -R="identifier \"$label\"" "$helper"; then
+    # Never leave an unverified binary where the LaunchDaemon runs it.
+    sudo rm -f "$helper"
+    echo "The installed helper failed its signature check; removed $helper." >&2
+    exit 1
+fi
 sudo install -S -o root -g wheel -m 0644 "$work/$label.plist" "$plist"
 sudo install -S -o root -g wheel -m 0644 "$work/$label.conf" "$rotation"
 sudo launchctl bootstrap system "$plist"

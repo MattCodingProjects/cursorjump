@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 use std::time::Instant;
 
 use crate::iface::Iface;
-use crate::logging::{LOG_EVERY, RateLimit, more};
+use crate::logging::{KindLimit, LOG_EVERY, RateLimit, more};
 use crate::protocol::Command;
 
 /// A connection, numbered by the server.
@@ -19,9 +19,18 @@ pub struct Awdl<I: Iface> {
     downed: bool,
     /// Times macOS brought the interface back up during the current hold.
     redowns: u64,
+    /// Re-downs after the first of a hold.
     redown_log: RateLimit,
     check_log: RateLimit,
+    /// Lines a client can cause by holding and releasing (kinds below).
+    hold_log: KindLimit<4>,
 }
+
+/// `Awdl::hold_log` kinds.
+const HELD: usize = 0;
+const RELEASED: usize = 1;
+const RESTORE_FAILED: usize = 2;
+const FIRST_REDOWN: usize = 3;
 
 impl<I: Iface> Awdl<I> {
     pub fn new(iface: I) -> Awdl<I> {
@@ -32,6 +41,7 @@ impl<I: Iface> Awdl<I> {
             redowns: 0,
             redown_log: RateLimit::new(LOG_EVERY),
             check_log: RateLimit::new(LOG_EVERY),
+            hold_log: KindLimit::new(LOG_EVERY),
         }
     }
 
@@ -51,8 +61,7 @@ impl<I: Iface> Awdl<I> {
                 if !self.is_held() {
                     self.take_down().map_err(|e| e.to_string())?;
                     self.redowns = 0;
-                    self.redown_log = RateLimit::new(LOG_EVERY);
-                    log!("AWDL held down");
+                    self.hold_line(HELD, format_args!("AWDL held down"));
                 }
                 self.holders.insert(conn);
                 Ok(())
@@ -64,7 +73,10 @@ impl<I: Iface> Awdl<I> {
     /// `conn` closed (or crashed): its hold, if any, ends.
     pub fn closed(&mut self, conn: ConnId) {
         if let Err(e) = self.release(conn) {
-            log!("could not bring AWDL back up: {e}; retrying");
+            self.hold_line(
+                RESTORE_FAILED,
+                format_args!("could not bring AWDL back up: {e}; retrying"),
+            );
         }
     }
 
@@ -87,18 +99,30 @@ impl<I: Iface> Awdl<I> {
         }
     }
 
-    /// Logs the first re-down of a hold, then a count at most every LOG_EVERY.
+    /// Logs the first re-down of a hold (as a hold line), then a count at
+    /// most every LOG_EVERY.
     fn redowned(&mut self) {
         self.redowns += 1;
-        match self.redown_log.hit(Instant::now()) {
-            Some(_) if self.redowns == 1 => log!(
-                "macOS brought AWDL back up; taking it down again (repeats are counted, not logged)"
-            ),
-            Some(n) => log!(
+        if self.redowns == 1 {
+            self.hold_line(
+                FIRST_REDOWN,
+                format_args!(
+                    "macOS brought AWDL back up; taking it down again (repeats are counted, not logged)"
+                ),
+            );
+        } else if let Some(n) = self.redown_log.hit(Instant::now()) {
+            log!(
                 "macOS brought AWDL back up {} more times; took it down each time",
                 n + 1
-            ),
-            None => {}
+            );
+        }
+    }
+
+    /// A line a client's holds and releases cause: the first of each kind,
+    /// then at most one per LOG_EVERY across kinds, with a count.
+    fn hold_line(&mut self, kind: usize, line: std::fmt::Arguments) {
+        if let Some(n) = self.hold_log.hit(kind, Instant::now()) {
+            log!("{line}{}", more(n));
         }
     }
 
@@ -116,8 +140,11 @@ impl<I: Iface> Awdl<I> {
             return Ok(());
         }
         match self.redowns {
-            0 => log!("AWDL released"),
-            n => log!("AWDL released; macOS brought it back up {n} times during the hold"),
+            0 => self.hold_line(RELEASED, format_args!("AWDL released")),
+            n => self.hold_line(
+                RELEASED,
+                format_args!("AWDL released; macOS brought it back up {n} times during the hold"),
+            ),
         }
         self.restore().map_err(|e| e.to_string())
     }
@@ -269,6 +296,53 @@ pub(crate) mod tests {
             fake.take_sets(),
             [false, true],
             "closing a non-holder does nothing"
+        );
+    }
+
+    #[test]
+    fn a_flapping_client_logs_a_bounded_number_of_lines() {
+        let fake = Fake::up();
+        let mut a = Awdl::new(fake.clone());
+        crate::logging::take_lines();
+        for _ in 0..100 {
+            a.command(1, AwdlDown).unwrap();
+            // macOS re-ups it during each hold.
+            fake.set_externally(true);
+            a.recheck();
+            a.command(1, AwdlUp).unwrap();
+        }
+        let lines = crate::logging::take_lines();
+        assert!(lines.len() <= 4, "{lines:#?}");
+        for first in [
+            "AWDL held down",
+            "macOS brought AWDL back up",
+            "AWDL released",
+        ] {
+            assert!(
+                lines.iter().any(|l| l.contains(first)),
+                "the first {first:?} shows: {lines:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failing_restore_logs_a_bounded_number_of_lines() {
+        let fake = Fake::up();
+        let mut a = Awdl::new(fake.clone());
+        crate::logging::take_lines();
+        for conn in 0..100 {
+            fake.set_failing(false);
+            a.command(conn, AwdlDown).unwrap();
+            fake.set_failing(true);
+            a.closed(conn);
+        }
+        fake.set_failing(false);
+        let lines = crate::logging::take_lines();
+        assert!(lines.len() <= 4, "{lines:#?}");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("could not bring AWDL back up"))
         );
     }
 
