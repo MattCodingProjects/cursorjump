@@ -33,7 +33,11 @@ pub fn init_process() {
 }
 
 /// Longest stay on the "Mac" before diagnose forces a return.
-const MAC_SAFETY: Duration = Duration::from_secs(20);
+const MAC_SAFETY: Duration = Duration::from_secs(8);
+
+/// After any return to the PC, edge pushes are ignored this long so a user who
+/// is still pushing does not cross straight back.
+const RECROSS_COOLDOWN: Duration = Duration::from_secs(2);
 
 /// `--diagnose`: run the input thread with a stub app that logs every message
 /// and simulates crossing on edge pushes and returning on the hotkey.
@@ -42,13 +46,16 @@ pub fn run_diagnose(run_for: Duration) {
     let (cmd_tx, msg_rx) = spawn_input_thread(Config::default());
     info!(
         seconds = run_for.as_secs(),
-        "diagnose: push against the Mac edge to cross; Ctrl+Alt+Home returns"
+        "diagnose: push against the Mac edge to cross; Ctrl+Alt+Shift+H or Ctrl+Alt+Home returns (auto-return after {} s)",
+        MAC_SAFETY.as_secs()
     );
     spawn_clipboard_logger();
     let mut diag = Diagnose {
         cmd_tx,
         on_mac_since: None,
         frac: 0.5,
+        cooldown_until: None,
+        cooldown_logged: false,
     };
     let deadline = Instant::now() + run_for;
     loop {
@@ -57,7 +64,10 @@ pub fn run_diagnose(run_for: Duration) {
             .on_mac_since
             .is_some_and(|since| now.duration_since(since) >= MAC_SAFETY)
         {
-            info!("diagnose: safety return after 20 s on the Mac");
+            info!(
+                "diagnose: safety return after {} s on the Mac",
+                MAC_SAFETY.as_secs()
+            );
             diag.return_to_pc();
         }
         if now >= deadline {
@@ -112,6 +122,10 @@ struct Diagnose {
     cmd_tx: std::sync::mpsc::Sender<InputCmd>,
     on_mac_since: Option<Instant>,
     frac: f32,
+    /// Edge pushes are ignored until this instant (set on every return).
+    cooldown_until: Option<Instant>,
+    /// Whether the current cooldown window already logged an ignored push.
+    cooldown_logged: bool,
 }
 
 impl Diagnose {
@@ -120,6 +134,8 @@ impl Diagnose {
             .cmd_tx
             .send(InputCmd::ReturnToPc { pc_frac: self.frac });
         self.on_mac_since = None;
+        self.cooldown_until = Some(Instant::now() + RECROSS_COOLDOWN);
+        self.cooldown_logged = false;
     }
 
     fn handle(&mut self, msg: InputMsg) {
@@ -137,7 +153,12 @@ impl Diagnose {
             }) => {
                 let locked = game_locked(&game);
                 info!(frac, buttons_held, locked, ?game, "EdgePush");
-                if locked {
+                if self.cooldown_until.is_some_and(|t| Instant::now() < t) {
+                    if !self.cooldown_logged {
+                        self.cooldown_logged = true;
+                        info!("ignored: cooldown after returning to the PC");
+                    }
+                } else if locked {
                     info!("blocked: game");
                 } else if buttons_held {
                     info!("blocked: mouse button held");
