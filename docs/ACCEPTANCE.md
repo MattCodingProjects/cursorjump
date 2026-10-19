@@ -9,7 +9,7 @@ Each line is a spec success bar or a plan Review Focus item. `[x]` = passed hand
 - [~] Mouse speed and scrolling on the Mac feel the same as on the PC. (scrolling works; a real work session still to judge feel)
 - [x] Keys and shortcuts just work: no stuck keys, no doubled keys, Ctrl-shortcuts act as Cmd-shortcuts. (typing and shortcuts confirmed; held-key-at-crossing stress still to try, see Review Focus 1)
 - [~] Looks after itself: auto-starts, auto-reconnects, never strands the cursor. (auto-reconnect after Wi-Fi off/on and sleep passed; reboots deferred)
-- [ ] Gaming on the PC is never disturbed. (Valorant / Roblox, Step 3)
+- [ ] Gaming on the PC is never disturbed. (Valorant / Roblox, Step 3 — deferred by the user)
 - [x] Nothing but file transfer takes a moment. (crossing, clipboard and reconnect are instant per user)
 
 ### Phase 1 goals (spec)
@@ -19,7 +19,7 @@ Each line is a spec success bar or a plan Review Focus item. `[x]` = passed hand
 - [x] 4. Encrypted, paired connection with a 6-digit code confirmed on both screens.
 - [x] 5. Zero-config discovery (mDNS; no addresses typed).
 - [~] 6. Set and forget: starts at login on both machines and reconnects quietly. (reboots deferred)
-- [ ] 7. Tray / menu-bar status with a live latency readout and settings. (latency numbers: Step 2)
+- [x] 7. Tray / menu-bar status with a live latency readout and settings.
 
 ### Anti-goals (must not happen)
 - [x] Added latency, jitter or stutter in cursor movement.
@@ -45,7 +45,7 @@ Each line is a spec success bar or a plan Review Focus item. `[x]` = passed hand
 - [~] 5. Second/unknown device or the Mac's IP changing: no new prompt for the known peer. (pairing survived restarts and reinstalls; unknown-device rejection is covered by tests only)
 
 ### Latency (plan Task 19, Step 2)
-- [ ] Median RTT ≤ 10 ms and verdict Good over 5 minutes on Wi-Fi, with "Reduce Wi-Fi hiccups" off and on.
+- [x] Median RTT ≤ 10 ms and verdict Good over 5 minutes on Wi-Fi, with "Reduce Wi-Fi hiccups" off and on. (median 3.4–3.7 ms, 0 spikes; see Latency below)
 
 
 ## Lock screen
@@ -79,3 +79,33 @@ Each line is a spec success bar or a plan Review Focus item. `[x]` = passed hand
 | Windows scaling at 150 % | Deferred |
 
 Deferred checks were postponed by the user ("it's all working fantastically as intended") and belong to the Task 19 acceptance pass.
+
+## Latency (plan Task 19, Step 2)
+
+- **Date:** 2026-10-19, 14:13–14:25 UTC. MacBook on Wi-Fi, PC wired. Measured from the Mac app's own pings to the PC (every 100 ms, about 600 per minute). The app logs one summary line per minute.
+- **Result:** PASSED in both modes. The median is far under the 10 ms bar, and there were no spikes over 40 ms, so the verdict is Good every minute.
+
+| Minute ending (UTC) | Wi-Fi hiccup mode | Median | p95 | p99 | Max | Spikes > 40 ms |
+|---|---|---|---|---|---|---|
+| 14:14:31 | on (AWDL held) | 3.6 ms | 4.0 ms | 4.5 ms | 7.5 ms | 0 |
+| 14:15:31 | on | 3.5 ms | 4.2 ms | 8.3 ms | 19.7 ms | 0 |
+| 14:16:31 | on | 3.5 ms | 3.9 ms | 4.3 ms | 6.1 ms | 0 |
+| 14:17:31 | on | 3.4 ms | 3.9 ms | 6.2 ms | 8.4 ms | 0 |
+| 14:18:31 | on | 3.4 ms | 3.9 ms | 4.3 ms | 8.0 ms | 0 |
+| 14:19:31 | off (AWDL released at 14:19:10) | 3.5 ms | 4.1 ms | 5.4 ms | 7.2 ms | 0 |
+| 14:20:31 | off | 3.6 ms | 4.1 ms | 4.7 ms | 6.9 ms | 0 |
+| 14:21:31 | off | 3.6 ms | 4.1 ms | 5.8 ms | 7.6 ms | 0 |
+| 14:22:31 | off | 3.7 ms | 4.2 ms | 6.2 ms | 12.7 ms | 0 |
+| 14:23:31 | off | 3.7 ms | 4.1 ms | 4.5 ms | 6.2 ms | 0 |
+| 14:24:31 | off | 3.6 ms | 4.1 ms | 5.1 ms | 6.5 ms | 0 |
+
+The minute ending 14:19:31 includes about 20 s from before the switch.
+
+- **Takeaway:** on this network today, Wi-Fi alone is well within the bar, so a USB-C Ethernet adapter isn't needed. Hiccup mode made only a small difference (median about 0.2 ms lower). The off run's p99 and max weren't worse. "Reduce Wi-Fi hiccups" is left on as a safeguard against AWDL bursts on busier days.
+
+## Deferred by the user
+
+- Games (Step 3): Valorant and Roblox, the in-game wall, Alt+Tab, and no lag or anti-cheat warnings.
+- Hardening (Task 18 Step 4): deep sleep, reboots of both machines, unplugging the vertical monitor, 150 % scaling.
+- Review Focus 1 (held key or button while crossing) and 4 (clipboard extremes).
+- Step 4 (feel): a real work session.
