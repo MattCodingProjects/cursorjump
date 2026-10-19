@@ -2,7 +2,10 @@
 
 use std::sync::Mutex;
 
+use objc2::rc::Retained;
+use objc2::runtime::{NSObjectProtocol, ProtocolObject};
 use objc2_core_foundation::CFString;
+use objc2_foundation::{NSActivityOptions, NSProcessInfo, NSString};
 use objc2_io_kit::{
     IOPMAssertionCreateWithName, IOPMAssertionDeclareUserActivity, IOPMAssertionID,
     IOPMAssertionRelease, IOPMUserActiveType, kIOPMAssertionLevelOn,
@@ -15,6 +18,7 @@ const IO_RETURN_SUCCESS: i32 = 0;
 const PREVENT_USER_IDLE_SYSTEM_SLEEP: &str = "PreventUserIdleSystemSleep";
 const ACTIVITY_NAME: &str = "CursorJump input from the PC";
 const STAY_AWAKE_NAME: &str = "CursorJump is connected to the PC";
+const ACTIVITY_REASON: &str = "CursorJump is connected";
 
 /// The user-activity assertion; reused on each call so repeated wakes
 /// refresh one assertion instead of creating new ones.
@@ -63,9 +67,45 @@ impl Drop for StayAwake {
     }
 }
 
+/// Keeps this Mac responsive while the PC is connected: no idle system
+/// sleep (`StayAwake`), and a latency-critical, user-initiated activity so
+/// App Nap never throttles the agent. Both end when it is dropped.
+pub struct KeepAwake {
+    _stay: StayAwake,
+    activity: Retained<ProtocolObject<dyn NSObjectProtocol>>,
+}
+
+impl KeepAwake {
+    pub fn start() -> anyhow::Result<KeepAwake> {
+        let stay = StayAwake::new()?;
+        let options = NSActivityOptions::UserInitiatedAllowingIdleSystemSleep
+            | NSActivityOptions::LatencyCritical;
+        let activity = NSProcessInfo::processInfo()
+            .beginActivityWithOptions_reason(options, &NSString::from_str(ACTIVITY_REASON));
+        Ok(KeepAwake {
+            _stay: stay,
+            activity,
+        })
+    }
+}
+
+impl Drop for KeepAwake {
+    fn drop(&mut self) {
+        // SAFETY: `activity` is the token beginActivityWithOptions returned,
+        // ended exactly once.
+        unsafe { NSProcessInfo::processInfo().endActivity(&self.activity) };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keep_awake_begins_and_ends() {
+        let k = KeepAwake::start().expect("keep awake");
+        drop(k);
+    }
 
     #[test]
     fn stay_awake_creates_and_releases_an_assertion() {

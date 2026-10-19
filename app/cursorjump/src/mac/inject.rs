@@ -35,7 +35,7 @@ const LAG_TOLERANCE: f64 = 0.5;
 /// How long a posted position counts as possibly not yet applied.
 const RECENT_WINDOW: Duration = Duration::from_millis(100);
 /// At most this many recently posted positions are remembered.
-const RECENT_MAX: usize = 32;
+const RECENT_MAX: usize = 128;
 /// Display bounds are re-read at least this often while moving, in case the
 /// reconfiguration callback is not delivered.
 const BOUNDS_MAX_AGE: Duration = Duration::from_millis(500);
@@ -382,6 +382,14 @@ impl Injector {
 
     pub fn buttons_held(&self) -> bool {
         self.held.any_button()
+    }
+
+    pub fn button_held(&self, b: MouseButton) -> bool {
+        self.held.is_button_down(b)
+    }
+
+    pub fn key_held(&self, mac_keycode: u16) -> bool {
+        self.held.is_key_down(mac_keycode)
     }
 
     fn refresh_bounds(&mut self) {

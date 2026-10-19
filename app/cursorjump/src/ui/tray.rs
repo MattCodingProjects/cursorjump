@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 use cj_core::latency::{LatencyStats, WifiVerdict};
 use tao::event::{Event, StartCause};
 use tao::event_loop::{ControlFlow, EventLoop, EventLoopBuilder};
-use tracing::{error, warn};
-use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tracing::{error, info, warn};
+use tray_icon::menu::{CheckMenuItem, IsMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 /// What the tray shows.
@@ -22,6 +22,9 @@ pub struct TrayModel {
     /// One or two lines (the second is a hint, see `latency_text`).
     pub latency: String,
     pub paused: bool,
+    /// macOS: input cannot be posted until Accessibility is granted, so the
+    /// menu offers "Grant Accessibility…". Always false on Windows.
+    pub needs_accessibility: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +32,8 @@ pub enum TrayCmd {
     TogglePause,
     OpenSettings,
     ForgetPairing,
+    /// macOS: ask for the Accessibility permission.
+    GrantAccessibility,
     Quit,
 }
 
@@ -99,6 +104,8 @@ struct Items {
     latency: MenuItem,
     hint: MenuItem,
     hint_shown: bool,
+    grant: MenuItem,
+    grant_shown: bool,
     pause: CheckMenuItem,
     settings: MenuItem,
     forget: MenuItem,
@@ -113,21 +120,27 @@ impl Items {
             latency: MenuItem::new("", false, None),
             hint: MenuItem::new("", false, None),
             hint_shown: false,
+            grant: MenuItem::new("Grant Accessibility…", true, None),
+            grant_shown: false,
             pause: CheckMenuItem::new("Pause crossing", true, false, None),
             settings: MenuItem::new("Settings…", true, None),
             forget: MenuItem::new("Forget paired computer…", true, None),
             quit: MenuItem::new("Quit CursorJump", true, None),
         };
-        let appended = items.menu.append_items(&[
-            &items.status,
-            &items.latency,
-            &PredefinedMenuItem::separator(),
-            &items.pause,
-            &items.settings,
+        let separator = PredefinedMenuItem::separator();
+        let mut menu: Vec<&dyn IsMenuItem> = vec![&items.status, &items.latency, &separator];
+        // The PC owns crossing, so only its menu can pause it.
+        if cfg!(windows) {
+            menu.push(&items.pause);
+        }
+        let separator2 = PredefinedMenuItem::separator();
+        menu.extend([
+            &items.settings as &dyn IsMenuItem,
             &items.forget,
-            &PredefinedMenuItem::separator(),
+            &separator2,
             &items.quit,
         ]);
+        let appended = items.menu.append_items(&menu);
         if let Err(e) = appended {
             error!("tray menu: {e}");
         }
@@ -142,6 +155,8 @@ impl Items {
             Some(TrayCmd::OpenSettings)
         } else if id == self.forget.id() {
             Some(TrayCmd::ForgetPairing)
+        } else if id == self.grant.id() {
+            Some(TrayCmd::GrantAccessibility)
         } else if id == self.quit.id() {
             Some(TrayCmd::Quit)
         } else {
@@ -157,17 +172,38 @@ impl Items {
         if let Some(h) = hint {
             self.hint.set_text(h);
         }
-        // Menus cannot hide an item, so the hint line is inserted and removed.
-        let result = match (hint.is_some(), self.hint_shown) {
-            (true, false) => self.menu.insert(&self.hint, 2),
-            (false, true) => self.menu.remove(&self.hint),
-            _ => Ok(()),
-        };
-        match result {
-            Ok(()) => self.hint_shown = hint.is_some(),
-            Err(e) => warn!("tray menu: {e}"),
-        }
+        // Menus cannot hide an item, so the hint line and the Accessibility
+        // item are inserted and removed. The hint goes under the latency
+        // line; the Accessibility item heads the actions, below the separator.
+        show_or_hide(
+            &self.menu,
+            &self.hint,
+            2,
+            hint.is_some(),
+            &mut self.hint_shown,
+        );
+        let grant_at = 3 + usize::from(self.hint_shown);
+        show_or_hide(
+            &self.menu,
+            &self.grant,
+            grant_at,
+            m.needs_accessibility,
+            &mut self.grant_shown,
+        );
         self.pause.set_checked(m.paused);
+    }
+}
+
+/// Inserts `item` at `position` or removes it, so it is in the menu exactly when `want`.
+fn show_or_hide(menu: &Menu, item: &MenuItem, position: usize, want: bool, shown: &mut bool) {
+    let result = match (want, *shown) {
+        (true, false) => menu.insert(item, position),
+        (false, true) => menu.remove(item),
+        _ => Ok(()),
+    };
+    match result {
+        Ok(()) => *shown = want,
+        Err(e) => warn!("tray menu: {e}"),
     }
 }
 
@@ -235,7 +271,10 @@ impl TrayLoop {
                         .with_icon(icon(false).expect("built-in icon is valid"))
                         .build();
                     match built {
-                        Ok(t) => tray = Some(t),
+                        Ok(t) => {
+                            info!("tray icon ready");
+                            tray = Some(t);
+                        }
                         Err(e) => error!("tray icon failed: {e}"),
                     }
                     // A model that arrived before the icon existed.
@@ -295,9 +334,12 @@ fn apply(t: &TrayIcon, m: &TrayModel) {
 }
 
 /// Runs the tray on the main thread until the app drops `model_rx`'s sender.
-#[allow(
-    dead_code,
-    reason = "the macOS app's entry point; the PC uses TrayLoop"
+#[cfg_attr(
+    windows,
+    allow(
+        dead_code,
+        reason = "the macOS app's entry point; the PC uses TrayLoop"
+    )
 )]
 pub fn run_tray(model_rx: Receiver<TrayModel>, on_menu: impl Fn(TrayCmd) + 'static) -> ! {
     TrayLoop::new().run(model_rx, on_menu)

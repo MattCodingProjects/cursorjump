@@ -108,6 +108,10 @@ impl Held {
         self.keys.contains(&kc)
     }
 
+    pub fn is_button_down(&self, b: MouseButton) -> bool {
+        self.buttons.contains(&b)
+    }
+
     /// The first held button in declaration order (Left, Right, Middle, Back, Forward).
     pub fn first_button(&self) -> Option<MouseButton> {
         BUTTON_ORDER.into_iter().find(|b| self.buttons.contains(b))
@@ -199,6 +203,17 @@ mod tests {
         assert_eq!(h.first_button(), Some(MouseButton::Right));
         h.button(MouseButton::Right, false);
         assert_eq!(h.first_button(), Some(MouseButton::Forward));
+    }
+
+    #[test]
+    fn held_reports_each_button() {
+        let mut h = Held::new();
+        assert!(!h.is_button_down(MouseButton::Left));
+        h.button(MouseButton::Left, true);
+        assert!(h.is_button_down(MouseButton::Left));
+        assert!(!h.is_button_down(MouseButton::Right));
+        h.button(MouseButton::Left, false);
+        assert!(!h.is_button_down(MouseButton::Left));
     }
 
     #[test]

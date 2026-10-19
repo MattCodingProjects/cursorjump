@@ -31,10 +31,11 @@ use windows::core::w;
 use super::bridges::bridge_input;
 use super::clipboard::{read_clipboard, spawn_clipboard_watcher, write_clipboard};
 use super::input_thread::{InputCmd, InputMsg, spawn_input_thread};
-use super::link::{Backoff, Established, Live, NetEv, establish, paired_fingerprint};
+use super::link::{Backoff, Established, Live, NetEv, establish};
 use super::settings_window::bring_to_front;
 use crate::common::clipboard_bridge::{ClipboardLink, bridge_clipboard};
 use crate::common::config_file::ConfigFile;
+use crate::common::paired_fingerprint;
 use crate::common::settings_window::SettingsWindow;
 use crate::paths;
 use crate::ui::dialogs;
@@ -684,6 +685,8 @@ impl App {
                 });
             }
             TrayCmd::Quit => self.begin_quit().await,
+            // Only the Mac's menu offers it.
+            TrayCmd::GrantAccessibility => {}
         }
     }
 
@@ -720,6 +723,7 @@ impl App {
             status: status_text(self.machine.link(), peer, self.cfg.paused),
             latency: self.latency_text.clone(),
             paused: self.cfg.paused,
+            needs_accessibility: false,
         };
         if self.last_model.as_ref() != Some(&model) {
             let _ = self.ch.tray.send(model.clone());

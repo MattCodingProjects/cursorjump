@@ -13,6 +13,8 @@ use anyhow::{Context, Result, bail};
 
 /// The LaunchAgent's label, also its plist's file name.
 pub const AGENT_LABEL: &str = "com.cursorjump.agent";
+/// The app bundle's `CFBundleIdentifier` (scripts/mac/Info.plist).
+const BUNDLE_ID: &str = "com.cursorjump.app";
 
 /// `ESRCH` ("No such process"): launchctl's answer for an unloaded service.
 const LAUNCHCTL_NO_SUCH_PROCESS: i32 = 3;
@@ -61,8 +63,9 @@ fn agent_plist_path() -> Result<PathBuf> {
 
 /// The LaunchAgent property list that runs `executable` at login.
 ///
-/// `KeepAlive` restarts the app after a crash but not after Quit, and
-/// `ProcessType Interactive` keeps App Nap from throttling it.
+/// `KeepAlive` restarts the app after a crash but not after Quit,
+/// `ProcessType Interactive` keeps App Nap from throttling it, and
+/// `AssociatedBundleIdentifiers` makes Login Items show it as CursorJump.
 fn launch_agent_plist(executable: &Path) -> String {
     let exe = xml_escape(&executable.to_string_lossy());
     format!(
@@ -87,6 +90,10 @@ fn launch_agent_plist(executable: &Path) -> String {
 	<string>Aqua</string>
 	<key>ProcessType</key>
 	<string>Interactive</string>
+	<key>AssociatedBundleIdentifiers</key>
+	<array>
+		<string>{BUNDLE_ID}</string>
+	</array>
 </dict>
 </plist>
 "#
@@ -244,6 +251,11 @@ mod tests {
         assert_eq!(plutil_extract(&plist, "KeepAlive.SuccessfulExit"), "false");
         assert_eq!(plutil_extract(&plist, "LimitLoadToSessionType"), "Aqua");
         assert_eq!(plutil_extract(&plist, "ProcessType"), "Interactive");
+        // Login Items in System Settings shows the agent as CursorJump.
+        assert_eq!(
+            plutil_extract(&plist, "AssociatedBundleIdentifiers.0"),
+            "com.cursorjump.app"
+        );
     }
 
     #[test]

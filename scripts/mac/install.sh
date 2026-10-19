@@ -48,6 +48,5 @@ macOS asks for two permissions; allow both:
 
 Settings and pairing: ~/Library/Application Support/CursorJump/
 Start at login:       ~/Library/LaunchAgents/$label.plist
-Logs:                 CursorJump logs to standard error. To watch them, quit
-                      it and run $exe in Terminal.
+Logs:                 ~/Library/Application Support/CursorJump/cursorjump.log
 MSG

@@ -11,13 +11,14 @@ use cj_core::config::Config;
 use cj_core::proto::{Control, Datagram};
 use cj_net::discovery::{DISCOVERY_PORT, QUIC_PORT, choose_peer, discover};
 use cj_net::session::{Session, connect};
-use cj_net::{Fingerprint, Identity, Trust};
+use cj_net::{Identity, Trust};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
 use super::app::Ev;
+use crate::common::paired_fingerprint;
 
 /// `discover` needs at least 3 s to get through mDNS and the broadcast fallback.
 const DISCOVER_TIMEOUT: Duration = Duration::from_secs(3);
@@ -75,15 +76,6 @@ pub(super) fn manual_addr(s: &str) -> Option<SocketAddr> {
             .ok()
             .map(|ip| SocketAddr::new(ip, QUIC_PORT))
     })
-}
-
-pub(super) fn paired_fingerprint(cfg: &Config) -> Option<Fingerprint> {
-    let hex = cfg.paired_peer.as_deref()?;
-    let fp = Fingerprint::from_hex(hex);
-    if fp.is_none() {
-        warn!("paired_peer in the config is not a fingerprint; treating as unpaired");
-    }
-    fp
 }
 
 /// Discovery, then connect: pinned to the paired Mac, or in pairing mode
@@ -271,21 +263,5 @@ mod tests {
             Some(([192, 168, 1, 20], QUIC_PORT).into())
         );
         assert_eq!(manual_addr("macbook.local"), None);
-    }
-
-    #[test]
-    fn paired_fingerprint_parses_hex_only() {
-        let fp = Fingerprint([0xab; 32]);
-        let cfg = Config {
-            paired_peer: Some(fp.to_hex()),
-            ..Config::default()
-        };
-        assert_eq!(paired_fingerprint(&cfg), Some(fp));
-        let bad = Config {
-            paired_peer: Some("not hex".into()),
-            ..Config::default()
-        };
-        assert_eq!(paired_fingerprint(&bad), None);
-        assert_eq!(paired_fingerprint(&Config::default()), None);
     }
 }

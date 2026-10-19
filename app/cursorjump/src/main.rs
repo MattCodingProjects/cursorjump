@@ -88,12 +88,17 @@ fn fail(text: &str) {
     }
 }
 
-/// Logs go to stderr, except for the release app on Windows: it has no
-/// console, so it appends to `cursorjump.log` in the config directory.
+/// Logs go to stderr, except for the release app: it appends to
+/// `cursorjump.log` in the config directory, because on Windows it has no
+/// console and on macOS launchd discards its stderr.
 fn init_logging(app: bool) {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let builder = tracing_subscriber::fmt().with_env_filter(filter);
-    let to_file = app && cfg!(all(windows, not(debug_assertions)));
+    let to_file = app
+        && cfg!(all(
+            any(windows, target_os = "macos"),
+            not(debug_assertions)
+        ));
     match to_file.then(open_log_file).flatten() {
         Some(file) => builder
             .with_ansi(false)
@@ -140,7 +145,12 @@ fn run_app() -> anyhow::Result<()> {
     win::app::run_pc()
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn run_app() -> anyhow::Result<()> {
+    mac::app::run_mac()
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn run_app() -> anyhow::Result<()> {
     println!("cursorjump {}", env!("CARGO_PKG_VERSION"));
     Ok(())

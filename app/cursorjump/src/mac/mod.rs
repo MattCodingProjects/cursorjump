@@ -1,12 +1,11 @@
 //! macOS client: event injection, clipboard, power management, permissions
 //! and start at login.
 
-// Nothing calls into this module until Task 17 wires up the Mac app;
-// Task 17 removes this allow.
-#![allow(dead_code)]
-
+pub mod app;
 pub mod autostart;
 pub mod clipboard;
+pub mod control;
 pub mod inject;
+mod link;
 pub mod permissions;
 pub mod power;
