@@ -83,6 +83,8 @@ pub enum Control {
         mac_keycode: u16,
         down: bool,
     },
+    /// PC to Mac: the PC took the cursor back (return hotkey, hook lost,
+    /// pause or quit). The Mac releases everything held and stops being controlled.
     ReleaseAll,
 }
 

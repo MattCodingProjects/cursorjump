@@ -55,7 +55,15 @@ impl MacMachine {
                     MacAction::StopControl,
                 ]
             }
-            MacEvent::ReleaseAll => vec![MacAction::ReleaseAllInjected],
+            // The PC took the cursor back (hotkey, hook lost, pause, quit).
+            MacEvent::ReleaseAll => {
+                if !self.controlled {
+                    return vec![MacAction::ReleaseAllInjected];
+                }
+                self.controlled = false;
+                self.entry = None;
+                vec![MacAction::ReleaseAllInjected, MacAction::StopControl]
+            }
             MacEvent::Disconnected => {
                 if !self.controlled {
                     return vec![];
@@ -152,14 +160,25 @@ mod tests {
     }
 
     #[test]
-    fn mac_release_all_keeps_state() {
+    fn mac_release_all_while_controlled_stops_control() {
         let mut m = entered();
+        assert_eq!(
+            m.on(MacEvent::ReleaseAll),
+            vec![MacAction::ReleaseAllInjected, MacAction::StopControl]
+        );
+        assert!(!m.controlled());
+        assert_eq!(m.entry_edge(), None);
+    }
+
+    #[test]
+    fn mac_release_all_when_not_controlled_only_releases() {
+        let mut m = MacMachine::new();
         assert_eq!(
             m.on(MacEvent::ReleaseAll),
             vec![MacAction::ReleaseAllInjected]
         );
-        assert!(m.controlled());
-        assert_eq!(m.entry_edge(), Some(Side::Left));
+        assert!(!m.controlled());
+        assert_eq!(m.entry_edge(), None);
     }
 
     #[test]
