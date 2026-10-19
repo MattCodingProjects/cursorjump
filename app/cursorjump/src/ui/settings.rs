@@ -65,6 +65,51 @@ fn merge_edits(before: &Config, after: &Config, mut disk: Config) -> Config {
     disk
 }
 
+/// A setting the window can show.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Setting {
+    MacSide,
+    EdgeOffset,
+    PointerSpeed,
+    ScrollSpeed,
+    ReverseScroll,
+    SwapCtrlCmd,
+    Autostart,
+    ReduceWifiHiccups,
+}
+
+impl Setting {
+    /// Shown as a labelled row of the grid, rather than as a checkbox below it.
+    fn in_grid(self) -> bool {
+        use Setting::*;
+        matches!(self, MacSide | EdgeOffset | PointerSpeed | ScrollSpeed)
+    }
+}
+
+/// The settings shown on this computer, in order. The PC owns the pointer,
+/// scroll and key settings; start at login on the Mac is set by its installer.
+fn settings_shown(is_mac: bool) -> &'static [Setting] {
+    use Setting::*;
+    if is_mac {
+        &[ReduceWifiHiccups]
+    } else {
+        &[
+            MacSide,
+            EdgeOffset,
+            PointerSpeed,
+            ScrollSpeed,
+            ReverseScroll,
+            SwapCtrlCmd,
+            Autostart,
+        ]
+    }
+}
+
+/// A line saying where the settings this computer does not show are set.
+fn pc_only_note(is_mac: bool) -> Option<&'static str> {
+    is_mac.then_some("Pointer, scroll and key settings are set on the PC.")
+}
+
 fn modified(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
@@ -170,53 +215,25 @@ impl SettingsApp {
 
     fn controls(&mut self, ui: &mut egui::Ui) {
         let e = &mut self.edit;
-        egui::Grid::new("settings")
-            .num_columns(2)
-            .spacing([16.0, 12.0])
-            .show(ui, |ui| {
-                ui.label("Mac is on the");
-                ui.horizontal(|ui| {
-                    for (side, name) in [
-                        (Side::Left, "Left"),
-                        (Side::Right, "Right"),
-                        (Side::Top, "Top"),
-                        (Side::Bottom, "Bottom"),
-                    ] {
-                        ui.radio_value(&mut e.mac_side, side, name);
+        if let Some(note) = pc_only_note(self.is_mac) {
+            ui.label(note);
+            ui.add_space(8.0);
+        }
+        let shown = settings_shown(self.is_mac);
+        if shown.iter().any(|s| s.in_grid()) {
+            egui::Grid::new("settings")
+                .num_columns(2)
+                .spacing([16.0, 12.0])
+                .show(ui, |ui| {
+                    for &setting in shown.iter().filter(|s| s.in_grid()) {
+                        grid_row(ui, e, setting);
+                        ui.end_row();
                     }
                 });
-                ui.end_row();
-
-                ui.label("Edge offset");
-                let mut percent = e.edge_offset * 100.0;
-                let slider = egui::Slider::new(&mut percent, -50.0..=50.0)
-                    .suffix(" %")
-                    .fixed_decimals(0);
-                if ui.add(slider).changed() {
-                    e.edge_offset = percent / 100.0;
-                }
-                ui.end_row();
-
-                ui.label("Pointer speed");
-                ui.add(speed_slider(&mut e.pointer_speed));
-                ui.end_row();
-
-                ui.label("Scroll speed");
-                ui.add(speed_slider(&mut e.scroll_speed));
-                ui.end_row();
-            });
-        ui.add_space(8.0);
-        ui.checkbox(&mut e.reverse_scroll, "Reverse scroll direction");
-        ui.checkbox(
-            &mut e.swap_ctrl_cmd,
-            "Swap Ctrl and Cmd (Ctrl+C copies on the Mac)",
-        );
-        ui.checkbox(&mut e.autostart, "Start at login");
-        if self.is_mac {
-            ui.checkbox(
-                &mut e.reduce_wifi_hiccups,
-                "Reduce Wi-Fi hiccups (turns off AirDrop while connected)",
-            );
+            ui.add_space(8.0);
+        }
+        for &setting in shown.iter().filter(|s| !s.in_grid()) {
+            checkbox(ui, e, setting);
         }
     }
 
@@ -249,6 +266,60 @@ impl SettingsApp {
     }
 }
 
+fn grid_row(ui: &mut egui::Ui, e: &mut Config, setting: Setting) {
+    match setting {
+        Setting::MacSide => {
+            ui.label("Mac is on the");
+            ui.horizontal(|ui| {
+                for (side, name) in [
+                    (Side::Left, "Left"),
+                    (Side::Right, "Right"),
+                    (Side::Top, "Top"),
+                    (Side::Bottom, "Bottom"),
+                ] {
+                    ui.radio_value(&mut e.mac_side, side, name);
+                }
+            });
+        }
+        Setting::EdgeOffset => {
+            ui.label("Edge offset");
+            let mut percent = e.edge_offset * 100.0;
+            let slider = egui::Slider::new(&mut percent, -50.0..=50.0)
+                .suffix(" %")
+                .fixed_decimals(0);
+            if ui.add(slider).changed() {
+                e.edge_offset = percent / 100.0;
+            }
+        }
+        Setting::PointerSpeed => {
+            ui.label("Pointer speed");
+            ui.add(speed_slider(&mut e.pointer_speed));
+        }
+        Setting::ScrollSpeed => {
+            ui.label("Scroll speed");
+            ui.add(speed_slider(&mut e.scroll_speed));
+        }
+        _ => unreachable!("{setting:?} is a checkbox"),
+    }
+}
+
+fn checkbox(ui: &mut egui::Ui, e: &mut Config, setting: Setting) {
+    let (value, text) = match setting {
+        Setting::ReverseScroll => (&mut e.reverse_scroll, "Reverse scroll direction"),
+        Setting::SwapCtrlCmd => (
+            &mut e.swap_ctrl_cmd,
+            "Swap Ctrl and Cmd (Ctrl+C copies on the Mac)",
+        ),
+        Setting::Autostart => (&mut e.autostart, "Start at login"),
+        Setting::ReduceWifiHiccups => (
+            &mut e.reduce_wifi_hiccups,
+            "Reduce Wi-Fi hiccups (turns off AirDrop while connected)",
+        ),
+        _ => unreachable!("{setting:?} is a grid row"),
+    };
+    ui.checkbox(value, text);
+}
+
 fn speed_slider(v: &mut f32) -> egui::Slider<'_> {
     egui::Slider::new(v, 0.25..=4.0)
         .logarithmic(true)
@@ -278,7 +349,8 @@ fn unreadable(e: &anyhow::Error) -> String {
 fn apply_autostart(enabled: bool) -> anyhow::Result<()> {
     #[cfg(windows)]
     crate::win::autostart::set_autostart(enabled)?;
-    // On the Mac the app applies `autostart` from the config file.
+    // The Mac's window never shows start at login: its installer registers
+    // the LaunchAgent (`--enable-autostart`), and the app ignores `autostart`.
     #[cfg(not(windows))]
     let _ = enabled;
     Ok(())
@@ -375,6 +447,29 @@ mod tests {
         assert_eq!(on_disk.scroll_speed, 2.0);
         assert_eq!(on_disk.pointer_speed, 1.5);
         assert!(on_disk.paused);
+    }
+
+    #[test]
+    fn the_mac_shows_only_what_the_mac_uses() {
+        assert_eq!(settings_shown(true), [Setting::ReduceWifiHiccups]);
+        assert!(pc_only_note(true).is_some());
+    }
+
+    #[test]
+    fn the_pc_shows_every_pc_setting_and_no_mac_one() {
+        assert_eq!(
+            settings_shown(false),
+            [
+                Setting::MacSide,
+                Setting::EdgeOffset,
+                Setting::PointerSpeed,
+                Setting::ScrollSpeed,
+                Setting::ReverseScroll,
+                Setting::SwapCtrlCmd,
+                Setting::Autostart,
+            ]
+        );
+        assert_eq!(pc_only_note(false), None);
     }
 
     #[test]

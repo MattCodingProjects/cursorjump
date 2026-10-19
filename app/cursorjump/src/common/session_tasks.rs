@@ -129,8 +129,11 @@ mod tests {
         }
     }
 
+    /// Items cross the session, and an item replaced before it is sent is
+    /// never delivered. (Refusing oversized items is tested in cj-net's
+    /// loopback tests.)
     #[tokio::test]
-    async fn clipboard_items_cross_and_oversized_ones_are_refused() {
+    async fn clipboard_items_cross_and_the_latest_wins() {
         let ident = || {
             let dir = tempfile::tempdir().unwrap();
             Identity::load_or_create(dir.path()).unwrap()
@@ -156,8 +159,9 @@ mod tests {
 
         b_out.send(text("this is far too long"));
         b_out.send(text("hello"));
-        // Latest wins: the oversized item may be replaced before it is sent;
-        // either way only "hello" arrives.
+        // Latest wins: the first item may be replaced before it is sent. If it
+        // is sent anyway it is over the 10-byte limit, so either way the first
+        // item to arrive is "hello".
         let d = timeout(T, got_rx.recv()).await.unwrap().unwrap();
         assert_eq!(d, text("hello"));
     }

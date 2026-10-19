@@ -2,7 +2,8 @@
 //!
 //! `NSPasteboard` is usable from any thread; reads and writes run inside their
 //! own autorelease pool so callers need not provide one. File copies
-//! (`public.file-url`) are ignored in phase 1.
+//! (`public.file-url`) are ignored in phase 1, and so are items a password
+//! manager marks concealed or transient (nspasteboard.org).
 
 use std::io::Cursor;
 use std::sync::{Mutex, MutexGuard};
@@ -110,14 +111,19 @@ fn lock_pasteboard() -> MutexGuard<'static, ()> {
     PASTEBOARD.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Marker types for secrets a password manager copies (nspasteboard.org).
+const CONCEALED_TYPE: &str = "org.nspasteboard.ConcealedType";
+const TRANSIENT_TYPE: &str = "org.nspasteboard.TransientType";
+
 /// The pasteboard-access half of a read: copies bytes only. Call it with
-/// `PASTEBOARD` held. File-URL pasteboards read as empty.
+/// `PASTEBOARD` held. File-URL, concealed and transient pasteboards read as
+/// empty.
 fn read_raw(pb: &NSPasteboard) -> (ClipboardData, Option<RawImage>) {
     let t = types();
-    if pb
-        .availableTypeFromArray(&NSArray::from_slice(&[t.file_url]))
-        .is_some()
-    {
+    let concealed = NSString::from_str(CONCEALED_TYPE);
+    let transient = NSString::from_str(TRANSIENT_TYPE);
+    let skipped = NSArray::from_slice(&[t.file_url, &*concealed, &*transient]);
+    if pb.availableTypeFromArray(&skipped).is_some() {
         return (ClipboardData::default(), None);
     }
     let data = ClipboardData {
@@ -139,7 +145,8 @@ fn finish_read((mut data, raw_image): (ClipboardData, Option<RawImage>)) -> Clip
 }
 
 /// Read the general pasteboard. Absent types are `None`; a pasteboard holding
-/// file URLs reads as empty, so a file's name or icon is never sent as content.
+/// file URLs reads as empty, so a file's name or icon is never sent as content,
+/// and so does one a password manager marked concealed or transient.
 pub fn read_clipboard() -> Result<ClipboardData> {
     let raw = autoreleasepool(|_| {
         let _lock = lock_pasteboard();
@@ -392,6 +399,24 @@ mod tests {
             read_clipboard()
         });
         assert_eq!(got.expect("read"), ClipboardData::default());
+    }
+
+    /// Password managers mark secrets with these types (nspasteboard.org).
+    #[test]
+    fn concealed_or_transient_pasteboard_reads_empty() {
+        for marker in [CONCEALED_TYPE, TRANSIENT_TYPE] {
+            let got = with_saved_clipboard(|| {
+                {
+                    let _lock = lock_pasteboard();
+                    let pb = NSPasteboard::generalPasteboard();
+                    pb.clearContents();
+                    pb.setString_forType(&NSString::from_str("hunter2"), types().string);
+                    pb.setString_forType(&NSString::from_str(""), &NSString::from_str(marker));
+                }
+                read_clipboard()
+            });
+            assert_eq!(got.expect("read"), ClipboardData::default(), "{marker}");
+        }
     }
 
     #[test]
