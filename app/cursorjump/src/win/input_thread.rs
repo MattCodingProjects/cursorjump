@@ -14,7 +14,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use cj_core::config::Config;
-use cj_core::input::{scale_motion, wheel_to_pixels};
+use cj_core::input::{MotionScaler, WheelAxis};
 use cj_core::keymap::{KeyRouter, PcKey, Route, is_return_hotkey, pc_to_mac};
 use cj_core::layout::{Rect, edge_frac, is_pushing_out, point_on_edge};
 use cj_core::pc_state::PcEvent;
@@ -28,6 +28,7 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON,
+    VK_XBUTTON1, VK_XBUTTON2,
 };
 use windows::Win32::UI::Input::{
     GetRawInputData, HRAWINPUT, MOUSE_MOVE_ABSOLUTE, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER,
@@ -308,6 +309,8 @@ struct State {
     /// Entry keys seeded only as the other form of an ambiguous key; forgotten
     /// together with their partner so the key's first press on the Mac is kept.
     entry_twins: HashSet<PcKey>,
+    /// Motion and wheel rounding remainders; reset at each entry.
+    scaler: MotionScaler,
 }
 
 thread_local! {
@@ -397,6 +400,7 @@ impl State {
             router: KeyRouter::new(),
             held: HashSet::with_capacity(32),
             entry_twins: HashSet::with_capacity(8),
+            scaler: MotionScaler::default(),
         }
     }
 
@@ -466,6 +470,7 @@ impl State {
         };
         info!(keys_held = snapshot.keys.len(), "hooks: installed");
         let center = park_and_read_back(target);
+        self.scaler.reset();
         self.mac = Some(MacStay::new(hooks, center, Instant::now()));
     }
 
@@ -612,18 +617,21 @@ impl State {
                     debug!(dx, dy, "hook: dropped oversized move");
                     None
                 } else {
-                    let (dx, dy) = scale_motion(dx, dy, self.cfg.pointer_speed);
-                    Some(InputMsg::Motion { dx, dy })
+                    // A slow move may round to nothing; its remainder carries over.
+                    match self.scaler.motion(dx, dy, self.cfg.pointer_speed) {
+                        (0, 0) => None,
+                        (dx, dy) => Some(InputMsg::Motion { dx, dy }),
+                    }
                 }
             }
-            WM_MOUSEWHEEL => Some(InputMsg::Scroll {
-                dx: 0,
-                dy: self.wheel(hiword),
-            }),
-            WM_MOUSEHWHEEL => Some(InputMsg::Scroll {
-                dx: self.wheel(hiword),
-                dy: 0,
-            }),
+            WM_MOUSEWHEEL => match self.wheel(WheelAxis::Vertical, hiword) {
+                0 => None,
+                dy => Some(InputMsg::Scroll { dx: 0, dy }),
+            },
+            WM_MOUSEHWHEEL => match self.wheel(WheelAxis::Horizontal, hiword) {
+                0 => None,
+                dx => Some(InputMsg::Scroll { dx, dy: 0 }),
+            },
             WM_LBUTTONDOWN => button(MouseButton::Left, true),
             WM_LBUTTONUP => button(MouseButton::Left, false),
             WM_RBUTTONDOWN => button(MouseButton::Right, true),
@@ -646,8 +654,9 @@ impl State {
         true
     }
 
-    fn wheel(&self, hiword: u16) -> i32 {
-        wheel_to_pixels(
+    fn wheel(&mut self, axis: WheelAxis, hiword: u16) -> i32 {
+        self.scaler.wheel(
+            axis,
             hiword as i16 as i32,
             self.cfg.scroll_speed,
             self.cfg.reverse_scroll,
@@ -879,7 +888,7 @@ fn is_down(vk: u16) -> bool {
 }
 
 fn mouse_buttons_held() -> bool {
-    [VK_LBUTTON, VK_RBUTTON, VK_MBUTTON]
+    [VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2]
         .into_iter()
         .any(|vk| is_down(vk.0))
 }
@@ -1170,6 +1179,41 @@ mod tests {
                 InputMsg::Motion { dx: 5, dy: -3 },
                 InputMsg::Motion { dx: 200, dy: -200 }
             ]
+        ));
+    }
+
+    #[test]
+    fn mouse_hook_carries_slow_motion_and_wheel_remainders() {
+        let (mut s, rx) = on_mac(&[]);
+        s.cfg.pointer_speed = 0.4;
+        let mv = MSLLHOOKSTRUCT {
+            pt: POINT {
+                x: CENTER.0 + 1,
+                y: CENTER.1,
+            },
+            ..Default::default()
+        };
+        for _ in 0..5 {
+            assert!(s.on_mouse_hook(WM_MOUSEMOVE, &mv));
+        }
+        // 0.4, 0.8, 0.2, 0.6, 0.0: two 1-px moves, no empty ones.
+        assert!(matches!(
+            drain(&rx)[..],
+            [
+                InputMsg::Motion { dx: 1, dy: 0 },
+                InputMsg::Motion { dx: 1, dy: 0 }
+            ]
+        ));
+        // A hi-res wheel delta of 1 (0.4 px) is held until it adds up.
+        let wheel = MSLLHOOKSTRUCT {
+            mouseData: 1 << 16,
+            ..Default::default()
+        };
+        assert!(s.on_mouse_hook(WM_MOUSEWHEEL, &wheel));
+        assert!(s.on_mouse_hook(WM_MOUSEWHEEL, &wheel));
+        assert!(matches!(
+            drain(&rx)[..],
+            [InputMsg::Scroll { dx: 0, dy: 1 }]
         ));
     }
 
