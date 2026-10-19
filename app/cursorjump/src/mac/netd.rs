@@ -111,6 +111,7 @@ pub struct AwdlKeeper {
     thread: Option<JoinHandle<()>>,
     wanted: bool,
     missing: Arc<AtomicBool>,
+    held: Arc<AtomicBool>,
 }
 
 impl AwdlKeeper {
@@ -121,16 +122,18 @@ impl AwdlKeeper {
     fn spawn_at(socket: PathBuf, retry: Duration) -> Result<AwdlKeeper> {
         let (tx, rx) = std::sync::mpsc::channel();
         let missing = Arc::new(AtomicBool::new(false));
-        let m = missing.clone();
+        let held = Arc::new(AtomicBool::new(false));
+        let (m, h) = (missing.clone(), held.clone());
         let thread = std::thread::Builder::new()
             .name("cj-netd".into())
-            .spawn(move || keep(&socket, retry, &rx, &m))
+            .spawn(move || keep(&socket, retry, &rx, &m, &h))
             .context("starting the Wi-Fi helper thread")?;
         Ok(AwdlKeeper {
             tx: Some(tx),
             thread: Some(thread),
             wanted: false,
             missing,
+            held,
         })
     }
 
@@ -149,6 +152,11 @@ impl AwdlKeeper {
     pub fn helper_missing(&self) -> bool {
         self.missing.load(Ordering::Relaxed)
     }
+
+    /// The helper holds AWDL down (as of its last check).
+    pub fn held(&self) -> bool {
+        self.held.load(Ordering::Relaxed)
+    }
 }
 
 impl Drop for AwdlKeeper {
@@ -163,7 +171,13 @@ impl Drop for AwdlKeeper {
 
 /// The keeper's thread: holds AWDL down while the latest wish says so,
 /// until the channel closes.
-fn keep(socket: &Path, retry: Duration, wishes: &Receiver<bool>, missing: &AtomicBool) {
+fn keep(
+    socket: &Path,
+    retry: Duration,
+    wishes: &Receiver<bool>,
+    missing: &AtomicBool,
+    held: &AtomicBool,
+) {
     let mut wanted = false;
     let mut hold: Option<AwdlHold> = None;
     let mut told_missing = false;
@@ -181,6 +195,7 @@ fn keep(socket: &Path, retry: Duration, wishes: &Receiver<bool>, missing: &Atomi
         }
         if !wanted {
             if let Some(h) = hold.take() {
+                held.store(false, Ordering::Relaxed);
                 drop(h);
                 info!("AWDL released");
             }
@@ -188,6 +203,7 @@ fn keep(socket: &Path, retry: Duration, wishes: &Receiver<bool>, missing: &Atomi
         }
         if hold.as_ref().is_some_and(|h| !h.is_open()) {
             warn!("the Wi-Fi helper dropped the AWDL hold; asking again");
+            held.store(false, Ordering::Relaxed);
             hold = None;
         }
         if hold.is_some() {
@@ -197,6 +213,7 @@ fn keep(socket: &Path, retry: Duration, wishes: &Receiver<bool>, missing: &Atomi
             Ok(h) => {
                 info!("AWDL held down (Reduce Wi-Fi hiccups)");
                 missing.store(false, Ordering::Relaxed);
+                held.store(true, Ordering::Relaxed);
                 quiet = false;
                 hold = Some(h);
             }
@@ -326,6 +343,14 @@ mod tests {
         stream
     }
 
+    fn wait_until(cond: impl Fn() -> bool) {
+        let deadline = Instant::now() + T;
+        while !cond() {
+            assert!(Instant::now() < deadline, "condition never held");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     #[test]
     fn a_hold_sends_down_then_up_and_closes() {
         let helper = FakeHelper::start(Answer::Ok);
@@ -398,11 +423,14 @@ mod tests {
     fn the_keeper_follows_what_is_wanted() {
         let helper = FakeHelper::start(Answer::Ok);
         let mut keeper = AwdlKeeper::spawn_at(helper.path.clone(), T).unwrap();
+        assert!(!keeper.held());
         keeper.hold(true);
         helper.wait_for(&["awdl-down"]);
+        wait_until(|| keeper.held());
         keeper.hold(true);
         keeper.hold(false);
         helper.wait_for(&["awdl-down", "awdl-up", "EOF"]);
+        assert!(!keeper.held(), "cleared before the release is sent");
         keeper.hold(true);
         helper.wait_for(&["awdl-down", "awdl-up", "EOF", "awdl-down"]);
         assert!(!keeper.helper_missing());

@@ -46,6 +46,8 @@ const PING_EVERY: Duration = Duration::from_millis(100);
 const CONFIG_POLL: Duration = Duration::from_millis(500);
 /// The latency readout is recomputed this often.
 const LATENCY_REFRESH: Duration = Duration::from_secs(1);
+/// A latency summary is logged this often during a paired session.
+const LATENCY_LOG: Duration = Duration::from_secs(60);
 /// After either side declines pairing, wait this long before asking again.
 const PAIR_DECLINED_RETRY: Duration = Duration::from_secs(30);
 /// How long Quit waits for the input thread to put the cursor back.
@@ -289,6 +291,7 @@ impl App {
         ping.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut config_poll = interval(CONFIG_POLL);
         let mut latency_refresh = interval(LATENCY_REFRESH);
+        let mut latency_log = interval(LATENCY_LOG);
         self.publish();
         loop {
             let (retry_at, quit_by) = (self.retry_at, self.quit_by);
@@ -308,6 +311,7 @@ impl App {
                     }
                 }
                 _ = latency_refresh.tick() => self.latency_text = latency_text(&self.latency),
+                _ = latency_log.tick() => self.log_latency(),
                 _ = sleep_until(quit_by.unwrap_or_else(Instant::now)), if quit_by.is_some() => {
                     warn!("input thread did not stop in time");
                     break;
@@ -539,6 +543,13 @@ impl App {
     fn reset_latency(&mut self) {
         self.latency = LatencyStats::new();
         self.latency_text = latency_text(&self.latency);
+    }
+
+    /// Logs the latency summary during a paired session with samples.
+    fn log_latency(&self) {
+        if self.paired_session().is_some() && !self.latency.is_empty() {
+            info!("{}", self.latency.log_line());
+        }
     }
 
     // --------------------------------------------------------------- pairing
