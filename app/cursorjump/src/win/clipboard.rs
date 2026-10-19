@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use cj_core::clipboard::{ClipboardData, cf_html_extract, cf_html_wrap, dib_to_png, png_to_dib};
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, TrySendError};
 use tracing::{debug, warn};
 use windows::Win32::Foundation::{
     ERROR_CLASS_ALREADY_EXISTS, GlobalFree, HANDLE, HGLOBAL, HWND, LPARAM, LRESULT, WPARAM,
@@ -25,8 +25,9 @@ use windows::Win32::System::Memory::{
     GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, MSG,
-    PostQuitMessage, RegisterClassExW, WINDOW_EX_STYLE, WM_CLIPBOARDUPDATE, WNDCLASSEXW, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, HWND_MESSAGE,
+    MSG, PostQuitMessage, RegisterClassExW, WINDOW_EX_STYLE, WM_CLIPBOARDUPDATE, WNDCLASSEXW,
+    WS_POPUP,
 };
 use windows::core::{PCWSTR, w};
 
@@ -75,7 +76,7 @@ impl ClipboardGuard {
                 0,
                 0,
                 0,
-                None,
+                Some(HWND_MESSAGE),
                 None,
                 None,
                 None,
@@ -182,26 +183,38 @@ fn read_text() -> Option<String> {
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .take_while(|&u| u != 0)
         .collect();
-    Some(String::from_utf16_lossy(&units))
+    Some(String::from_utf16_lossy(&units)).filter(|s| !s.is_empty())
 }
 
-fn read_png(f: &Formats) -> Option<Vec<u8>> {
-    if let Some(png) = get_bytes(f.png) {
-        let png = trim_nul_tail(png);
-        if !png.is_empty() {
-            return Some(png);
-        }
+/// Image bytes as found on the clipboard; conversion happens after it is closed.
+enum RawImage {
+    Png(Vec<u8>),
+    Dib(u32, Vec<u8>),
+}
+
+fn read_raw_image(f: &Formats) -> Option<RawImage> {
+    if let Some(png) = get_bytes(f.png)
+        .map(trim_nul_tail)
+        .filter(|b| !b.is_empty())
+    {
+        return Some(RawImage::Png(png));
     }
-    [CF_DIBV5, CF_DIB].into_iter().find_map(|fmt| {
-        let dib = get_bytes(fmt)?;
-        match dib_to_png(&dib) {
+    [CF_DIBV5, CF_DIB]
+        .into_iter()
+        .find_map(|fmt| get_bytes(fmt).map(|dib| RawImage::Dib(fmt, dib)))
+}
+
+fn finish_image(raw: RawImage) -> Option<Vec<u8>> {
+    match raw {
+        RawImage::Png(png) => Some(png),
+        RawImage::Dib(fmt, dib) => match dib_to_png(&dib) {
             Ok(png) => Some(png),
             Err(e) => {
                 debug!("clipboard: format {fmt} not convertible to PNG: {e:#}");
                 None
             }
-        }
-    })
+        },
+    }
 }
 
 /// PNG data is binary: only strip trailing NULs some writers append past the IEND chunk.
@@ -214,16 +227,23 @@ fn trim_nul_tail(mut b: Vec<u8>) -> Vec<u8> {
 
 /// Read the current clipboard. Formats that are absent are `None`; `CF_HDROP` is ignored.
 pub fn read_clipboard() -> Result<ClipboardData> {
-    let _guard = ClipboardGuard::open()?;
-    let f = formats();
-    Ok(ClipboardData {
-        text: read_text(),
-        html: get_bytes(f.html)
-            .map(|b| String::from_utf8_lossy(&trim_nul(b)).into_owned())
-            .and_then(|cf| cf_html_extract(&cf)),
-        rtf: get_bytes(f.rtf).map(trim_nul).filter(|b| !b.is_empty()),
-        png: read_png(&f),
-    })
+    // Under the guard only copy bytes; the (slow) image conversion runs after it is dropped.
+    let (mut data, raw_image) = {
+        let _guard = ClipboardGuard::open()?;
+        let f = formats();
+        let data = ClipboardData {
+            text: read_text(),
+            html: get_bytes(f.html)
+                .map(|b| String::from_utf8_lossy(&trim_nul(b)).into_owned())
+                .and_then(|cf| cf_html_extract(&cf))
+                .filter(|h| !h.is_empty()),
+            rtf: get_bytes(f.rtf).map(trim_nul).filter(|b| !b.is_empty()),
+            png: None,
+        };
+        (data, read_raw_image(&f))
+    };
+    data.png = raw_image.and_then(finish_image);
+    Ok(data)
 }
 
 /// Replace the clipboard with every format present in `d`.
@@ -268,18 +288,21 @@ pub fn write_clipboard(d: &ClipboardData) -> Result<()> {
 // ------------------------------------------------------------------ watcher
 
 thread_local! {
-    static WATCH_TX: RefCell<Option<Sender<ClipboardData>>> = const { RefCell::new(None) };
+    static WATCH_TX: RefCell<Option<(Sender<ClipboardData>, Receiver<ClipboardData>)>> =
+        const { RefCell::new(None) };
 }
 
 /// Watch the clipboard on a dedicated thread. Every change that reads back
 /// non-empty is sent; failed reads are logged and skipped. The thread exits
 /// when the receiver is dropped (noticed on the next change).
 pub fn spawn_clipboard_watcher() -> Receiver<ClipboardData> {
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    // The watcher's own handle, used only to drop a stale item when the slot is full.
+    let keep_rx = rx.clone();
     let spawned = std::thread::Builder::new()
         .name("cj-clipboard".into())
         .spawn(move || {
-            if let Err(e) = run_watcher(tx) {
+            if let Err(e) = run_watcher(tx, keep_rx) {
                 warn!("clipboard watcher stopped: {e:#}");
             }
         });
@@ -289,8 +312,8 @@ pub fn spawn_clipboard_watcher() -> Receiver<ClipboardData> {
     rx
 }
 
-fn run_watcher(tx: Sender<ClipboardData>) -> Result<()> {
-    WATCH_TX.with(|c| *c.borrow_mut() = Some(tx));
+fn run_watcher(tx: Sender<ClipboardData>, rx: Receiver<ClipboardData>) -> Result<()> {
+    WATCH_TX.with(|c| *c.borrow_mut() = Some((tx, rx)));
     let hwnd = create_watcher_window().context("create clipboard listener window")?;
     // SAFETY: hwnd is a live window of this thread.
     unsafe { AddClipboardFormatListener(hwnd) }.context("AddClipboardFormatListener")?;
@@ -334,11 +357,24 @@ fn create_watcher_window() -> windows::core::Result<HWND> {
             0,
             0,
             0,
-            None,
+            Some(HWND_MESSAGE),
             None,
             Some(hinst),
             None,
         )
+    }
+}
+
+/// Keep-latest send into a one-slot channel: a full slot holds a stale item, so
+/// drop it and send the new one. Returns true when the channel is disconnected.
+fn send_latest(tx: &Sender<ClipboardData>, rx: &Receiver<ClipboardData>, d: ClipboardData) -> bool {
+    match tx.try_send(d) {
+        Ok(()) => false,
+        Err(TrySendError::Full(d)) => {
+            let _ = rx.try_recv();
+            matches!(tx.try_send(d), Err(TrySendError::Disconnected(_)))
+        }
+        Err(TrySendError::Disconnected(_)) => true,
     }
 }
 
@@ -352,8 +388,11 @@ unsafe extern "system" fn watcher_proc(
         match read_clipboard() {
             Ok(d) if d.is_empty() => {}
             Ok(d) => {
-                let closed =
-                    WATCH_TX.with(|c| c.borrow().as_ref().is_some_and(|tx| tx.send(d).is_err()));
+                let closed = WATCH_TX.with(|c| {
+                    c.borrow()
+                        .as_ref()
+                        .is_some_and(|(tx, rx)| send_latest(tx, rx, d))
+                });
                 if closed {
                     // SAFETY: ends this thread's message loop.
                     unsafe { PostQuitMessage(0) };
@@ -376,8 +415,8 @@ mod tests {
         // Keep the user's clipboard: restore it best-effort at the end.
         let original = read_clipboard().ok();
         let want = ClipboardData {
-            text: Some("héllo ✓".into()),
-            html: Some("<i>héllo</i>".into()),
+            text: Some("héllo ✓ 😀 漢字".into()),
+            html: Some("<i>héllo 😀 漢字</i>".into()),
             ..Default::default()
         };
         let result = write_clipboard(&want).and_then(|()| read_clipboard());
@@ -387,5 +426,45 @@ mod tests {
         let got = result.expect("roundtrip");
         assert_eq!(got.text, want.text);
         assert_eq!(got.html, want.html);
+    }
+
+    /// A 2x2 bottom-up 32bpp BITMAPINFOHEADER DIB, converted to PNG.
+    fn tiny_png() -> Vec<u8> {
+        let mut dib = Vec::new();
+        dib.extend_from_slice(&40u32.to_le_bytes());
+        dib.extend_from_slice(&2i32.to_le_bytes());
+        dib.extend_from_slice(&2i32.to_le_bytes());
+        dib.extend_from_slice(&1u16.to_le_bytes());
+        dib.extend_from_slice(&32u16.to_le_bytes());
+        dib.extend_from_slice(&[0u8; 24]);
+        for px in [
+            [0, 0, 255, 255],
+            [0, 255, 0, 255],
+            [255, 0, 0, 255],
+            [9, 9, 9, 255],
+        ] {
+            dib.extend_from_slice(&px);
+        }
+        dib_to_png(&dib).expect("tiny dib")
+    }
+
+    #[test]
+    fn clipboard_roundtrip_image() {
+        let original = read_clipboard().ok();
+        let want = ClipboardData {
+            png: Some(tiny_png()),
+            ..Default::default()
+        };
+        let result = write_clipboard(&want).and_then(|()| read_clipboard());
+        let dib = {
+            let _g = ClipboardGuard::open().expect("open");
+            get_bytes(CF_DIBV5)
+        };
+        if let Some(orig) = original.filter(|o| !o.is_empty()) {
+            let _ = write_clipboard(&orig);
+        }
+        assert_eq!(result.expect("roundtrip").png, want.png);
+        let dib = dib.expect("CF_DIBV5 present");
+        assert!(dib_to_png(&dib).is_ok());
     }
 }
