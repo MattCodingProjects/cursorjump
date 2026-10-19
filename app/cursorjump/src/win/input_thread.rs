@@ -96,13 +96,7 @@ pub enum InputMsg {
 #[derive(Debug, Clone)]
 pub enum InputCmd {
     EnterMac,
-    ReturnToPc {
-        pc_frac: f32,
-    },
-    #[allow(
-        dead_code,
-        reason = "sent by the app wiring; diagnose does not change config"
-    )]
+    ReturnToPc { pc_frac: f32 },
     ApplyConfig(Config),
     Quit,
 }

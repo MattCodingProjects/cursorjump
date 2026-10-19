@@ -1,4 +1,6 @@
 //! Windows platform layer.
+pub mod app;
+pub mod autostart;
 pub mod clipboard;
 pub mod cursor;
 pub mod input_thread;
@@ -12,6 +14,7 @@ use cj_core::gaming::game_locked;
 use cj_core::pc_state::PcEvent;
 use crossbeam_channel::RecvTimeoutError;
 use tracing::{debug, error, info};
+use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
@@ -30,6 +33,14 @@ pub fn init_process() {
         restore_system_cursors();
         default_hook(info);
     }));
+}
+
+/// Release builds have no console of their own; when started from a
+/// terminal, log to that terminal. Does nothing in debug builds, which have one.
+pub fn attach_parent_console() {
+    // SAFETY: plain FFI call. It fails harmlessly when there is no parent
+    // console or this process already has one.
+    let _ = unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
 }
 
 /// Longest stay on the "Mac" before diagnose forces a return.

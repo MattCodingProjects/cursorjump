@@ -247,10 +247,6 @@ pub fn read_clipboard() -> Result<ClipboardData> {
 }
 
 /// Replace the clipboard with every format present in `d`.
-#[allow(
-    dead_code,
-    reason = "used by the app wiring (Task 14); covered by tests"
-)]
 pub fn write_clipboard(d: &ClipboardData) -> Result<()> {
     // Convert before touching the clipboard so a bad image cannot leave it emptied.
     let dib = d
