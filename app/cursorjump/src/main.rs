@@ -121,9 +121,16 @@ fn set_autostart(enabled: bool) -> anyhow::Result<()> {
     win::autostart::set_autostart(enabled)
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn set_autostart(enabled: bool) -> anyhow::Result<()> {
+    mac::autostart::set_autostart(enabled)
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn set_autostart(_enabled: bool) -> anyhow::Result<()> {
-    anyhow::bail!("--enable-autostart and --disable-autostart are Windows-only")
+    anyhow::bail!(
+        "--enable-autostart and --disable-autostart are only available on Windows and macOS"
+    )
 }
 
 #[cfg(windows)]
