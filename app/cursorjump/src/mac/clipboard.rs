@@ -5,6 +5,7 @@
 //! (`public.file-url`) are ignored in phase 1.
 
 use std::io::Cursor;
+use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -100,32 +101,51 @@ fn tiff_to_png(tiff: &[u8]) -> Result<Vec<u8>> {
     Ok(out.into_inner())
 }
 
+/// Serializes this process's pasteboard access. `clearContents` bumps
+/// `changeCount` before a write's data is set, so the watcher must not check
+/// the count or read while `write_clipboard` is part way through.
+static PASTEBOARD: Mutex<()> = Mutex::new(());
+
+fn lock_pasteboard() -> MutexGuard<'static, ()> {
+    PASTEBOARD.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The pasteboard-access half of a read: copies bytes only. Call it with
+/// `PASTEBOARD` held. File-URL pasteboards read as empty.
+fn read_raw(pb: &NSPasteboard) -> (ClipboardData, Option<RawImage>) {
+    let t = types();
+    if pb
+        .availableTypeFromArray(&NSArray::from_slice(&[t.file_url]))
+        .is_some()
+    {
+        return (ClipboardData::default(), None);
+    }
+    let data = ClipboardData {
+        text: string_for(pb, t.string),
+        html: string_for(pb, t.html),
+        rtf: data_for(pb, t.rtf),
+        png: None,
+    };
+    let raw_image = data_for(pb, t.png)
+        .map(RawImage::Png)
+        .or_else(|| data_for(pb, t.tiff).map(RawImage::Tiff));
+    (data, raw_image)
+}
+
+/// The slow half of a read, run without the lock: TIFF to PNG conversion.
+fn finish_read((mut data, raw_image): (ClipboardData, Option<RawImage>)) -> ClipboardData {
+    data.png = raw_image.and_then(finish_image);
+    data
+}
+
 /// Read the general pasteboard. Absent types are `None`; a pasteboard holding
 /// file URLs reads as empty, so a file's name or icon is never sent as content.
 pub fn read_clipboard() -> Result<ClipboardData> {
-    // Only copy bytes here; the (slow) TIFF conversion runs afterwards.
-    let (mut data, raw_image) = autoreleasepool(|_| {
-        let pb = NSPasteboard::generalPasteboard();
-        let t = types();
-        if pb
-            .availableTypeFromArray(&NSArray::from_slice(&[t.file_url]))
-            .is_some()
-        {
-            return (ClipboardData::default(), None);
-        }
-        let data = ClipboardData {
-            text: string_for(&pb, t.string),
-            html: string_for(&pb, t.html),
-            rtf: data_for(&pb, t.rtf),
-            png: None,
-        };
-        let raw_image = data_for(&pb, t.png)
-            .map(RawImage::Png)
-            .or_else(|| data_for(&pb, t.tiff).map(RawImage::Tiff));
-        (data, raw_image)
+    let raw = autoreleasepool(|_| {
+        let _lock = lock_pasteboard();
+        read_raw(&NSPasteboard::generalPasteboard())
     });
-    data.png = raw_image.and_then(finish_image);
-    Ok(data)
+    Ok(finish_read(raw))
 }
 
 fn ensure_set(ok: bool, what: &str) -> Result<()> {
@@ -139,6 +159,7 @@ fn ensure_set(ok: bool, what: &str) -> Result<()> {
 /// written as PNG only.
 pub fn write_clipboard(d: &ClipboardData) -> Result<()> {
     autoreleasepool(|_| {
+        let _lock = lock_pasteboard();
         let pb = NSPasteboard::generalPasteboard();
         let t = types();
         pb.clearContents();
@@ -173,9 +194,9 @@ pub fn write_clipboard(d: &ClipboardData) -> Result<()> {
 // ------------------------------------------------------------------ watcher
 
 /// Watch the pasteboard on a dedicated thread, polling `changeCount`. Every
-/// change that reads back non-empty is sent; failed reads are logged and
-/// skipped. The thread exits once the receiver is dropped (noticed on the
-/// next send attempt).
+/// change that reads back non-empty is sent. The thread exits only when a send
+/// finds the receiver dropped: an idle watcher keeps polling after the
+/// receiver is dropped, until the pasteboard's next non-empty change.
 pub fn spawn_clipboard_watcher() -> Receiver<ClipboardData> {
     let (tx, rx) = crossbeam_channel::bounded(1);
     let spawned = std::thread::Builder::new()
@@ -188,20 +209,29 @@ pub fn spawn_clipboard_watcher() -> Receiver<ClipboardData> {
 }
 
 fn run_watcher(tx: &Sender<ClipboardData>) {
-    let mut last = autoreleasepool(|_| NSPasteboard::generalPasteboard().changeCount());
+    let mut last = autoreleasepool(|_| {
+        let _lock = lock_pasteboard();
+        NSPasteboard::generalPasteboard().changeCount()
+    });
     let mut pending = None;
     loop {
         std::thread::sleep(POLL_INTERVAL);
         let connected = autoreleasepool(|_| {
-            let count = NSPasteboard::generalPasteboard().changeCount();
-            if count != last {
-                last = count;
-                match read_clipboard() {
-                    // The newest contents replace anything not yet delivered;
-                    // empty contents leave nothing to send.
-                    Ok(d) => pending = Some(d).filter(|d| !d.is_empty()),
-                    Err(e) => warn!("clipboard read failed: {e:#}"),
-                }
+            // Check the count and copy the bytes under the lock, so a write in
+            // progress is seen either not at all or complete.
+            let raw = {
+                let _lock = lock_pasteboard();
+                let pb = NSPasteboard::generalPasteboard();
+                let count = pb.changeCount();
+                (count != last).then(|| {
+                    last = count;
+                    read_raw(&pb)
+                })
+            };
+            if let Some(raw) = raw {
+                // The newest contents replace anything not yet delivered;
+                // empty contents leave nothing to send.
+                pending = Some(finish_read(raw)).filter(|d| !d.is_empty());
             }
             deliver(tx, &mut pending)
         });
@@ -234,14 +264,9 @@ fn deliver(tx: &Sender<ClipboardData>, pending: &mut Option<ClipboardData>) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
 
-    use image::{ImageFormat, Rgba, RgbaImage};
+    use image::{Rgba, RgbaImage};
     use objc2::rc::Retained;
-    use objc2_app_kit::{
-        NSPasteboard, NSPasteboardTypeFileURL, NSPasteboardTypeString, NSPasteboardTypeTIFF,
-    };
-    use objc2_foundation::{NSData, NSString};
 
     /// The pasteboard is global: tests that write it must not run in parallel.
     static CLIPBOARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -250,6 +275,7 @@ mod tests {
     /// user had (including types `read_clipboard` ignores, like file URLs).
     /// Multi-item pasteboards come back as their first item.
     fn snapshot() -> Vec<(Retained<NSString>, Retained<NSData>)> {
+        let _lock = lock_pasteboard();
         let pb = NSPasteboard::generalPasteboard();
         pb.types()
             .map(|types| {
@@ -262,6 +288,7 @@ mod tests {
     }
 
     fn restore(saved: &[(Retained<NSString>, Retained<NSData>)]) {
+        let _lock = lock_pasteboard();
         let pb = NSPasteboard::generalPasteboard();
         pb.clearContents();
         for (ty, data) in saved {
@@ -269,14 +296,23 @@ mod tests {
         }
     }
 
+    /// Restores a snapshot when dropped, so a panicking test still puts the
+    /// user's pasteboard back.
+    struct RestoreOnDrop(Vec<(Retained<NSString>, Retained<NSData>)>);
+
+    impl Drop for RestoreOnDrop {
+        fn drop(&mut self) {
+            restore(&self.0);
+        }
+    }
+
     /// Runs `f` with the pasteboard to itself, restoring the user's contents
-    /// best-effort afterwards.
+    /// best-effort afterwards, even if `f` panics.
     fn with_saved_clipboard<T>(f: impl FnOnce() -> T) -> T {
         let _serial = CLIPBOARD.lock().unwrap_or_else(|e| e.into_inner());
-        let saved = snapshot();
-        let out = f();
-        restore(&saved);
-        out
+        // Declared after `_serial`, so it drops (restores) while the lock is held.
+        let _restore = RestoreOnDrop(snapshot());
+        f()
     }
 
     fn tiny_image() -> RgbaImage {
@@ -321,11 +357,12 @@ mod tests {
     fn tiff_only_pasteboard_reads_back_as_png() {
         let tiff = encode(&tiny_image(), ImageFormat::Tiff);
         let got = with_saved_clipboard(|| {
-            let pb = NSPasteboard::generalPasteboard();
-            pb.clearContents();
-            // SAFETY: the pasteboard type statics are immutable NSStrings.
-            let tiff_type = unsafe { NSPasteboardTypeTIFF };
-            assert!(pb.setData_forType(Some(&NSData::with_bytes(&tiff)), tiff_type));
+            {
+                let _lock = lock_pasteboard();
+                let pb = NSPasteboard::generalPasteboard();
+                pb.clearContents();
+                assert!(pb.setData_forType(Some(&NSData::with_bytes(&tiff)), types().tiff));
+            }
             read_clipboard()
         });
         let png = got.expect("read").png.expect("PNG converted from TIFF");
@@ -340,19 +377,17 @@ mod tests {
         // A Finder copy carries the file URL, its name as text and an icon TIFF.
         let tiff = encode(&tiny_image(), ImageFormat::Tiff);
         let got = with_saved_clipboard(|| {
-            let pb = NSPasteboard::generalPasteboard();
-            pb.clearContents();
-            // SAFETY: the pasteboard type statics are immutable NSStrings.
-            unsafe {
+            {
+                let _lock = lock_pasteboard();
+                let pb = NSPasteboard::generalPasteboard();
+                let t = types();
+                pb.clearContents();
                 pb.setString_forType(
                     &NSString::from_str("file:///tmp/cursorjump-test.txt"),
-                    NSPasteboardTypeFileURL,
+                    t.file_url,
                 );
-                pb.setString_forType(
-                    &NSString::from_str("cursorjump-test.txt"),
-                    NSPasteboardTypeString,
-                );
-                pb.setData_forType(Some(&NSData::with_bytes(&tiff)), NSPasteboardTypeTIFF);
+                pb.setString_forType(&NSString::from_str("cursorjump-test.txt"), t.string);
+                pb.setData_forType(Some(&NSData::with_bytes(&tiff)), t.tiff);
             }
             read_clipboard()
         });
@@ -373,6 +408,43 @@ mod tests {
             rx.recv_timeout(Duration::from_secs(3))
         });
         assert_eq!(got.expect("watcher sent the change"), want);
+    }
+
+    /// A watcher polling while writes are in flight must never see a write
+    /// half done (`clearContents` bumps `changeCount` before the data is set).
+    #[test]
+    fn watcher_never_sees_a_partial_write() {
+        let png = encode(&tiny_image(), ImageFormat::Png);
+        let item = |n: u32| ClipboardData {
+            text: Some(format!("cj-{n}")),
+            html: Some(format!("<b>cj-{n}</b>")),
+            rtf: Some(format!("{{\\rtf1 cj-{n}}}").into_bytes()),
+            png: Some(png.clone()),
+        };
+        let received = with_saved_clipboard(|| {
+            let rx = spawn_clipboard_watcher();
+            std::thread::sleep(POLL_INTERVAL * 2);
+            let mut received = Vec::new();
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            let mut n = 0;
+            while std::time::Instant::now() < deadline {
+                write_clipboard(&item(n)).expect("write");
+                received.extend(rx.try_iter());
+                n += 1;
+            }
+            received.extend(rx.recv_timeout(POLL_INTERVAL * 4));
+            received
+        });
+        assert!(!received.is_empty(), "the watcher saw no change");
+        for d in &received {
+            let n: u32 = d
+                .text
+                .as_deref()
+                .and_then(|t| t.strip_prefix("cj-"))
+                .and_then(|n| n.parse().ok())
+                .unwrap_or_else(|| panic!("partial item (text): {:?}", d.text));
+            assert_eq!(d, &item(n), "partial or mixed item");
+        }
     }
 
     #[test]
