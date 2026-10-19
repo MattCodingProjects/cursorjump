@@ -406,8 +406,12 @@ unsafe extern "system" fn watcher_proc(
 mod tests {
     use super::*;
 
+    /// The clipboard is global: tests that write it must not run in parallel.
+    static CLIPBOARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn clipboard_roundtrip_text_html() {
+        let _serial = CLIPBOARD.lock().unwrap_or_else(|e| e.into_inner());
         // Keep the user's clipboard: restore it best-effort at the end.
         let original = read_clipboard().ok();
         let want = ClipboardData {
@@ -446,6 +450,7 @@ mod tests {
 
     #[test]
     fn clipboard_roundtrip_image() {
+        let _serial = CLIPBOARD.lock().unwrap_or_else(|e| e.into_inner());
         let original = read_clipboard().ok();
         let want = ClipboardData {
             png: Some(tiny_png()),
