@@ -2,6 +2,7 @@
 
 pub mod clipboard_bridge;
 pub mod config_file;
+pub mod session_tasks;
 pub mod settings_window;
 
 use cj_core::config::Config;

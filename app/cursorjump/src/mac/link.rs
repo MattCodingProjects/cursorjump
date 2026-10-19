@@ -6,7 +6,6 @@
 //! session ending) goes to the app's loop.
 
 use std::future::Future;
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -14,29 +13,16 @@ use cj_core::clipboard::ClipboardData;
 use cj_core::proto::{Control, Datagram};
 use cj_net::session::Session;
 use tokio::sync::mpsc::UnboundedSender;
-use tokio::sync::watch;
 use tokio::task::JoinHandle;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use super::app::Ev;
 use super::control::{InjectMsg, Input};
+use crate::common::session_tasks::{ClipboardOut, NetEv, pong, spawn_clipboard_tasks};
 
-/// Pongs reporting a longer round trip are ignored as bogus.
-const MAX_RTT: Duration = Duration::from_secs(10);
-
-/// What a session's tasks report to the loop.
-#[derive(Debug)]
-pub(super) enum NetEv {
-    /// A control message that is not input.
-    Control(Control),
-    /// Measured in the reader, so loop delays do not inflate it.
-    Pong {
-        rtt: Duration,
-        at: std::time::Instant,
-    },
-    Clipboard(ClipboardData),
-    Closed(String),
-}
+/// After declining a pairing, how long to wait for the PC to close the
+/// session (so the answer is delivered) before closing it ourselves.
+const DECLINE_FLUSH: Duration = Duration::from_secs(1);
 
 /// Input for the injection thread, or (Err) a message for the loop.
 pub(super) fn route_control(c: Control) -> Result<Input, Control> {
@@ -47,16 +33,6 @@ pub(super) fn route_control(c: Control) -> Result<Input, Control> {
         Control::ReleaseAll => Ok(Input::ReleaseAll),
         other => Err(other),
     }
-}
-
-/// The round trip of a ping sent `sent_us` after `epoch` whose pong arrived
-/// at `at`; None if it is impossible or implausibly long.
-fn round_trip(epoch: std::time::Instant, sent_us: u64, at: std::time::Instant) -> Option<Duration> {
-    let now_us = at.duration_since(epoch).as_micros() as u64;
-    now_us
-        .checked_sub(sent_us)
-        .map(Duration::from_micros)
-        .filter(|rtt| *rtt <= MAX_RTT)
 }
 
 /// Pairing with a PC that is not paired yet, on the session it opened in
@@ -101,6 +77,10 @@ where
         .await
         .context("sending this Mac's pairing answer")?;
     if !local {
+        // Closing at once would discard the unsent answer, and the PC would
+        // ask again within seconds instead of after its decline back-off.
+        // The PC closes once both answers are in; give it a moment.
+        let _ = tokio::time::timeout(DECLINE_FLUSH, session.closed()).await;
         return Ok(false);
     }
     match remote {
@@ -132,8 +112,7 @@ pub(super) struct Live {
     pub session: Session,
     pub peer_name: String,
     inject: crossbeam_channel::Sender<InjectMsg>,
-    /// Latest local clipboard item to send; a newer one replaces an unsent one.
-    clip_out: watch::Sender<Option<Arc<ClipboardData>>>,
+    clip_out: ClipboardOut,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -187,9 +166,8 @@ impl Live {
                         continue;
                     }
                     Ok(Datagram::Pong { sent_us, .. }) => {
-                        let at = std::time::Instant::now();
-                        if let Some(rtt) = round_trip(epoch, sent_us, at)
-                            && tx.send(net(NetEv::Pong { rtt, at })).is_err()
+                        if let Some(ev) = pong(epoch, sent_us)
+                            && tx.send(net(ev)).is_err()
                         {
                             return;
                         }
@@ -204,34 +182,11 @@ impl Live {
             let _ = tx.send(net(NetEv::Closed(reason)));
         }));
 
-        let (s, tx) = (session.clone(), events.clone());
-        tasks.push(tokio::spawn(async move {
-            loop {
-                match s.recv_clipboard(clip_max).await {
-                    Ok(d) => {
-                        if tx.send(net(NetEv::Clipboard(d))).is_err() {
-                            return;
-                        }
-                    }
-                    // A closed session is reported by the other readers.
-                    Err(_) if is_closed(&s).await => return,
-                    Err(e) => warn!("clipboard from the PC not accepted: {e:#}"),
-                }
-            }
-        }));
-
-        let (clip_out, mut clip_rx) = watch::channel(None::<Arc<ClipboardData>>);
-        let s = session.clone();
-        tasks.push(tokio::spawn(async move {
-            while clip_rx.changed().await.is_ok() {
-                let item = clip_rx.borrow_and_update().clone();
-                if let Some(d) = item
-                    && let Err(e) = s.send_clipboard(&d).await
-                {
-                    debug!("clipboard not sent: {e:#}");
-                }
-            }
-        }));
+        let tx = events.clone();
+        let (clip_out, clip_tasks) = spawn_clipboard_tasks(&session, clip_max, move |d| {
+            tx.send(net(NetEv::Clipboard(d))).is_ok()
+        });
+        tasks.extend(clip_tasks);
 
         Live {
             sid,
@@ -245,7 +200,7 @@ impl Live {
 
     /// Queues a local clipboard item, replacing one not yet sent.
     pub fn send_clipboard(&self, d: ClipboardData) {
-        self.clip_out.send_replace(Some(Arc::new(d)));
+        self.clip_out.send(d);
     }
 }
 
@@ -259,12 +214,6 @@ impl Drop for Live {
         // instead of after the idle timeout.
         self.session.close();
     }
-}
-
-async fn is_closed(s: &Session) -> bool {
-    tokio::time::timeout(Duration::ZERO, s.closed())
-        .await
-        .is_ok()
 }
 
 #[cfg(test)]
@@ -311,19 +260,6 @@ mod tests {
         ] {
             assert_eq!(route_control(other.clone()), Err(other));
         }
-    }
-
-    #[test]
-    fn round_trip_is_measured_from_the_epoch() {
-        let epoch = std::time::Instant::now();
-        let at = epoch + Duration::from_millis(50);
-        assert_eq!(
-            round_trip(epoch, 46_000, at),
-            Some(Duration::from_millis(4))
-        );
-        assert_eq!(round_trip(epoch, 51_000, at), None, "sent after it arrived");
-        let late = epoch + Duration::from_secs(20);
-        assert_eq!(round_trip(epoch, 0, late), None, "implausibly long");
     }
 
     /// Real QUIC sessions on 127.0.0.1 between this Mac's code and a fake PC.
@@ -434,13 +370,28 @@ mod tests {
         async fn pairing_fails_when_the_mac_declines() {
             let (_l, mac, pc) = connected(false).await;
             let ask = |_code: String| async { false };
-            let (result, (_, mac_answer)) = timeout(T, async {
-                tokio::join!(run_pairing(&mac, ask), pc_pairs(&pc, LATER, true))
-            })
-            .await
-            .unwrap();
+            // Like the app: the session is closed as soon as the pairing ends.
+            let mac_side = async {
+                let result = run_pairing(&mac, ask).await;
+                mac.close();
+                result
+            };
+            // The PC's user is still deciding; its reader sees the Mac's answer.
+            let pc_side = async {
+                pc.pair().await.unwrap();
+                let answer = pc.recv_control().await.ok();
+                pc.close();
+                answer
+            };
+            let (result, mac_answer) = timeout(T, async { tokio::join!(mac_side, pc_side) })
+                .await
+                .unwrap();
             assert!(!result.unwrap());
-            assert_eq!(mac_answer, Some(Control::PairConfirm { accepted: false }));
+            assert_eq!(
+                mac_answer,
+                Some(Control::PairConfirm { accepted: false }),
+                "the decline reaches the PC before the session closes"
+            );
         }
 
         #[tokio::test]
@@ -557,7 +508,8 @@ mod tests {
             assert!(ended.elapsed() < Duration::from_millis(400));
 
             let (fake, calls) = Fake::new();
-            let mut router = Router::new(fake);
+            let granted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let mut router = Router::new(fake, granted);
             for msg in got {
                 router.handle(msg);
             }

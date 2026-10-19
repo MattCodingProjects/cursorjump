@@ -28,6 +28,8 @@ objc2-core-foundation = { version = "0.3.2", default-features = false, features 
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "CGDirectDisplay", "CGDisplayConfiguration", "CGEvent", "CGEventSource", "CGEventTypes", "CGRemoteOperation", "CGError", "libc"] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSData", "NSProcessInfo", "NSString"] }
 objc2-io-kit = { version = "0.3.2", default-features = false, features = ["std", "pwr_mgt"] }
+# SIGTERM (launchctl bootout, logout) runs the normal quit.
+tokio = { version = "1.53.3", features = ["signal"] }
 
 [dev-dependencies]
 tempfile = "3"

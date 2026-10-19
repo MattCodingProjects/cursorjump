@@ -8,19 +8,21 @@
 //! can be queued ahead of this Mac's own `Leave`, and the PC then never
 //! sends its up, so injecting the down would leave it stuck.
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use anyhow::{Context, Result};
 use cj_core::mac_state::{MacAction, MacEvent, MacMachine};
 use cj_core::proto::{MouseButton, Side};
-use tracing::warn;
+use tracing::{error, warn};
 
 use super::inject::Injector;
-use super::{permissions, power};
+use super::power;
 
 /// What the thread needs from the Injector; a trait so the routing can be
 /// tested without posting real events.
 pub trait Inject {
-    /// Whether this process may post events (Accessibility).
-    fn can_post(&self) -> bool;
     fn wake_display(&mut self);
     fn warp_to(&mut self, edge: Side, frac: f32);
     /// The fraction along the entry edge when the move pushes out through it.
@@ -35,9 +37,6 @@ pub trait Inject {
 }
 
 impl Inject for Injector {
-    fn can_post(&self) -> bool {
-        permissions::has_post_event_access()
-    }
     fn wake_display(&mut self) {
         power::wake_display();
     }
@@ -113,8 +112,29 @@ pub enum InjectMsg {
     End {
         sid: u64,
     },
+    /// The Accessibility permission was revoked: if the PC is controlling
+    /// this Mac, send its cursor back.
+    AccessLost,
     /// Release everything and stop the thread.
     Quit,
+}
+
+/// Records whether this process may post events (`has`, from
+/// `has_post_event_access`) for the injection thread, which reads `access`
+/// instead of asking the system (a TCC query, milliseconds) on every Enter.
+/// When the permission goes away, tells the thread. True if it changed.
+pub fn update_access(
+    access: &AtomicBool,
+    has: bool,
+    inject: &crossbeam_channel::Sender<InjectMsg>,
+) -> bool {
+    if access.swap(has, Ordering::Relaxed) == has {
+        return false;
+    }
+    if !has {
+        let _ = inject.send(InjectMsg::AccessLost);
+    }
+    true
 }
 
 /// What the thread reports to the app's loop.
@@ -134,15 +154,26 @@ pub struct Router<I: Inject> {
     machine: MacMachine,
     /// The session whose input is accepted.
     sid: Option<u64>,
+    /// Whether events may be posted (Accessibility), kept up to date by the loop.
+    access: Arc<AtomicBool>,
+    /// Where the PC's cursor came in, for sending it back without a push.
+    enter_frac: f32,
 }
 
 impl<I: Inject> Router<I> {
-    pub fn new(inj: I) -> Self {
+    pub fn new(inj: I, access: Arc<AtomicBool>) -> Self {
         Router {
             inj,
             machine: MacMachine::new(),
             sid: None,
+            access,
+            enter_frac: 0.5,
         }
+    }
+
+    /// Lets go of every key and button the Injector holds.
+    pub fn release_all(&mut self) {
+        self.inj.release_all();
     }
 
     /// Handles one message; returns what to report to the loop.
@@ -156,6 +187,13 @@ impl<I: Inject> Router<I> {
             InjectMsg::Input { sid, input } if self.sid == Some(sid) => self.input(sid, input),
             InjectMsg::End { sid } if self.sid == Some(sid) => self.end_session(),
             InjectMsg::Input { .. } | InjectMsg::End { .. } => Vec::new(),
+            InjectMsg::AccessLost => match self.sid {
+                Some(sid) if self.machine.controlled() => {
+                    warn!("Accessibility permission revoked: sending the cursor back to the PC");
+                    self.bounce(sid)
+                }
+                _ => Vec::new(),
+            },
             InjectMsg::Quit => {
                 let out = self.end_session();
                 self.inj.release_all();
@@ -175,18 +213,13 @@ impl<I: Inject> Router<I> {
         let controlled = self.machine.controlled();
         match input {
             Input::Enter { edge, frac } => {
-                let allowed = self.inj.can_post();
+                // The cached state: asking the system costs milliseconds.
+                let allowed = self.access.load(Ordering::Relaxed);
+                self.enter_frac = frac;
                 let mut out = self.feed(sid, MacEvent::Enter { edge, frac });
                 if !allowed {
-                    // Never strand the PC's cursor on a Mac that cannot be controlled.
                     warn!("no Accessibility permission: sending the cursor back to the PC");
-                    out.extend(self.feed(
-                        sid,
-                        MacEvent::PushOut {
-                            frac,
-                            buttons_held: false,
-                        },
-                    ));
+                    out.extend(self.bounce(sid));
                 }
                 out
             }
@@ -218,6 +251,19 @@ impl<I: Inject> Router<I> {
         }
     }
 
+    /// Sends the PC's cursor back where it came in, as if pushed out: never
+    /// strand it on a Mac that cannot be controlled.
+    fn bounce(&mut self, sid: u64) -> Vec<InjectEv> {
+        let frac = self.enter_frac;
+        self.feed(
+            sid,
+            MacEvent::PushOut {
+                frac,
+                buttons_held: false,
+            },
+        )
+    }
+
     /// Feeds the machine and carries out its actions.
     fn feed(&mut self, sid: u64, ev: MacEvent) -> Vec<InjectEv> {
         let mut out = Vec::new();
@@ -235,9 +281,12 @@ impl<I: Inject> Router<I> {
     }
 }
 
-/// Starts the injection thread; `report` passes its events to the app's loop.
+/// Starts the injection thread; `report` passes its events to the app's
+/// loop. It always ends by reporting `Stopped`: after `Quit`, or, having
+/// released everything, after a panic.
 pub fn spawn_inject_thread<I: Inject + Send + 'static>(
     inj: I,
+    access: Arc<AtomicBool>,
     report: impl Fn(InjectEv) + Send + 'static,
 ) -> Result<crossbeam_channel::Sender<InjectMsg>> {
     let (tx, rx) = crossbeam_channel::unbounded::<InjectMsg>();
@@ -245,14 +294,24 @@ pub fn spawn_inject_thread<I: Inject + Send + 'static>(
         .name("cj-inject".into())
         .spawn(move || {
             set_user_interactive_qos();
-            let mut router = Router::new(inj);
-            for msg in rx {
-                let quit = msg == InjectMsg::Quit;
-                for ev in router.handle(msg) {
-                    report(ev);
+            let mut router = Router::new(inj, access);
+            let run = catch_unwind(AssertUnwindSafe(|| {
+                for msg in rx {
+                    let quit = msg == InjectMsg::Quit;
+                    for ev in router.handle(msg) {
+                        report(ev);
+                    }
+                    if quit {
+                        break;
+                    }
                 }
-                if quit {
-                    break;
+            }));
+            if run.is_err() {
+                // Never leave a key or button held down: let go of
+                // everything, then report Stopped like any other ending.
+                error!("injection thread panicked; releasing everything");
+                if catch_unwind(AssertUnwindSafe(|| router.release_all())).is_err() {
+                    error!("releasing after the panic failed too");
                 }
             }
             report(InjectEv::Stopped);
@@ -263,7 +322,7 @@ pub fn spawn_inject_thread<I: Inject + Send + 'static>(
 
 /// Runs this thread at the highest QoS class, so input is never delayed
 /// behind background work.
-fn set_user_interactive_qos() {
+pub fn set_user_interactive_qos() {
     // SAFETY: plain call that only changes the calling thread's QoS.
     let err = unsafe {
         libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0)
@@ -294,7 +353,8 @@ pub(super) mod tests {
     /// Records every call; holds keys and buttons like the Injector does.
     pub(crate) struct Fake {
         calls: Arc<Mutex<Vec<Call>>>,
-        access: bool,
+        /// `key` panics, like a bug in the Injector would.
+        key_panics: bool,
         /// What every `motion` returns.
         push_out: Option<f32>,
         keys: BTreeSet<u16>,
@@ -306,7 +366,7 @@ pub(super) mod tests {
             let calls = Arc::new(Mutex::new(Vec::new()));
             let fake = Fake {
                 calls: calls.clone(),
-                access: true,
+                key_panics: false,
                 push_out: None,
                 keys: BTreeSet::new(),
                 buttons: Vec::new(),
@@ -320,9 +380,6 @@ pub(super) mod tests {
     }
 
     impl Inject for Fake {
-        fn can_post(&self) -> bool {
-            self.access
-        }
         fn wake_display(&mut self) {
             self.log(Call::Wake);
         }
@@ -344,6 +401,7 @@ pub(super) mod tests {
             self.log(Call::Button(b, down));
         }
         fn key(&mut self, kc: u16, down: bool) {
+            assert!(!self.key_panics, "injector bug");
             if down {
                 self.keys.insert(kc);
             } else {
@@ -392,9 +450,20 @@ pub(super) mod tests {
         }
     }
 
-    /// A router with session 1 begun, and its call log.
+    fn granted() -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(true))
+    }
+
+    /// A router with session 1 begun, with or without Accessibility.
+    fn begun_with(fake: Fake, access: Arc<AtomicBool>) -> Router<Fake> {
+        let mut r = Router::new(fake, access);
+        assert_eq!(r.handle(InjectMsg::Begin { sid: 1 }), vec![]);
+        r
+    }
+
+    /// A router with session 1 begun.
     fn begun(fake: Fake) -> Router<Fake> {
-        let mut r = Router::new(fake);
+        let mut r = Router::new(fake, granted());
         assert_eq!(r.handle(InjectMsg::Begin { sid: 1 }), vec![]);
         r
     }
@@ -577,9 +646,8 @@ pub(super) mod tests {
 
     #[test]
     fn without_accessibility_enter_leaves_at_once() {
-        let (mut fake, calls) = Fake::new();
-        fake.access = false;
-        let mut r = begun(fake);
+        let (fake, calls) = Fake::new();
+        let mut r = begun_with(fake, Arc::new(AtomicBool::new(false)));
         assert_eq!(
             r.handle(input(1, enter(0.7))),
             vec![
@@ -592,6 +660,67 @@ pub(super) mod tests {
         assert_eq!(
             take(&calls),
             vec![Call::Wake, Call::Warp(Side::Left, 0.7), Call::ReleaseAll]
+        );
+    }
+
+    #[test]
+    fn enter_follows_the_cached_access_state() {
+        let (fake, calls) = Fake::new();
+        let access = Arc::new(AtomicBool::new(false));
+        let mut r = begun_with(fake, access.clone());
+        let bounced = r.handle(input(1, enter(0.7)));
+        assert!(bounced.contains(&InjectEv::SendLeave { sid: 1, frac: 0.7 }));
+        access.store(true, Ordering::Relaxed);
+        take(&calls);
+        assert_eq!(
+            r.handle(input(1, enter(0.6))),
+            vec![InjectEv::Controlled { sid: 1, on: true }],
+            "granted since: the PC keeps the cursor here"
+        );
+    }
+
+    #[test]
+    fn losing_access_while_controlled_sends_the_cursor_back() {
+        let (fake, calls) = Fake::new();
+        let access = granted();
+        let mut r = begun_with(fake, access.clone());
+        r.handle(input(1, enter(0.3)));
+        r.handle(input(1, key(0x00, true)));
+        take(&calls);
+        access.store(false, Ordering::Relaxed);
+        assert_eq!(
+            r.handle(InjectMsg::AccessLost),
+            vec![
+                InjectEv::SendLeave { sid: 1, frac: 0.3 },
+                InjectEv::Controlled { sid: 1, on: false },
+            ]
+        );
+        assert_eq!(take(&calls), vec![Call::ReleaseAll]);
+        assert_eq!(r.handle(InjectMsg::AccessLost), vec![], "already gone");
+    }
+
+    #[test]
+    fn losing_access_while_not_controlled_does_nothing() {
+        let (fake, calls) = Fake::new();
+        let mut r = begun(fake);
+        assert_eq!(r.handle(InjectMsg::AccessLost), vec![]);
+        assert_eq!(take(&calls), vec![]);
+    }
+
+    #[test]
+    fn update_access_tells_the_thread_only_when_access_goes() {
+        let access = AtomicBool::new(true);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        assert!(!update_access(&access, true, &tx), "unchanged");
+        assert!(update_access(&access, false, &tx));
+        assert!(!access.load(Ordering::Relaxed));
+        assert_eq!(rx.try_recv(), Ok(InjectMsg::AccessLost));
+        assert!(!update_access(&access, false, &tx));
+        assert!(update_access(&access, true, &tx));
+        assert!(access.load(Ordering::Relaxed));
+        assert!(
+            rx.try_recv().is_err(),
+            "nothing to do when access comes back"
         );
     }
 
@@ -614,7 +743,7 @@ pub(super) mod tests {
     fn thread_injects_in_order_and_reports_until_quit() {
         let (fake, calls) = Fake::new();
         let (ev_tx, ev_rx) = crossbeam_channel::unbounded();
-        let tx = spawn_inject_thread(fake, move |ev| {
+        let tx = spawn_inject_thread(fake, granted(), move |ev| {
             let _ = ev_tx.send(ev);
         })
         .unwrap();
@@ -650,5 +779,41 @@ pub(super) mod tests {
             ]
         );
         assert!(calls[5..].iter().all(|c| *c == Call::ReleaseAll));
+    }
+
+    #[test]
+    fn a_panic_releases_everything_and_reports_stopped() {
+        let (mut fake, calls) = Fake::new();
+        fake.key_panics = true;
+        let (ev_tx, ev_rx) = crossbeam_channel::unbounded();
+        let tx = spawn_inject_thread(fake, granted(), move |ev| {
+            let _ = ev_tx.send(ev);
+        })
+        .unwrap();
+        for msg in [
+            InjectMsg::Begin { sid: 3 },
+            input(3, enter(0.5)),
+            input(
+                3,
+                Input::Button {
+                    button: MouseButton::Left,
+                    down: true,
+                },
+            ),
+            input(3, key(0x00, true)),
+        ] {
+            tx.send(msg).unwrap();
+        }
+        let t = Duration::from_secs(2);
+        assert_eq!(
+            ev_rx.recv_timeout(t).unwrap(),
+            InjectEv::Controlled { sid: 3, on: true }
+        );
+        assert_eq!(ev_rx.recv_timeout(t).unwrap(), InjectEv::Stopped);
+        assert_eq!(
+            take(&calls).last(),
+            Some(&Call::ReleaseAll),
+            "the held button is let go"
+        );
     }
 }

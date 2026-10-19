@@ -23,20 +23,24 @@ use cj_core::proto::{Control, Datagram};
 use cj_net::discovery::{Advertiser, DISCOVERY_PORT, QUIC_PORT};
 use cj_net::session::{Listener, Session};
 use cj_net::{Identity, Trust};
+use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior, interval, sleep_until};
 use tracing::{debug, error, info, warn};
 
 use super::clipboard::{read_clipboard, spawn_clipboard_watcher, write_clipboard};
-use super::control::{InjectEv, InjectMsg, spawn_inject_thread};
+use super::control::{
+    InjectEv, InjectMsg, set_user_interactive_qos, spawn_inject_thread, update_access,
+};
 use super::inject::Injector;
-use super::link::{Live, NetEv, run_pairing};
+use super::link::{Live, run_pairing};
 use super::permissions::{has_post_event_access, request_post_event_access};
 use super::power::KeepAwake;
 use crate::common::clipboard_bridge::{ClipboardLink, bridge_clipboard};
 use crate::common::config_file::ConfigFile;
 use crate::common::paired_fingerprint;
+use crate::common::session_tasks::NetEv;
 use crate::common::settings_window::SettingsWindow;
 use crate::paths;
 use crate::ui::dialogs;
@@ -76,6 +80,8 @@ pub fn run_mac() -> Result<()> {
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
+        // Motion datagrams pass through a worker on their way to cj-inject.
+        .on_thread_start(set_user_interactive_qos)
         .enable_all()
         .build()
         .context("starting the network runtime")?;
@@ -96,7 +102,13 @@ pub fn run_mac() -> Result<()> {
 
     let (events, events_rx) = unbounded_channel();
     let inject_events = events.clone();
-    let inject = spawn_inject_thread(Injector::new()?, move |ev| {
+    let access = Arc::new(AtomicBool::new(has_post_event_access()));
+    if !access.load(Ordering::Relaxed) {
+        warn!(
+            "no Accessibility permission yet: the PC cannot control this Mac until it is granted"
+        );
+    }
+    let inject = spawn_inject_thread(Injector::new()?, access.clone(), move |ev| {
         let _ = inject_events.send(Ev::Inject(ev));
     })?;
     let clip_link = Arc::new(ClipboardLink::new(cfg.clipboard_max_bytes));
@@ -112,6 +124,7 @@ pub fn run_mac() -> Result<()> {
 
     let channels = Channels {
         inject,
+        access,
         clip_write,
         clip_link,
         tray: model_tx,
@@ -200,6 +213,16 @@ pub(super) enum Ev {
     LocalClipboard(ClipboardData),
 }
 
+/// Resolves when SIGTERM arrives (launchctl bootout, logout); never without a handler.
+async fn terminated(sigterm: &mut Option<Signal>) {
+    if let Some(s) = sigterm
+        && s.recv().await.is_some()
+    {
+        return;
+    }
+    std::future::pending().await
+}
+
 /// The connection as the menu shows it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum LinkStatus<'a> {
@@ -252,6 +275,8 @@ enum Conn {
 /// The loop's connections to the other threads.
 struct Channels {
     inject: crossbeam_channel::Sender<InjectMsg>,
+    /// Whether events may be posted, shared with the injection thread.
+    access: Arc<AtomicBool>,
     clip_write: crossbeam_channel::Sender<ClipboardData>,
     clip_link: Arc<ClipboardLink>,
     tray: std::sync::mpsc::Sender<TrayModel>,
@@ -271,7 +296,6 @@ struct App {
     next_sid: u64,
     /// Set while a pairing dialog is on screen, which can outlive its session.
     pair_dialog_open: Arc<AtomicBool>,
-    has_access: bool,
     latency: LatencyStats,
     latency_text: String,
     ping_seq: u32,
@@ -281,6 +305,9 @@ struct App {
     last_model: Option<TrayModel>,
     quit_by: Option<Instant>,
     done: bool,
+    /// The injection thread stopped without Quit: exit non-zero so launchd
+    /// (KeepAlive SuccessfulExit=false) starts a fresh copy.
+    failed: bool,
 }
 
 impl App {
@@ -292,12 +319,6 @@ impl App {
         ch: Channels,
     ) -> App {
         let latency = LatencyStats::new();
-        let has_access = has_post_event_access();
-        if !has_access {
-            warn!(
-                "no Accessibility permission yet: the PC cannot control this Mac until it is granted"
-            );
-        }
         App {
             cfg,
             config_file,
@@ -308,7 +329,6 @@ impl App {
             awake: None,
             next_sid: 0,
             pair_dialog_open: Arc::new(AtomicBool::new(false)),
-            has_access,
             latency_text: latency_text(&latency),
             latency,
             ping_seq: 0,
@@ -317,6 +337,7 @@ impl App {
             last_model: None,
             quit_by: None,
             done: false,
+            failed: false,
         }
     }
 
@@ -328,6 +349,9 @@ impl App {
         let mut latency_refresh = interval(LATENCY_REFRESH);
         let mut access_poll = interval(ACCESS_POLL);
         access_poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut sigterm = signal(SignalKind::terminate())
+            .inspect_err(|e| warn!("SIGTERM will not quit cleanly: {e}"))
+            .ok();
         self.publish();
         loop {
             let quit_by = self.quit_by;
@@ -344,6 +368,10 @@ impl App {
                 }
                 _ = latency_refresh.tick() => self.latency_text = latency_text(&self.latency),
                 _ = access_poll.tick() => self.poll_access(),
+                () = terminated(&mut sigterm) => {
+                    info!("SIGTERM received");
+                    self.begin_quit();
+                }
                 _ = sleep_until(quit_by.unwrap_or_else(Instant::now)), if quit_by.is_some() => {
                     warn!("injection thread did not stop in time");
                     break;
@@ -365,6 +393,10 @@ impl App {
             tokio::time::sleep(CLOSE_FLUSH),
             tokio::task::spawn_blocking(move || drop(advertiser)),
         );
+        if self.failed {
+            error!("exiting with an error");
+            std::process::exit(1);
+        }
         info!("stopped");
     }
 
@@ -455,7 +487,8 @@ impl App {
             }
             InjectEv::Stopped => {
                 if self.quit_by.is_none() {
-                    error!("injection thread stopped; quitting");
+                    error!("injection thread stopped; quitting so that CursorJump restarts");
+                    self.failed = true;
                 }
                 self.done = true;
             }
@@ -463,6 +496,10 @@ impl App {
     }
 
     // ------------------------------------------------------------ sessions
+
+    fn has_access(&self) -> bool {
+        self.ch.access.load(Ordering::Relaxed)
+    }
 
     fn live(&self) -> Option<&Live> {
         match &self.conn {
@@ -606,11 +643,12 @@ impl App {
         self.ping_seq = seq;
     }
 
+    /// Refreshes the injection thread's view of the Accessibility
+    /// permission; losing it sends the PC's cursor back.
     fn poll_access(&mut self) {
         let has = has_post_event_access();
-        if has != self.has_access {
+        if update_access(&self.ch.access, has, &self.ch.inject) {
             info!(granted = has, "Accessibility permission changed");
-            self.has_access = has;
         }
     }
 
@@ -670,7 +708,8 @@ impl App {
                 tokio::task::spawn_blocking(request_post_event_access);
             }
             TrayCmd::Quit => self.begin_quit(),
-            // The PC owns crossing; the Mac's menu has no pause item.
+            // Never sent on macOS: the PC owns crossing, so the Mac's menu has
+            // no pause item. The arm only keeps the shared enum's match exhaustive.
             TrayCmd::TogglePause => {}
         }
     }
@@ -710,10 +749,10 @@ impl App {
             Conn::Live(l) => LinkStatus::Connected(&l.peer_name),
         };
         let model = TrayModel {
-            status: status_text(link, !self.has_access),
+            status: status_text(link, !self.has_access()),
             latency: self.latency_text.clone(),
             paused: false,
-            needs_accessibility: !self.has_access,
+            needs_accessibility: !self.has_access(),
         };
         if self.last_model.as_ref() != Some(&model) {
             let _ = self.ch.tray.send(model.clone());

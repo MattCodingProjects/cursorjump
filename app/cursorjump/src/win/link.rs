@@ -2,41 +2,24 @@
 //! the tasks serving a live session (`Live`), and the reconnect schedule.
 
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use cj_core::clipboard::ClipboardData;
 use cj_core::config::Config;
-use cj_core::proto::{Control, Datagram};
+use cj_core::proto::Datagram;
 use cj_net::discovery::{DISCOVERY_PORT, QUIC_PORT, choose_peer, discover};
 use cj_net::session::{Session, connect};
 use cj_net::{Identity, Trust};
 use tokio::sync::mpsc::UnboundedSender;
-use tokio::sync::watch;
 use tokio::task::JoinHandle;
-use tracing::{debug, warn};
 
 use super::app::Ev;
 use crate::common::paired_fingerprint;
+use crate::common::session_tasks::{ClipboardOut, NetEv, pong, spawn_clipboard_tasks};
 
 /// `discover` needs at least 3 s to get through mDNS and the broadcast fallback.
 const DISCOVER_TIMEOUT: Duration = Duration::from_secs(3);
-/// Pongs reporting a longer round trip are ignored as bogus.
-const MAX_RTT: Duration = Duration::from_secs(10);
-
-/// What a session's tasks report to the loop.
-pub(super) enum NetEv {
-    Control(Control),
-    /// Measured in the reader, so loop delays do not inflate it.
-    Pong {
-        rtt: Duration,
-        at: std::time::Instant,
-    },
-    Clipboard(ClipboardData),
-    Closed(String),
-}
-
 pub(super) struct Established {
     pub session: Session,
     /// The pairing code when the session was made in pairing mode.
@@ -107,7 +90,7 @@ pub(super) struct Live {
     pub session: Session,
     pub peer_name: String,
     /// Latest local clipboard item to send; a newer one replaces an unsent one.
-    clip_out: watch::Sender<Option<Arc<ClipboardData>>>,
+    clip_out: ClipboardOut,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -144,11 +127,8 @@ impl Live {
             let reason = loop {
                 match s.recv_datagram().await {
                     Ok(Datagram::Pong { sent_us, .. }) => {
-                        let at = std::time::Instant::now();
-                        let now_us = at.duration_since(epoch).as_micros() as u64;
-                        if let Some(rtt) = now_us.checked_sub(sent_us).map(Duration::from_micros)
-                            && rtt <= MAX_RTT
-                            && tx.send(net(NetEv::Pong { rtt, at })).is_err()
+                        if let Some(ev) = pong(epoch, sent_us)
+                            && tx.send(net(ev)).is_err()
                         {
                             return;
                         }
@@ -164,34 +144,11 @@ impl Live {
             let _ = tx.send(net(NetEv::Closed(reason)));
         }));
 
-        let (s, tx) = (session.clone(), events.clone());
-        tasks.push(tokio::spawn(async move {
-            loop {
-                match s.recv_clipboard(clip_max).await {
-                    Ok(d) => {
-                        if tx.send(net(NetEv::Clipboard(d))).is_err() {
-                            return;
-                        }
-                    }
-                    // A closed session is reported by the other readers.
-                    Err(_) if is_closed(&s).await => return,
-                    Err(e) => warn!("clipboard from the Mac not accepted: {e:#}"),
-                }
-            }
-        }));
-
-        let (clip_out, mut clip_rx) = watch::channel(None::<Arc<ClipboardData>>);
-        let s = session.clone();
-        tasks.push(tokio::spawn(async move {
-            while clip_rx.changed().await.is_ok() {
-                let item = clip_rx.borrow_and_update().clone();
-                if let Some(d) = item
-                    && let Err(e) = s.send_clipboard(&d).await
-                {
-                    debug!("clipboard not sent: {e:#}");
-                }
-            }
-        }));
+        let tx = events.clone();
+        let (clip_out, clip_tasks) = spawn_clipboard_tasks(&session, clip_max, move |d| {
+            tx.send(net(NetEv::Clipboard(d))).is_ok()
+        });
+        tasks.extend(clip_tasks);
 
         Live {
             sid,
@@ -204,7 +161,7 @@ impl Live {
 
     /// Queues a local clipboard item, replacing one not yet sent.
     pub fn send_clipboard(&self, d: ClipboardData) {
-        self.clip_out.send_replace(Some(Arc::new(d)));
+        self.clip_out.send(d);
     }
 }
 
@@ -215,12 +172,6 @@ impl Drop for Live {
         }
         self.session.close();
     }
-}
-
-async fn is_closed(s: &Session) -> bool {
-    tokio::time::timeout(Duration::ZERO, s.closed())
-        .await
-        .is_ok()
 }
 
 #[cfg(test)]
