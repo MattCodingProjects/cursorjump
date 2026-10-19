@@ -160,11 +160,18 @@ pub(super) enum Ev {
 }
 
 /// The tray's status line.
-fn status_text(link: &Link, peer_name: Option<&str>, paused: bool) -> String {
+fn status_text(link: &Link, peer_name: Option<&str>, mac_ready: bool, paused: bool) -> String {
     let base = match link {
         Link::Searching => "Searching for your Mac…".to_string(),
         Link::Pairing { code } => format!("Pairing — check that both screens show {code}"),
-        Link::Connected => format!("Connected to {}", peer_name.unwrap_or("your Mac")),
+        Link::Connected => {
+            let peer = peer_name.unwrap_or("your Mac");
+            if mac_ready {
+                format!("Connected to {peer}")
+            } else {
+                format!("Connected to {peer} — Mac needs Accessibility")
+            }
+        }
     };
     if paused {
         format!("{base} (paused)")
@@ -430,6 +437,12 @@ impl App {
     fn on_net(&mut self, ev: NetEv) {
         match ev {
             NetEv::Control(Control::Leave { frac }) => self.feed(PcEvent::MacLeave { frac }),
+            NetEv::Control(Control::MacReady { ready }) => {
+                if ready != self.machine.mac_ready() {
+                    info!(ready, "the Mac's readiness changed");
+                }
+                self.feed(PcEvent::MacReady(ready));
+            }
             NetEv::Control(Control::PairConfirm { accepted }) => {
                 self.on_remote_pair_answer(accepted)
             }
@@ -721,7 +734,12 @@ impl App {
             .store(self.paired_session().is_some(), Ordering::Relaxed);
         let peer = self.link.as_ref().map(|l| l.peer_name.as_str());
         let model = TrayModel {
-            status: status_text(self.machine.link(), peer, self.cfg.paused),
+            status: status_text(
+                self.machine.link(),
+                peer,
+                self.machine.mac_ready(),
+                self.cfg.paused,
+            ),
             latency: self.latency_text.clone(),
             paused: self.cfg.paused,
             needs_accessibility: false,
@@ -740,7 +758,7 @@ mod tests {
     #[test]
     fn status_searching() {
         assert_eq!(
-            status_text(&Link::Searching, None, false),
+            status_text(&Link::Searching, None, true, false),
             "Searching for your Mac…"
         );
     }
@@ -751,7 +769,7 @@ mod tests {
             code: "123 456".into(),
         };
         assert_eq!(
-            status_text(&link, Some("MacBook"), false),
+            status_text(&link, Some("MacBook"), true, false),
             "Pairing — check that both screens show 123 456"
         );
     }
@@ -759,12 +777,29 @@ mod tests {
     #[test]
     fn status_connected_names_peer() {
         assert_eq!(
-            status_text(&Link::Connected, Some("Matt's MacBook Pro"), false),
+            status_text(&Link::Connected, Some("Matt's MacBook Pro"), true, false),
             "Connected to Matt's MacBook Pro"
         );
         assert_eq!(
-            status_text(&Link::Connected, None, true),
+            status_text(&Link::Connected, None, true, true),
             "Connected to your Mac (paused)"
+        );
+    }
+
+    #[test]
+    fn status_connected_says_when_the_mac_needs_accessibility() {
+        assert_eq!(
+            status_text(&Link::Connected, Some("MacBook"), false, false),
+            "Connected to MacBook — Mac needs Accessibility"
+        );
+        assert_eq!(
+            status_text(&Link::Connected, None, false, true),
+            "Connected to your Mac — Mac needs Accessibility (paused)"
+        );
+        assert_eq!(
+            status_text(&Link::Searching, None, false, false),
+            "Searching for your Mac…",
+            "only a connected Mac's readiness is shown"
         );
     }
 
