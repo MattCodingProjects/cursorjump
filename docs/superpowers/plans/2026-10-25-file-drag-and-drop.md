@@ -31,8 +31,8 @@
 
 ## Global Constraints
 
-- **Anti-cheat (phase 1, binding):** no global hooks while the cursor is on the PC; no DLL injection, overlays or reading other processes' memory; and no `SendInput`, with exactly one exception, **E1** below. The gaming wall still blocks every crossing while a game holds the mouse (clip, hidden cursor, D3D exclusive full screen).
-- **Exception E1 (spec: "write the exception down explicitly in the plan, so the user can see it"):** the PC may call `SendInput` with one `MOUSEEVENTF_LEFTUP`, only to end a file drag that started on the PC and is now riding on the Mac. The cursor is then parked over CursorJump's own full-screen catcher, the hooks are installed, and the gaming rule is not "wall". Nothing else is ever injected on the PC. Every use is logged at `info`.
+- **Anti-cheat (phase 1, binding):** no global hooks while the cursor is on the PC; no DLL injection, overlays or reading other processes' memory; and **no `SendInput`, ever**. There are no exceptions. The gaming wall still blocks every crossing while a game holds the mouse (clip, hidden cursor, D3D exclusive full screen).
+- **Ending a PC drag that rides on the Mac (amended 2026-10-25, replaces the earlier exception E1):** nothing is injected. While a file drag that started on the PC is riding on the Mac, the phase 1 mouse hook lets the user's *real* left-button release through to Windows, as well as forwarding it to the Mac. The cursor is parked over CursorJump's own full-screen catcher, so Windows ends the source app's drag on the catcher. After a forced return, the catcher stays in reject mode until the user's real release ends the drag with no drop.
 - **CursorJump's own windows on the PC (spec):** "The phase 1 'no overlays' rule means injected in-game overlays." CursorJump may show ordinary top-level windows for the catcher and the pill. "Neither may appear while the gaming rule says 'wall'." A pill for a Mac-to-PC copy that finishes or fails while a game holds the mouse "is held back until the game no longer does".
 - **Transfer (spec):**
   - "Any size. Files go directly over the existing encrypted LAN connection, with no cloud and no size cap."
@@ -97,7 +97,7 @@ app/cursorjump/
     pill_render.rs tiny-skia renderer for one PillView                                                            (new)
     session_tasks.rs  one stream acceptor routing clipboard and file streams
   src/win/
-    dnd/mod.rs    cj-dnd STA thread, DndCmd/DndEv, finish_os_drag (E1)                                            (new)
+    dnd/mod.rs    cj-dnd STA thread, DndCmd/DndEv                                                                 (new)
     dnd/catcher.rs catcher window + IDropTarget + offer extraction + virtual-file spooling                        (new)
     dnd/source.rs DoDragDrop for drags arriving from the Mac: IDataObject, IDropSource                            (new)
     pill.rs       layered pill windows (cj-pill thread)                                                           (new)
@@ -120,8 +120,8 @@ docs/superpowers/progress/dnd-spike.md   spike findings (Task 1)                
 | A2 | A lazy `public.file-url` pasteboard item can block about 60 s at drop time | Task 15 | file-url after prefetch, pill shown during prefetch |
 | A3 | An `NSDraggingSession` starts from a CGEvent-posted LeftMouseDown on our panel, follows posted drags, drops on posted up, and Esc cancels it | Task 15 | stop and rethink with the user |
 | A4 | Windows targets accept our `IDataObject`, in some format order | Task 12 | the per-target order found |
-| A5 | `DoDragDrop` runs while the button is physically held but logically up, ending on our raw-input-driven `QueryContinueDrag` | Task 12 | Exception E2: one `MOUSEEVENTF_LEFTDOWN` before `DoDragDrop`. Ask the user before adding it. |
-| A6 | A 1/255-alpha layered topmost window gets `DragEnter` from Explorer, WhatsApp, browser and Discord drags, and E1 ends the source's drag with or without a drop | Task 11 | stop and rethink with the user |
+| A5 | `DoDragDrop` runs while Windows thinks the left button is up, ending on our raw-input-driven `QueryContinueDrag` | Task 12 | stop and rethink with the user (no input injection) |
+| A6 | A 1/255-alpha layered topmost window gets `DragEnter` from Explorer, WhatsApp, browser and Discord drags. Grown to the full screen, the user's real release over it ends the source's drag with `Drop` (accept mode) or without one (reject mode), and FILECONTENTS can be read inside `Drop` | Task 11 | stop and rethink with the user |
 | A7 | A near-transparent Mac panel at the edge gets drags from Finder, WhatsApp, browser and Discord, and a posted LeftMouseUp over it triggers `performDragOperation` | Task 16 | stop and rethink with the user |
 
 ---
@@ -135,12 +135,12 @@ Throwaway code, with no tests and no review gate beyond the user watching it wor
 - Create `docs/superpowers/progress/dnd-spike.md`.
 
 - [ ] **Step 1 (1a, PC):** Write `dnd_spike_win.rs`. It needs:
-  - **Catcher (A6):** a catcher window on the main monitor's right edge (2 px strip) that logs `DragEnter` formats and extracts CF_HDROP paths or FILEDESCRIPTORW/FILECONTENTS. A `--park` mode grows it to the full virtual screen and, after 3 s, ends the drag with one `SendInput` LEFTUP. Accept/reject is chosen by a flag.
-  - **Source (A4, A5):** a source mode where you hold the left button and press a hotkey. The program swallows the button with a temporary LL hook to reproduce the "logically up" state, then starts `DoDragDrop` with:
-    - (i) a lazy CF_HDROP whose `GetData` sleeps 60 s, then returns a 1 GB temp file;
+  - **Catcher (A6):** a catcher window on the main monitor's right edge (2 px strip) that logs `DragEnter` formats and extracts CF_HDROP paths or FILEDESCRIPTORW/FILECONTENTS. A `--park` mode grows it to the full virtual screen on `DragEnter`. The user then releases anywhere over it, which logs whether `Drop` was called, and reads FILECONTENTS inside `Drop`. Accept/reject is chosen by a flag. No hooks and no `SendInput`.
+  - **Source (A4, A5):** a source mode started by a hotkey with **no** mouse button held, so Windows thinks the button is up, which is A5's state. It starts `DoDragDrop` with:
+    - (i) a lazy CF_HDROP whose `GetData` sleeps 60 s, then returns a generated temp file (`--size-mb`; use about 5 MB for Gmail and Discord, which cap uploads);
     - (ii) FILEDESCRIPTORW/FILECONTENTS serving the same bytes from an `IStream`.
 
-    `QueryContinueDrag` follows raw-input left-button state.
+    `QueryContinueDrag` returns DROP on the next raw-input left-button up (the user clicks where they want to drop), and Esc cancels. No hooks and no `SendInput`.
 - [ ] **Step 2 (1a):** With the user, drag from Explorer, WhatsApp, Gmail (default browser) and Discord onto the catcher. Then drop the spike source into WhatsApp, Gmail, Discord, an Explorer folder, Downloads and the desktop, in both formats. Note:
   - whether the target freezes;
   - whether a 60 s wait survives;
@@ -239,8 +239,7 @@ PcEvent::MacLeave { frac, drag: Option<DragId> }
 PcEvent::DragDropped { drag: DragId }          // Mac: our outgoing drag was released on a target
 PcEvent::DragGone { drag: DragId }             // either drag ended without needing more from the machine (NotDropped, Finished, DoDragDrop returned)
 PcAction::EnterMac { mac_edge, frac, drag: Option<DragId> }
-PcAction::FinishSourceDrag { drag }            // dnd: spool virtual items, then E1 with accept
-PcAction::CancelSourceDrag { drag }            // dnd: E1 with reject; net: DragCancel{Cancelled}
+PcAction::CancelSourceDrag { drag }            // dnd: catcher to reject mode until the user's real release; net: DragCancel{Cancelled}
 PcAction::SourceDragHome { drag }              // dnd: catcher back to edge strip; the OS drag continues on the PC
 PcAction::StartIncomingDrag { drag }           // dnd: DoDragDrop with the Mac's offer
 PcAction::CancelIncomingDrag { drag }          // dnd: QueryContinueDrag → cancel
@@ -262,7 +261,7 @@ impl MacMachine { pub fn incoming(&self) -> Option<DragId>; }
 - **Mac leave.**
   - `MacLeave{drag: Some(id)}` where `id` is the outgoing drag: `[ReturnToPc, SourceDragHome{id}]`, riding cleared.
   - Any other `Some(id)`: `[ReturnToPc, StartIncomingDrag{id}]`, `riding = Incoming(id)`.
-- **Drops.** `DragDropped{id}` while `Outgoing(id)`: `[FinishSourceDrag{id}]`, riding cleared (`where_` stays Mac).
+- **Drops.** `DragDropped{id}` while `Outgoing(id)`: no actions, riding cleared (`where_` stays Mac). The PC's own OS drag already ended on the catcher when the user's real release passed through.
 - **Drag gone.** `DragGone{id}` clears a matching riding, with no actions.
 - **Forced return while Outgoing** (hotkey, hook lost, pause, `MacReady(false)`): `[SendReleaseAll, CancelSourceDrag, ReturnToPc]`.
 - **Disconnected.**
@@ -287,7 +286,7 @@ impl MacMachine { pub fn incoming(&self) -> Option<DragId>; }
     - `outgoing_drag_coming_home_continues_on_pc` (asserts `[ReturnToPc{..}, SourceDragHome{id}]`)
     - `mac_leave_with_foreign_drag_starts_incoming`
     - `incoming_drag_makes_the_edge_a_wall`
-    - `dropped_outgoing_finishes_source_drag_and_stays_on_mac`
+    - `dropped_outgoing_clears_riding_and_stays_on_mac`
     - `hotkey_during_outgoing_drag_cancels_before_return` (exact order)
     - `disconnect_during_outgoing_drag_cancels_before_return` (`[CancelSourceDrag, ReturnToPc, Reconnect]`)
     - `disconnect_during_incoming_drag_cancels_it`
@@ -688,14 +687,14 @@ fn stack_origin(work: Rect, scale: f32, index: usize) -> (i32, i32); // pure
 - Produces:
 ```rust
 // dnd/mod.rs
-pub enum DndCmd { CatcherZone(bool), Park(bool), Finish { drag: DragId }, Cancel { drag: DragId }, Home { drag: DragId },
+pub enum DndCmd { CatcherZone(bool), Park(bool), Cancel { drag: DragId }, Home { drag: DragId },
                   StartIncoming { drag: DragId, items: Vec<DragItem> }, CancelIncoming { drag: DragId } /* Task 12 */ }
 pub enum WinDndEv { Offer { drag: DragId, items: Vec<DragItem>, sources: Vec<Source> }, OfferGone { drag: DragId },
-                    Spooled { drag: DragId } /* virtual items written, OS drag ended */, IncomingEnded { drag: DragId, dropped: bool } /* Task 12 */,
+                    Spooled { drag: DragId } /* OS drag ended on the catcher, virtual items written */, IncomingEnded { drag: DragId, dropped: bool } /* Task 12 */,
                     Fetch { drag: DragId, item: u32, dir: PathBuf, reply: tokio::sync::oneshot::Sender<Result<PathBuf, FailReason>> } /* Task 12 */ }
-pub struct DndShared { pub offer: AtomicU64 /* 0 = none */, pub left_down: AtomicBool /* raw input, physical */ }
+pub struct DndShared { pub offer: AtomicU64 /* 0 = none */, pub left_down: AtomicBool /* raw input, physical */,
+                       pub pass_left_up: AtomicBool /* hook: let the next real left-up through to Windows */ }
 pub fn spawn_dnd_thread(cfg: Config, shared: Arc<DndShared>, events: impl Fn(WinDndEv) + Send + 'static) -> anyhow::Result<std::sync::mpsc::Sender<DndCmd>>; // "cj-dnd", OleInitialize (STA)
-fn finish_os_drag(accept: bool);  // Exception E1: one SendInput MOUSEEVENTF_LEFTUP; debug_assert park mode; info! log
 // catcher.rs
 fn strip_rect(monitor: Rect, side: Side) -> Rect;   // 2 px along the Mac edge, full edge length (pure)
 fn items_from_paths(paths: &[PathBuf]) -> Vec<DragItem>; // name, kind, size via metadata (pure, fs)
@@ -719,16 +718,19 @@ const SELF_FORMAT: &str = "CursorJump.Self";  // registered clipboard format mar
 
   Then store the `IDataObject`, set `shared.offer` to a fresh random id, emit `Offer`, and return `DROPEFFECT_COPY`. `DragOver` keeps returning COPY (or NONE in reject mode).
 - **`DragLeave`** when not parked: clear the offer and emit `OfferGone`.
-- **`Park(true)`** (on `EnterMac{drag: Some}`) grows the window to the virtual screen. `Park(false)` shrinks it back and hides it.
-- **`Finish{drag}`:**
-  1. For each pending item, read FILECONTENTS (`lindex` = descriptor index; `TYMED_ISTREAM` or `TYMED_HGLOBAL`) into `%LOCALAPPDATA%\CursorJump\outgoing\<drag>\<sanitized path>`, then resolve its watch.
-  2. Call `finish_os_drag(true)`; `Drop` returns `DROPEFFECT_COPY`.
+- **`Park(true)`** (on `EnterMac{drag: Some}`) grows the window to the virtual screen in accept mode, and sets `shared.pass_left_up`. `Park(false)` shrinks it back and hides it.
+- **`Drop`** (accept mode). Windows calls it when the user's real release passes through the hook:
+  1. For each pending item, read FILECONTENTS (`lindex` = descriptor index; `TYMED_ISTREAM` or `TYMED_HGLOBAL`) into `%LOCALAPPDATA%\CursorJump\outgoing\<drag>\<sanitized path>`, then resolve its watch. This has to happen inside `Drop`, because the source may free its data once the drag ends.
+  2. Return `DROPEFFECT_COPY`, never MOVE.
   3. `Park(false)`, then emit `Spooled`.
-- **`Cancel{drag}`:** reject mode, then `finish_os_drag(false)` (`DragOver` returns NONE, so there's no `Drop`), then `Park(false)`. Pending sources resolve to `Err(Cancelled)`.
-- **`Home{drag}`:** `Park(false)` and back to strip mode. The offer is cleared. The OS drag goes on locally.
+
+  The Mac's verdict (`DragDropped` or `DragFinished{NotDropped}`) arrives later. A not-dropped verdict drops the sources and the spool through `DndLink::on_finished`.
+- **`Cancel{drag}`** (a forced return while riding): switch to reject mode (`DragOver` returns NONE) and keep the window full-screen. The cursor comes home, the hooks come off, and the user's eventual real release reaches Windows with no `Drop`. On the `DragLeave` that follows, `Park(false)`. Pending sources resolve to `Err(Cancelled)`. Esc works as usual.
+- **`Home{drag}`:** `Park(false)`, clear `pass_left_up`, and go back to strip mode. The offer is cleared. The OS drag goes on locally.
 - **Input thread changes:**
   - **`EdgePush`:** set `offer` to `shared.offer` (nonzero) only when exactly the left button is held.
   - **Raw left button:** on every `WM_INPUT` mouse packet, `RI_MOUSE_LEFT_BUTTON_DOWN`/`UP` update `shared.left_down`.
+  - **Passing the real release through:** in the mouse hook, a `WM_LBUTTONUP` while `shared.pass_left_up` is set is forwarded to the Mac as today, and also passed on to Windows (`CallNextHookEx` instead of swallowing). Then the flag is cleared. Every other event is still swallowed. Nothing is injected.
   - **Parking:** unchanged. The full-screen catcher lies under the park point.
 - **Drag cursor at the park point:** if the spike found a drag cursor or drag image visible there, apply the fix recorded in `dnd-spike.md`. If none was found, accept it and log it in the ledger for the user.
 
@@ -737,11 +739,12 @@ const SELF_FORMAT: &str = "CursorJump.Self";  // registered clipboard format mar
   - `items_from_paths_files_and_dirs` (a tempdir);
   - `items_from_descriptors_groups_by_top_component`;
   - `catcher_zone_logic` (pure fn `fn in_catch_zone(edge: &Rect, side, x, y) -> bool`: 47 px in → true, 49 → false);
-  - `edge_push_offer_only_with_left_alone` (pure fn `fn offer_for(left: bool, others: bool, offer: u64) -> Option<DragId>`).
+  - `edge_push_offer_only_with_left_alone` (pure fn `fn offer_for(left: bool, others: bool, offer: u64) -> Option<DragId>`);
+  - `hook_passes_only_the_flagged_left_up` (pure fn `fn hook_verdict(msg: u32, pass_left_up: bool) -> (forward: bool, pass_to_windows: bool, clear_flag: bool)`, covering left-up with and without the flag, left-down and motion with the flag set).
 - [ ] **Step 2:** Run `cargo test -p cursorjump win::dnd win::input_thread`. Expected: FAIL.
 - [ ] **Step 3:** Implement.
 - [ ] **Step 4:** Run `cargo test -p cursorjump` and clippy. Expected: PASS. Then run the `#[ignore]` `smoke_catcher_logs_offer` with the user: drag a file from Explorer to the right edge (the app isn't running), and see the `Offer` logged with the right names and sizes.
-- [ ] **Step 5:** Commit `feat(win): edge catcher for drags leaving the PC (exception E1)`.
+- [ ] **Step 5:** Commit `feat(win): edge catcher for drags leaving the PC`.
 
 ---
 
@@ -788,7 +791,7 @@ fn hdrop_bytes(paths: &[PathBuf]) -> Vec<u8>;   // DROPFILES (fWide) + double-NU
 - **Per live session:** one `DndLink` and one `SharedPacer`, fed from every Pong (`Pacer::on_rtt`). The stream acceptor's `on_files` → `NetEv::Files`.
 - **`WinDndEv::Offer` / `OfferGone`:** keep the latest offer (items and sources). The input thread reads the atomic itself.
 - **`PcAction::EnterMac{drag: Some(id)}`:** `dnd.offer(id, items, sources)` (sends `DragOffer`), then `Control::Enter{.., drag: Some(id)}` on the same control stream.
-- **`FinishSourceDrag` / `CancelSourceDrag` / `SourceDragHome`:** `DndCmd::Finish` / `Cancel` / `Home`. `CancelSourceDrag` also sends `DragCancel{Cancelled}` if the link is up.
+- **`CancelSourceDrag` / `SourceDragHome`:** `DndCmd::Cancel` / `Home`. `CancelSourceDrag` also sends `DragCancel{Cancelled}` if the link is up.
 - **`StartIncomingDrag{id}`:** `DndCmd::StartIncoming{items: dnd.items(id)}` and `PillCmd::Start{at: cursor_pos}`, so the pill shows on the monitor where the drop happens.
 - **`WinDndEv::Fetch`:** `dnd.fetch(id, item, Dest::InDir(dir))`, with a reply on `DndEv::Received`.
 - **`IncomingEnded{dropped}`:**
@@ -984,6 +987,6 @@ fn in_catch_zone(bounds: Rectf, edge: Side, pos: (f64, f64)) -> bool;  // 48 pt 
   - cancel with ✕;
   - dragging back across the edge mid-drag, and Esc mid-drag (nothing dropped, nothing stuck);
   - the gaming wall during a drag, with Valorant or Roblox running in the background and no change in behaviour, and a Mac-to-PC copy finishing during a game, with the pill held back until Alt+Tab.
-- [ ] **Step 3:** Delete the spike examples. Update `HANDOFF.md`: what shipped, exception E1, the temp folders and their cleanup, the pacer constants and where to tune them, and the next step (the audio sharing plan, `docs/superpowers/specs/2026-10-25-audio-sharing-design.md`).
+- [ ] **Step 3:** Delete the spike examples. Update `HANDOFF.md`: what shipped, how a PC drag riding on the Mac ends (the real release passes through; nothing is injected), the temp folders and their cleanup, the pacer constants and where to tune them, and the next step (the audio sharing plan, `docs/superpowers/specs/2026-10-25-audio-sharing-design.md`).
 - [ ] **Step 4:** Run `cargo test --workspace` (on each machine) and clippy. Expected: PASS.
 - [ ] **Step 5:** Commit `docs: drag-and-drop acceptance and handoff`. Push.
