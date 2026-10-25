@@ -17,7 +17,9 @@ tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
 tray-icon = "0.26.1"
 
 [target."cfg(windows)".dependencies]
-windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input", "Win32_UI_Input_KeyboardAndMouse", "Win32_Graphics_Gdi", "Win32_UI_Shell", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_System_StationsAndDesktops", "Win32_UI_HiDpi", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_Registry", "Win32_System_Console", "Win32_Security"] }
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input", "Win32_UI_Input_KeyboardAndMouse", "Win32_Graphics_Gdi", "Win32_UI_Shell", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_System_StationsAndDesktops", "Win32_UI_HiDpi", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_Registry", "Win32_System_Console", "Win32_Security", "Win32_System_Ole", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_SystemServices", "Win32_Storage_FileSystem"] }
+# `#[implement]` (COM objects for drag-and-drop) expands to `::windows_core` paths.
+windows-core = "0.62.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 image = { version = "0.25", default-features = false, features = ["png", "tiff"] }
