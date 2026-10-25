@@ -120,7 +120,7 @@ docs/superpowers/progress/dnd-spike.md   spike findings (Task 1)                
 | A2 | A lazy `public.file-url` pasteboard item can block about 60 s at drop time | Task 15 | file-url after prefetch, pill shown during prefetch |
 | A3 | An `NSDraggingSession` starts from a CGEvent-posted LeftMouseDown on our panel, follows posted drags, drops on posted up, and Esc cancels it | Task 15 | stop and rethink with the user |
 | A4 | Windows targets accept our `IDataObject`, in some format order | Task 12 | the per-target order found |
-| A5 | `DoDragDrop` runs while Windows thinks the left button is up, ending on our raw-input-driven `QueryContinueDrag` | Task 12 | stop and rethink with the user (no input injection) |
+| A5 | ~~`DoDragDrop` runs while Windows thinks the left button is up~~ **Failed in the spike (no mouse input reaches OLE without a press on our own window). Replaced by Ruling R11 — see `docs/superpowers/progress/dnd-spike.md`:** the hook passes the real left down/up through to the catcher window under the park point, so `DoDragDrop` runs on the catcher thread with the button truly down | Tasks 11–13 | drop-on-release with no hover (when the park point isn't over our window) |
 | A6 | A 1/255-alpha layered topmost window gets `DragEnter` from Explorer, WhatsApp, browser and Discord drags. Grown to the full screen, the user's real release over it ends the source's drag with `Drop` (accept mode) or without one (reject mode), and FILECONTENTS can be read inside `Drop` | Task 11 | stop and rethink with the user |
 | A7 | A near-transparent Mac panel at the edge gets drags from Finder, WhatsApp, browser and Discord, and a posted LeftMouseUp over it triggers `performDragOperation` | Task 16 | stop and rethink with the user |
 
