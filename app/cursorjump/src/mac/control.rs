@@ -180,7 +180,7 @@ impl LogLimit {
 /// What the thread reports to the app's loop.
 #[derive(Debug, Clone, PartialEq)]
 pub enum InjectEv {
-    /// Send `Control::Leave { frac }` on session `sid`.
+    /// Send `Control::Leave` with `frac` on session `sid`.
     SendLeave { sid: u64, frac: f32 },
     /// The PC started (true) or stopped controlling this Mac.
     Controlled { sid: u64, on: bool },

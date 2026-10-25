@@ -86,19 +86,24 @@ pub fn sanitize_component(name: &str) -> String {
     truncate_keeping_extension(s)
 }
 
-/// `CON`, `com1.txt`, `Lpt9.tar.gz` and the like: Windows matches device
-/// names on the part before the first dot, ignoring trailing spaces.
+/// `CON`, `com1.txt`, `Lpt9.tar.gz`, `COM¹` and the like: Windows matches
+/// device names on the part before the first dot, ignoring trailing spaces.
 fn is_reserved(name: &str) -> bool {
     let stem = name.split('.').next().unwrap_or("");
     let stem = stem.trim_end_matches(' ').to_ascii_uppercase();
+    if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL") {
+        return true;
+    }
+    let Some(digit) = stem
+        .strip_prefix("COM")
+        .or_else(|| stem.strip_prefix("LPT"))
+    else {
+        return false;
+    };
+    let mut chars = digit.chars();
     matches!(
-        stem.as_bytes(),
-        b"CON"
-            | b"PRN"
-            | b"AUX"
-            | b"NUL"
-            | [b'C', b'O', b'M', b'1'..=b'9']
-            | [b'L', b'P', b'T', b'1'..=b'9']
+        (chars.next(), chars.next()),
+        (Some('1'..='9' | '¹' | '²' | '³'), None)
     )
 }
 
@@ -161,6 +166,14 @@ mod tests {
             ("console", "console"),
             ("a\u{0}b\u{1f}c", "a_b_c"),
             ("...", "_"),
+            ("COM¹.txt", "_COM¹.txt"),
+            ("com²", "_com²"),
+            ("COM³ .tar.gz", "_COM³ .tar.gz"),
+            ("Lpt¹", "_Lpt¹"),
+            ("LPT²", "_LPT²"),
+            ("lpt³.log", "_lpt³.log"),
+            ("COM⁴", "COM⁴"),
+            ("COM¹¹", "COM¹¹"),
         ] {
             assert_eq!(sanitize_component(input), want, "input {input:?}");
         }
@@ -168,9 +181,33 @@ mod tests {
         let long = format!("{}.mp4", "x".repeat(296));
         assert_eq!(long.chars().count(), 300);
         let got = sanitize_component(&long);
-        assert!(got.ends_with(".mp4"), "{got}");
+        assert_eq!(got, format!("{}.mp4", "x".repeat(251)));
         assert!(got.len() <= 255, "{} bytes", got.len());
         assert!(got.encode_utf16().count() <= 255);
+    }
+
+    #[test]
+    fn long_name_drops_an_extension_it_cannot_keep() {
+        let within = |s: &str| s.len() <= 255 && s.encode_utf16().count() <= 255;
+        // Over 16 bytes: not an extension, the whole name is cut.
+        let got = sanitize_component(&format!("{}.averyveryverylongext", "x".repeat(300)));
+        assert!(within(&got));
+        assert_eq!(got, "x".repeat(255));
+        // A leading dot is not an extension either.
+        let got = sanitize_component(&format!(".{}", "x".repeat(300)));
+        assert!(within(&got));
+        assert_eq!(got, format!(".{}", "x".repeat(254)));
+    }
+
+    #[test]
+    fn cut_without_extension_strips_the_new_trailing_dots_and_spaces() {
+        // The cut lands right after " .", then right after a space.
+        let got = sanitize_component(&format!("{} .{}", "a".repeat(253), "b".repeat(30)));
+        assert_eq!(got, "a".repeat(253));
+        let got = sanitize_component(&format!("{} {}", "a".repeat(254), "b".repeat(50)));
+        assert_eq!(got, "a".repeat(254));
+        // Nothing left after stripping.
+        assert_eq!(sanitize_component(&format!("{}x", " ".repeat(300))), "_");
     }
 
     #[test]
@@ -184,8 +221,13 @@ mod tests {
             None
         );
 
+        let all_normal = |p: &std::path::Path| {
+            p.is_relative()
+                && p.components()
+                    .all(|c| matches!(c, std::path::Component::Normal(_)))
+        };
         let p = safe_rel_path(&parts(&["Photos", "a:b.jpg"])).unwrap();
-        assert!(p.is_relative());
+        assert!(all_normal(&p));
         assert_eq!(p, std::path::Path::new("Photos").join("a_b.jpg"));
 
         for abs in [
@@ -193,7 +235,7 @@ mod tests {
             &["C:", "x"],
             &["\\\\server", "share"],
         ] {
-            assert!(safe_rel_path(&parts(abs)).unwrap().is_relative(), "{abs:?}");
+            assert!(all_normal(&safe_rel_path(&parts(abs)).unwrap()), "{abs:?}");
         }
         assert_eq!(
             safe_rel_path(&vec!["d".to_string(); MAX_PATH_DEPTH]).map(|p| p.components().count()),
