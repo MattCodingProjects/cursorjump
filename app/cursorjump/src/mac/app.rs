@@ -563,7 +563,10 @@ impl App {
                     return;
                 };
                 // Awaited here, outside any select!: send_control is not cancel-safe.
-                if let Err(e) = session.send_control(&Control::Leave { frac }).await {
+                if let Err(e) = session
+                    .send_control(&Control::Leave { frac, drag: None })
+                    .await
+                {
                     info!("disconnected: control stream: {e:#}");
                     self.set_conn(Conn::Waiting);
                 }

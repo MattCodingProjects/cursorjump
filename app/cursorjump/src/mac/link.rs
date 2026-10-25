@@ -27,7 +27,7 @@ const DECLINE_FLUSH: Duration = Duration::from_secs(1);
 /// Input for the injection thread, or (Err) a message for the loop.
 pub(super) fn route_control(c: Control) -> Result<Input, Control> {
     match c {
-        Control::Enter { edge, frac } => Ok(Input::Enter { edge, frac }),
+        Control::Enter { edge, frac, .. } => Ok(Input::Enter { edge, frac }),
         Control::Button { button, down } => Ok(Input::Button { button, down }),
         Control::Key { mac_keycode, down } => Ok(Input::Key { mac_keycode, down }),
         Control::ReleaseAll => Ok(Input::ReleaseAll),
@@ -226,7 +226,8 @@ mod tests {
         assert_eq!(
             route_control(Control::Enter {
                 edge: Side::Left,
-                frac: 0.25
+                frac: 0.25,
+                drag: None
             }),
             Ok(Input::Enter {
                 edge: Side::Left,
@@ -256,7 +257,10 @@ mod tests {
         assert_eq!(route_control(Control::ReleaseAll), Ok(Input::ReleaseAll));
         for other in [
             Control::PairConfirm { accepted: true },
-            Control::Leave { frac: 0.5 },
+            Control::Leave {
+                frac: 0.5,
+                drag: None,
+            },
         ] {
             assert_eq!(route_control(other.clone()), Err(other));
         }
@@ -452,6 +456,7 @@ mod tests {
                 Control::Enter {
                     edge: Side::Left,
                     frac: 0.25,
+                    drag: None,
                 },
                 Control::Key {
                     mac_keycode: 0x00,

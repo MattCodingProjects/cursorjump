@@ -361,6 +361,7 @@ impl App {
                 self.control(Control::Enter {
                     edge: mac_edge,
                     frac,
+                    drag: None,
                 })
                 .await;
             }
@@ -440,7 +441,7 @@ impl App {
 
     fn on_net(&mut self, ev: NetEv) {
         match ev {
-            NetEv::Control(Control::Leave { frac }) => self.feed(PcEvent::MacLeave { frac }),
+            NetEv::Control(Control::Leave { frac, .. }) => self.feed(PcEvent::MacLeave { frac }),
             NetEv::Control(Control::MacReady { ready }) => {
                 if ready != self.machine.mac_ready() {
                     info!(ready, "the Mac's readiness changed");

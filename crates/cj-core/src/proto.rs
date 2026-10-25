@@ -1,10 +1,11 @@
 //! Wire protocol shared by the PC and the Mac client.
 
+use crate::dnd::{DragId, DragItem, DragOutcome, FailReason};
 use serde::{Deserialize, Serialize};
 
 /// Peers must match exactly. 2: `Control::MacReady`, which a v1 peer
-/// cannot decode (an undecodable message ends the session).
-pub const PROTOCOL_VERSION: u16 = 2;
+/// cannot decode (an undecodable message ends the session). 3: drag-and-drop.
+pub const PROTOCOL_VERSION: u16 = 3;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MouseButton {
@@ -68,14 +69,18 @@ pub enum Control {
     PairReveal {
         nonce: [u8; 32],
     },
-    /// PC to Mac: edge of the Mac screen being entered.
+    /// PC to Mac: edge of the Mac screen being entered. `drag`: the
+    /// `DragOffer` this crossing carries.
     Enter {
         edge: Side,
         frac: f32,
+        drag: Option<DragId>,
     },
-    /// Mac to PC: fraction along the Mac's entry edge.
+    /// Mac to PC: fraction along the Mac's entry edge. `drag`: the
+    /// `DragOffer` this crossing carries.
     Leave {
         frac: f32,
+        drag: Option<DragId>,
     },
     Button {
         button: MouseButton,
@@ -90,10 +95,34 @@ pub enum Control {
     ReleaseAll,
     /// Mac to PC: whether the Mac can take the cursor (it has the
     /// Accessibility permission). Sent when a paired session starts and
-    /// whenever it changes. Must stay the last variant: postcard encodes the
-    /// variant index.
+    /// whenever it changes.
     MacReady {
         ready: bool,
+    },
+    // Drag-and-drop. New variants go last: postcard encodes the variant index.
+    /// Origin to receiver, just before the crossing that carries it.
+    DragOffer {
+        drag: DragId,
+        items: Vec<DragItem>,
+    },
+    /// Either side.
+    DragCancel {
+        drag: DragId,
+        reason: FailReason,
+    },
+    /// Receiver to origin: released on a target that accepted.
+    DragDropped {
+        drag: DragId,
+    },
+    /// Receiver to origin.
+    FileFetch {
+        drag: DragId,
+        item: u32,
+    },
+    /// Receiver to origin: the final result; the origin frees its temp files.
+    DragFinished {
+        drag: DragId,
+        outcome: DragOutcome,
     },
 }
 
@@ -128,6 +157,7 @@ pub fn decode_control_body(b: &[u8]) -> Result<Control, ProtoError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dnd::ItemKind;
 
     #[test]
     fn datagram_roundtrip_all_variants() {
@@ -184,8 +214,21 @@ mod tests {
             Control::Enter {
                 edge: Side::Left,
                 frac: 0.25,
+                drag: None,
             },
-            Control::Leave { frac: 1.0 },
+            Control::Enter {
+                edge: Side::Top,
+                frac: 0.5,
+                drag: Some(7),
+            },
+            Control::Leave {
+                frac: 1.0,
+                drag: None,
+            },
+            Control::Leave {
+                frac: 0.0,
+                drag: Some(7),
+            },
             Control::Button {
                 button: MouseButton::Forward,
                 down: true,
@@ -197,6 +240,50 @@ mod tests {
             Control::ReleaseAll,
             Control::MacReady { ready: false },
             Control::MacReady { ready: true },
+            Control::DragOffer {
+                drag: 7,
+                items: vec![
+                    DragItem {
+                        name: "Photos".into(),
+                        kind: ItemKind::Dir,
+                        size: None,
+                    },
+                    DragItem {
+                        name: "".into(),
+                        kind: ItemKind::File,
+                        size: Some(u64::MAX),
+                    },
+                ],
+            },
+            Control::DragCancel {
+                drag: 7,
+                reason: FailReason::Unreadable {
+                    name: "a.txt".into(),
+                },
+            },
+            Control::DragCancel {
+                drag: u64::MAX,
+                reason: FailReason::Cancelled,
+            },
+            Control::DragDropped { drag: 7 },
+            Control::FileFetch {
+                drag: 7,
+                item: u32::MAX,
+            },
+            Control::DragFinished {
+                drag: 7,
+                outcome: DragOutcome::Done,
+            },
+            Control::DragFinished {
+                drag: 7,
+                outcome: DragOutcome::NotDropped,
+            },
+            Control::DragFinished {
+                drag: 7,
+                outcome: DragOutcome::Failed(FailReason::Changed {
+                    name: "東京.mov".into(),
+                }),
+            },
         ];
         for c in all {
             let enc = encode_control(&c);
@@ -215,6 +302,20 @@ mod tests {
         assert_eq!(
             &encode_control(&Control::MacReady { ready: true })[4..],
             &[10, 1]
+        );
+        assert_eq!(
+            encode_control(&Control::DragOffer {
+                drag: 1,
+                items: vec![]
+            })[4],
+            11
+        );
+        assert_eq!(
+            encode_control(&Control::DragFinished {
+                drag: 1,
+                outcome: DragOutcome::Done
+            })[4],
+            15
         );
     }
 

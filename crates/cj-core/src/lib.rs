@@ -1,6 +1,7 @@
 //! Core types and logic for CursorJump.
 pub mod clipboard;
 pub mod config;
+pub mod dnd;
 pub mod gaming;
 pub mod input;
 pub mod keymap;
