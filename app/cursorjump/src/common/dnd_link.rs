@@ -581,10 +581,14 @@ impl DndLink {
         outcome: DragOutcome,
     ) -> bool {
         self.offered.remove(&drag);
-        let Some(inc) = self.lock().incoming.remove(&drag) else {
+        let Some(mut inc) = self.lock().incoming.remove(&drag) else {
             return false;
         };
         inc.cancel.cancel();
+        // Its pending flush will find the drag gone.
+        if let Some((done, total)) = inc.tally.held() {
+            self.shared.emit(DndEv::Progress { drag, done, total });
+        }
         let why = leftover.or(inc.reason).unwrap_or(FailReason::Cancelled);
         for item in inc.fetches.into_keys() {
             let result = Err(why.clone());
@@ -724,12 +728,7 @@ impl Tally {
     /// `PROGRESS_EVERY`; one that comes sooner is to be reported once that
     /// has passed.
     fn report(&mut self, now: Instant) -> Report {
-        let done = self.done.iter().fold(0u64, |a, d| a.saturating_add(*d));
-        let total = self
-            .sizes
-            .iter()
-            .try_fold(0u64, |a, s| Some(a.saturating_add((*s)?)));
-        let value = (done, total);
+        let value = self.sample();
         match self.last {
             Some((_, said)) if said == value => Report::Not,
             Some((at, _)) if now.saturating_duration_since(at) < PROGRESS_EVERY => {
@@ -750,6 +749,26 @@ impl Tally {
     /// The report a throttled change waited for is being made.
     fn flushed(&mut self) {
         self.flushing = false;
+    }
+
+    /// The change a throttled report holds back, if any, to send now
+    /// instead of at its flush.
+    fn held(&mut self) -> Option<Sample> {
+        if !std::mem::take(&mut self.flushing) {
+            return None;
+        }
+        let value = self.sample();
+        let said = self.last.map(|(_, said)| said);
+        (said != Some(value)).then_some(value)
+    }
+
+    fn sample(&self) -> Sample {
+        let done = self.done.iter().fold(0u64, |a, d| a.saturating_add(*d));
+        let total = self
+            .sizes
+            .iter()
+            .try_fold(0u64, |a, s| Some(a.saturating_add((*s)?)));
+        (done, total)
     }
 }
 
@@ -1706,5 +1725,46 @@ mod tests {
         p.receiver.link.fetch(14, 0, into).await.unwrap();
         p.until(|p| !p.received(14, 0).is_empty()).await;
         assert_eq!(p.received(14, 0), [&Err(why)]);
+    }
+
+    /// A drag finished while its last progress is still held back by the
+    /// throttle sends that progress first.
+    #[tokio::test]
+    async fn held_progress_is_sent_before_the_drag_finishes() {
+        let (src, dest) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let small = write(src.path(), "small.txt", 2000, 17);
+        let mut p = Pair::new().await;
+        p.offer(
+            15,
+            vec![file("small.txt", 2000)],
+            vec![Source::Ready(small)],
+        )
+        .await;
+        let into = Dest::InDir(dest.path().into());
+        p.receiver.link.fetch(15, 0, into).await.unwrap();
+        p.until(|p| !p.received(15, 0).is_empty()).await;
+        // Within 100 ms of the first report, the last one is held back.
+        let done = Some((2000, Some(2000)));
+        assert_ne!(
+            p.last_progress(15),
+            done,
+            "sent before the test could see it held"
+        );
+
+        let outcome = DragOutcome::Done;
+        p.receiver.link.finish(15, outcome.clone()).await.unwrap();
+        p.until(|p| !p.finished(At::Receiver, 15).is_empty()).await;
+        p.pump_for(Duration::from_millis(200)).await;
+        assert_eq!(p.last_progress(15), done);
+        let at = |want: fn(&DndEv) -> bool| {
+            p.events
+                .iter()
+                .rposition(|(a, e, _)| *a == At::Receiver && want(e))
+                .unwrap()
+        };
+        let progress = at(|e| matches!(e, DndEv::Progress { drag: 15, .. }));
+        let finished = at(|e| matches!(e, DndEv::Finished { drag: 15, .. }));
+        assert!(progress < finished, "progress after the drag finished");
+        assert_eq!(p.finished(At::Receiver, 15), [&outcome]);
     }
 }
