@@ -798,7 +798,7 @@ pub fn incoming_outcome(
 mod tests {
     use super::*;
     use crate::common::session_tasks::{ClipboardOut, spawn_stream_tasks};
-    use crate::common::transfer::{CHUNK, hooks};
+    use crate::common::transfer::CHUNK;
     use cj_core::dnd::{FileEntry, FilesHeader, ItemKind};
     use cj_core::pacer::Pacer;
     use cj_core::proto::Control;
@@ -901,6 +901,8 @@ mod tests {
         /// While set, Controls for the receiver wait in `held`.
         hold: bool,
         held: Vec<Control>,
+        /// Every files stream the receiver's link was given.
+        streams: Vec<(DragId, u32)>,
     }
 
     impl Pair {
@@ -914,6 +916,7 @@ mod tests {
                 controls: Vec::new(),
                 hold: false,
                 held: Vec::new(),
+                streams: Vec::new(),
             }
         }
 
@@ -938,7 +941,13 @@ mod tests {
             match got {
                 Got::Control(At::Receiver, c) if self.hold => self.held.push(c),
                 Got::Control(to, c) => self.deliver(to, c),
-                Got::Files(to, f) => self.side(to).link.on_files(f),
+                Got::Files(to, f) => {
+                    if to == At::Receiver {
+                        let h = f.header();
+                        self.streams.push((h.drag, h.item));
+                    }
+                    self.side(to).link.on_files(f);
+                }
                 Got::Event(at, e) => self.events.push((at, e, Instant::now())),
                 Got::Tick => {}
             }
@@ -1532,9 +1541,13 @@ mod tests {
         f.write_all(&[0; 1024]).unwrap();
     }
 
-    /// The origin's reason for resetting a stream, not "Cancelled", reaches
-    /// the receiver, whichever of the reset and the DragCancel arrives
-    /// first; with no reason in time, it is Cancelled.
+    /// The origin's reason for failing an item, not "Cancelled", reaches
+    /// the receiver whichever of the stream's reset and the DragCancel
+    /// arrives first, and when no stream arrived at all; with no reason in
+    /// time after a reset, it is Cancelled. The file that changes grows
+    /// only once its item is under way, so the receiver has its stream: a
+    /// failure at once could reset it before the receiver's acceptor reads
+    /// it, leaving no stream at all, which is the third case.
     #[tokio::test]
     async fn origin_failure_reason_reaches_receiver() {
         let (src, dest) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
@@ -1542,27 +1555,27 @@ mod tests {
         let mut p = Pair::new().await;
 
         // The reset first: the DragCancel is held until the receiver has
-        // seen the stream fail.
-        let growing = write(src.path(), "growing.log", CHUNK * 4, 11);
-        hooks::AFTER_READ
-            .lock()
-            .unwrap()
-            .push((growing.clone(), grow));
+        // had time to see the stream fail.
+        let growing = write(src.path(), "growing.log", BIG, 11);
         p.offer(
             31,
-            vec![file("growing.log", CHUNK * 4)],
-            vec![Source::Ready(growing)],
+            vec![file("growing.log", BIG)],
+            vec![Source::Ready(growing.clone())],
         )
         .await;
         let into = Dest::InDir(dest.path().into());
         p.receiver.link.fetch(31, 0, into).await.unwrap();
         p.hold = true;
+        p.until(|p| p.has_progress(31)).await;
+        grow(&growing);
         p.until(|p| !p.finished(At::Origin, 31).is_empty()).await;
         p.pump_for(Duration::from_millis(300)).await;
         assert!(p.received(31, 0).is_empty(), "{:?}", p.received(31, 0));
         p.release();
         p.until(|p| !p.received(31, 0).is_empty()).await;
         assert_eq!(p.received(31, 0), [&Err(changed("growing.log"))]);
+        let failed = DragOutcome::Failed(changed("growing.log"));
+        assert_eq!(p.finished(At::Origin, 31), [&failed]);
 
         // The DragCancel first: it arrives while the item is still coming.
         let big = write(src.path(), "big.iso", BIG, 12);
@@ -1575,18 +1588,41 @@ mod tests {
         p.until(|p| !p.received(32, 0).is_empty()).await;
         assert_eq!(p.received(32, 0), [&Err(changed("big.iso"))]);
 
+        // No stream at all: the file can't be opened, so the origin fails
+        // before it opens one, and only the DragCancel settles the fetch.
+        let missing = src.path().join("missing.txt");
+        p.offer(
+            34,
+            vec![file("missing.txt", 10)],
+            vec![Source::Ready(missing)],
+        )
+        .await;
+        let into = Dest::InDir(dest.path().into());
+        p.receiver.link.fetch(34, 0, into).await.unwrap();
+        p.hold = true;
+        p.until(|p| !p.finished(At::Origin, 34).is_empty()).await;
+        p.pump_for(Duration::from_millis(200)).await;
+        assert!(!p.streams.contains(&(34, 0)), "a stream was opened");
+        assert!(p.received(34, 0).is_empty(), "{:?}", p.received(34, 0));
+        p.release();
+        p.until(|p| !p.received(34, 0).is_empty()).await;
+        assert_eq!(p.received(34, 0), [&Err(unreadable("missing.txt"))]);
+        let failed = DragOutcome::Failed(unreadable("missing.txt"));
+        assert_eq!(p.finished(At::Origin, 34), [&failed]);
+
         // No reason in time.
-        let late = write(src.path(), "late.log", CHUNK * 4, 13);
-        hooks::AFTER_READ.lock().unwrap().push((late.clone(), grow));
+        let late = write(src.path(), "late.log", BIG, 13);
         p.offer(
             33,
-            vec![file("late.log", CHUNK * 4)],
-            vec![Source::Ready(late)],
+            vec![file("late.log", BIG)],
+            vec![Source::Ready(late.clone())],
         )
         .await;
         let into = Dest::InDir(dest.path().into());
         p.receiver.link.fetch(33, 0, into).await.unwrap();
         p.hold = true;
+        p.until(|p| p.has_progress(33)).await;
+        grow(&late);
         p.until(|p| !p.received(33, 0).is_empty()).await;
         assert_eq!(p.received(33, 0), [&Err(FailReason::Cancelled)]);
         p.release();
