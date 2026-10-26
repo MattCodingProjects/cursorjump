@@ -6,9 +6,12 @@
 //!
 //! Plain GETs over http or https only (redirects too, at most 5), with no
 //! cookies or credentials and `User-Agent: CursorJump`. TLS is rustls on
-//! ring with the Mozilla root store (webpki-roots), the same on both OSes.
-//! Only a URL's host is ever logged: Discord's CDN links carry signed
-//! tokens in their query.
+//! ring; certificates are checked against the OS trust store
+//! (rustls-platform-verifier: CryptoAPI on Windows, Security.framework on
+//! macOS), so a root that antivirus HTTPS scanning or a company installs is
+//! trusted as the browser trusts it (R41). Only a URL's host is ever
+//! logged: Discord's CDN links carry signed tokens in their query (main.rs
+//! also keeps ureq's own logging below trace, where it would print paths).
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::Path;
@@ -16,6 +19,7 @@ use std::time::Duration;
 
 use tracing::debug;
 use ureq::http::Uri;
+use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
 
 use super::transfer::{PartGuard, part_name};
 
@@ -95,19 +99,28 @@ fn fetch_with(
         .timeout_connect(Some(limits.connect))
         .timeout_per_read(Some(limits.stall))
         .user_agent("CursorJump")
+        .tls_config(
+            TlsConfig::builder()
+                .provider(TlsProvider::Rustls)
+                .root_certs(RootCerts::PlatformVerifier)
+                .build(),
+        )
         .build()
         .into();
+    // `cancelled` is first asked once the headers are in: until then the
+    // call is bounded by the connect timeout and by `stall` per read (per
+    // redirect), so a server trickling its headers can hold it longer.
     let response = agent.get(uri).call().map_err(network)?;
     let status = response.status().as_u16();
     if !(200..300).contains(&status) {
         debug!(%host, status, "link: refused");
         return Err(LinkError::Http(status));
     }
-    let said = response
-        .headers()
-        .get("content-length")
-        .and_then(|v| v.to_str().ok()?.trim().parse::<u64>().ok());
-    if said.is_some_and(|n| n > max_bytes) {
+    if response
+        .body()
+        .content_length()
+        .is_some_and(|n| n > max_bytes)
+    {
         return Err(LinkError::TooLarge);
     }
     let mut body = response.into_body().into_reader();
@@ -144,18 +157,21 @@ fn fetch_with(
     Ok(total)
 }
 
-/// `url` if it is http or https with a host and no credentials.
+/// `url` if it is http or https with a host and no credentials, in the
+/// ASCII form a request needs: an IDN host in punycode, a Unicode path or
+/// query percent-encoded, no fragment.
 fn checked_uri(url: &str) -> Option<Uri> {
-    let uri: Uri = url.parse().ok()?;
-    let scheme = uri.scheme_str()?;
-    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+    let mut parsed = url::Url::parse(url.trim()).ok()?;
+    // The url crate lowercases the scheme.
+    if !matches!(parsed.scheme(), "http" | "https")
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.host_str().is_none_or(str::is_empty)
+    {
         return None;
     }
-    let authority = uri.authority()?;
-    if authority.as_str().contains('@') || authority.host().is_empty() {
-        return None;
-    }
-    Some(uri)
+    parsed.set_fragment(None);
+    parsed.as_str().parse().ok()
 }
 
 /// A request that failed, in words that never hold the URL.
@@ -212,9 +228,9 @@ pub fn shortcut_url(contents: &[u8]) -> Option<String> {
 
 /// A URL's host, for the log ("?" if there is none).
 pub fn url_host(url: &str) -> String {
-    url.parse::<Uri>()
+    url::Url::parse(url.trim())
         .ok()
-        .and_then(|u| u.host().map(str::to_string))
+        .and_then(|u| u.host_str().map(str::to_string))
         .unwrap_or_else(|| "?".into())
 }
 
@@ -413,11 +429,24 @@ mod tests {
         assert_eq!(std::fs::read(&dest).unwrap(), b"png!");
         let heads = server.join().unwrap();
         assert!(heads[1].starts_with("GET /real.png "), "{}", heads[1]);
-        // At most 5 redirects.
-        let (base, _server) = serve(|base| {
-            let to = format!("Location: {base}/again\r\nContent-Length: 0\r\n");
-            (0..7).map(|_| now(head("302 Found", &to))).collect()
-        });
+        // Exactly 5 redirects are followed...
+        let hops = |n: usize| {
+            move |base: &str| {
+                let to = format!("Location: {base}/again\r\nContent-Length: 0\r\n");
+                let mut replies: Vec<Reply> = (0..n).map(|_| now(head("302 Found", &to))).collect();
+                replies.push(ok_body(b"end"));
+                replies
+            }
+        };
+        let (base, _server) = serve(hops(5));
+        let five = dest.with_file_name("five");
+        assert_eq!(
+            fetch_link(&format!("{base}/again"), &five, LINK_MAX_BYTES, &never).unwrap(),
+            3
+        );
+        std::fs::remove_file(&five).unwrap();
+        // ...and a 6th fails.
+        let (base, _server) = serve(hops(6));
         let got = fetch_link(
             &format!("{base}/again"),
             &dest.with_file_name("y"),
@@ -512,10 +541,9 @@ mod tests {
     #[test]
     fn error_kinds_never_hold_the_url() {
         let secret = "https://cdn.example/a.png?hm=secret";
-        let (base, server) = serve(|_| vec![]);
-        // Nobody listens once it is done: a network error, in words that
-        // carry no URL.
-        server.join().unwrap();
+        // The server reads the request and hangs up without an answer: a
+        // network error, in words that carry no URL.
+        let (base, _server) = serve(|_| vec![vec![]]);
         let dir = tempfile::tempdir().unwrap();
         let got = fetch_link(
             &format!("{base}/a.png?hm=secret"),
@@ -538,6 +566,73 @@ mod tests {
         for k in kinds {
             assert!(!k.contains("secret") && !k.contains(secret), "{k}");
         }
+    }
+
+    #[test]
+    fn a_body_cut_short_fails_and_cleans_up() {
+        let (base, _server) =
+            serve(|_| vec![now(head("200 OK", "Content-Length: 10\r\n") + "abcd")]);
+        let dir = tempfile::tempdir().unwrap();
+        let got = fetch_link(
+            &format!("{base}/short"),
+            &dir.path().join("short"),
+            LINK_MAX_BYTES,
+            &never,
+        );
+        assert!(matches!(got, Err(LinkError::Network(_))), "{got:?}");
+        assert!(names(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn non_ascii_urls_are_encoded_for_the_request() {
+        // An IDN host in punycode; a Unicode path and query percent-encoded.
+        let uri = checked_uri("https://bücher.example/ä.png?q=ü#frag").unwrap();
+        assert_eq!(uri.host(), Some("xn--bcher-kva.example"));
+        assert_eq!(uri.path(), "/%C3%A4.png");
+        assert_eq!(uri.query(), Some("q=%C3%BC"));
+        assert_eq!(
+            url_host("https://bücher.example/ä"),
+            "xn--bcher-kva.example"
+        );
+        // And they download.
+        let (base, server) = serve(|_| vec![ok_body(b"jpg")]);
+        let dir = tempfile::tempdir().unwrap();
+        let got = fetch_link(
+            &format!("{base}/картинка.jpg?q=ü"),
+            &dir.path().join("картинка.jpg"),
+            LINK_MAX_BYTES,
+            &never,
+        );
+        assert_eq!(got.unwrap(), 3);
+        let heads = server.join().unwrap();
+        assert!(
+            heads[0]
+                .starts_with("GET /%D0%BA%D0%B0%D1%80%D1%82%D0%B8%D0%BD%D0%BA%D0%B0.jpg?q=%C3%BC "),
+            "{}",
+            heads[0]
+        );
+    }
+
+    /// A real https download, checked against the OS trust store.
+    /// `CJ_LINK_URL` picks the link (default: the Rust logo).
+    #[test]
+    #[ignore = "needs the internet"]
+    fn smoke_fetches_over_https_with_the_os_trust_store() {
+        let url = std::env::var("CJ_LINK_URL")
+            .unwrap_or_else(|_| "https://www.rust-lang.org/static/images/rust-logo-blk.svg".into());
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = fetch_link(&url, &dir.path().join("fetched"), LINK_MAX_BYTES, &never)
+            .unwrap_or_else(|e| panic!("{}: {}", url_host(&url), e.kind()));
+        eprintln!("smoke: {} bytes from {}", bytes, url_host(&url));
+        assert!(bytes > 0);
+        // A certificate no OS trusts is refused.
+        let got = fetch_link(
+            "https://self-signed.badssl.com/",
+            &dir.path().join("bad"),
+            LINK_MAX_BYTES,
+            &never,
+        );
+        assert!(matches!(got, Err(LinkError::Network(_))), "{got:?}");
     }
 
     #[test]

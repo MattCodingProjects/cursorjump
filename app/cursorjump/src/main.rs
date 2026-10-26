@@ -14,6 +14,7 @@ use std::fs::{File, OpenOptions};
 
 use tracing::error;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::filter::LevelFilter;
 
 /// The app's log file is moved aside at startup once it is this large.
 const LOG_ROTATE_BYTES: u64 = 4 * 1024 * 1024;
@@ -93,7 +94,7 @@ fn fail(text: &str) {
 /// `cursorjump.log` in the config directory, because on Windows it has no
 /// console and on macOS launchd discards its stderr.
 fn init_logging(app: bool) {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = log_filter(EnvFilter::try_from_default_env().ok());
     let builder = tracing_subscriber::fmt().with_env_filter(filter);
     let to_file = app
         && cfg!(all(
@@ -111,6 +112,25 @@ fn init_logging(app: bool) {
             builder.init();
         }
     }
+}
+
+/// `RUST_LOG` if set, else "info". ureq and ureq-proto never log at trace,
+/// whatever `RUST_LOG` says: at trace they print request paths and queries,
+/// and a dragged link's query (a Discord CDN URL) is a signed token. At
+/// debug ureq masks the path.
+fn log_filter(from_env: Option<EnvFilter>) -> EnvFilter {
+    let mut filter = from_env.unwrap_or_else(|| EnvFilter::new("info"));
+    // Only when something may log at trace, so a quieter filter stays as it is.
+    if filter
+        .max_level_hint()
+        .is_none_or(|max| max == LevelFilter::TRACE)
+    {
+        for cap in ["ureq=debug", "ureq_proto=debug"] {
+            // Replaces any directive for the same target.
+            filter = filter.add_directive(cap.parse().expect("a valid directive"));
+        }
+    }
+    filter
 }
 
 /// Logs every panic through `tracing` too: release builds have no stderr
@@ -189,6 +209,34 @@ mod tests {
 
     fn args(a: &[&str]) -> Vec<String> {
         a.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Which of ureq trace, ureq debug and our own trace `env` enables.
+    fn ureq_levels(env: Option<&str>) -> [bool; 3] {
+        use tracing::Level;
+        use tracing_subscriber::prelude::*;
+        let filter = log_filter(env.map(EnvFilter::new));
+        let subscriber = tracing_subscriber::registry().with(filter);
+        tracing::subscriber::with_default(subscriber, || {
+            [
+                tracing::enabled!(target: "ureq::unversioned::transport", Level::TRACE),
+                tracing::enabled!(target: "ureq::run", Level::DEBUG),
+                tracing::enabled!(target: "cursorjump::common", Level::TRACE),
+            ]
+        })
+    }
+
+    #[test]
+    fn ureq_never_logs_at_trace() {
+        assert_eq!(ureq_levels(Some("trace")), [false, true, true]);
+        assert_eq!(ureq_levels(Some("info,ureq=trace")), [false, true, false]);
+        assert_eq!(
+            ureq_levels(Some("ureq_proto=trace,ureq=trace")),
+            [false, true, false]
+        );
+        // A quieter filter is left alone: no ureq debug under plain info.
+        assert_eq!(ureq_levels(None), [false, false, false]);
+        assert_eq!(ureq_levels(Some("debug")), [false, true, false]);
     }
 
     #[test]
