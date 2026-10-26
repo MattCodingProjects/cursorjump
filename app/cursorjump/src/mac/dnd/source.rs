@@ -132,7 +132,7 @@ pub enum MacDndEv {
     Ready { drag: DragId, crossing: Crossing },
     /// A session started just as its drag was cancelled: cj-inject posts
     /// Esc to end it undropped.
-    NeedsEscape { drag: DragId },
+    NeedsEscape { drag: DragId, crossing: Crossing },
     /// Item `item` of `drag`'s `crossing` failed; cj-inject cancels the
     /// drag.
     #[cfg_attr(
@@ -157,7 +157,9 @@ impl MacDndEv {
             MacDndEv::Failed { drag, crossing, .. } => {
                 Some(InjectMsg::DragFailed { drag, crossing })
             }
-            MacDndEv::NeedsEscape { drag } => Some(InjectMsg::EscapeSession { drag }),
+            MacDndEv::NeedsEscape { drag, crossing } => {
+                Some(InjectMsg::EscapeSession { drag, crossing })
+            }
             MacDndEv::Fetch { .. } | MacDndEv::Released { .. } => None,
         }
     }
@@ -754,6 +756,14 @@ impl Inner {
         past.push(drag.clone());
     }
 
+    /// `drag`'s `crossing`, live or remembered.
+    fn crossing(&self, drag: DragId, crossing: Crossing) -> Option<Arc<Drag>> {
+        let is = |d: &Arc<Drag>| d.id == drag && d.crossing == crossing;
+        self.get(drag)
+            .filter(is)
+            .or_else(|| self.past().iter().rev().find(|d| is(d)).cloned())
+    }
+
     /// The latest earlier crossing of `drag`, left in the list.
     fn find_past(&self, drag: DragId) -> Option<Arc<Drag>> {
         self.past().iter().rev().find(|d| d.id == drag).cloned()
@@ -987,6 +997,15 @@ impl DragSource {
         live
     }
 
+    /// Whether the session of `drag`'s `crossing` is live: started and not
+    /// ended, so that an Esc reaches it.
+    pub fn session_live(&self, drag: DragId, crossing: Crossing) -> bool {
+        self.inner.crossing(drag, crossing).is_some_and(|d| {
+            let st = d.lock();
+            st.started && !st.ended
+        })
+    }
+
     /// Whether every item of `drag` is in place (true once it is over).
     #[cfg(debug_assertions)]
     pub(super) fn all_complete(&self, drag: DragId) -> bool {
@@ -1006,6 +1025,9 @@ impl DragPort for DragSource {
     }
     fn cancel(&mut self, drag: DragId) -> bool {
         DragSource::cancel(self, drag)
+    }
+    fn session_live(&mut self, drag: DragId, crossing: Crossing) -> bool {
+        DragSource::session_live(self, drag, crossing)
     }
 }
 
@@ -1489,8 +1511,14 @@ mod tests {
                 }),
             ),
             (
-                MacDndEv::NeedsEscape { drag: 7 },
-                Some(InjectMsg::EscapeSession { drag: 7 }),
+                MacDndEv::NeedsEscape {
+                    drag: 7,
+                    crossing: 3,
+                },
+                Some(InjectMsg::EscapeSession {
+                    drag: 7,
+                    crossing: 3,
+                }),
             ),
             (
                 MacDndEv::Failed {
@@ -1655,8 +1683,12 @@ mod tests {
             !src.may_release(7, (0.0, 0.0)),
             "cancelled, its session on, incomplete: hold"
         );
+        assert!(!src.session_live(7, 1), "not started yet");
         assert!(d.session_started(), "it needs an Esc");
+        assert!(src.session_live(7, 1), "started, not ended: the Esc goes");
+        assert!(!src.session_live(7, 2), "another crossing");
         src.inner.end(&d, false);
+        assert!(!src.session_live(7, 1), "ended: no stray Esc");
         assert!(src.may_release(7, (0.0, 0.0)), "ended: the up may go");
         // A session that started before the cancel is live: cj-inject's Esc.
         let d = Arc::new(drag_in(&tmp.path().join("8"), 1));

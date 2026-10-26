@@ -131,6 +131,9 @@ impl DragPort for SmokeDrags {
     fn cancel(&mut self, drag: DragId) -> bool {
         self.source.cancel(drag)
     }
+    fn session_live(&mut self, drag: DragId, crossing: Crossing) -> bool {
+        self.source.session_live(drag, crossing)
+    }
 }
 
 pub fn run_smoke(mode: SmokeMode) -> anyhow::Result<()> {

@@ -303,7 +303,10 @@ impl DragView {
         if iv.drag.session_started() {
             // Cancelled while it started: cj-inject's Esc may have come
             // before the session could take it.
-            iv.inner.emit(MacDndEv::NeedsEscape { drag: iv.drag.id });
+            iv.inner.emit(MacDndEv::NeedsEscape {
+                drag: iv.drag.id,
+                crossing: iv.drag.crossing,
+            });
         }
         info!(drag = iv.drag.id, "the drag session from the PC began");
     }

@@ -90,6 +90,9 @@ pub trait DragPort {
     /// session is live, so that Esc must end it; a session that is still
     /// starting asks for its Esc itself (`InjectMsg::EscapeSession`).
     fn cancel(&mut self, drag: DragId) -> bool;
+    /// Whether the session of `drag`'s `crossing` is live: started and not
+    /// ended, so that Esc reaches it.
+    fn session_live(&mut self, drag: DragId, crossing: Crossing) -> bool;
 }
 
 /// For a Mac without a drag source: no PC drag starts here.
@@ -109,6 +112,9 @@ impl DragPort for NoDrags {
         true
     }
     fn cancel(&mut self, _drag: DragId) -> bool {
+        false
+    }
+    fn session_live(&mut self, _drag: DragId, _crossing: Crossing) -> bool {
         false
     }
 }
@@ -228,10 +234,12 @@ pub enum InjectMsg {
         drag: DragId,
         crossing: Crossing,
     },
-    /// From the drag source: a session that started as its drag was being
-    /// cancelled: post Esc so that it ends undropped.
+    /// From the drag source: the session of `drag`'s `crossing` started as
+    /// its drag was being cancelled: post Esc so that it ends undropped,
+    /// if it is still on by now.
     EscapeSession {
         drag: DragId,
+        crossing: Crossing,
     },
     /// Cancel `drag` (the pill's ✕, the PC's `DragCancel`): Esc, then the
     /// button goes up if the PC doesn't hold it any more.
@@ -451,9 +459,13 @@ impl<I: Inject, D: DragPort> Router<I, D> {
                 self.session_ended(drag, crossing);
                 Vec::new()
             }
-            InjectMsg::EscapeSession { drag } => {
-                info!(drag, "ending a cancelled drag's late session");
-                self.escape();
+            InjectMsg::EscapeSession { drag, crossing } => {
+                // An up may have ended it meanwhile (going home, a forced
+                // return): then an Esc would reach the front-most app.
+                if self.drags.session_live(drag, crossing) {
+                    info!(drag, crossing, "ending a cancelled drag's late session");
+                    self.escape();
+                }
                 Vec::new()
             }
             InjectMsg::Quit => {
@@ -968,6 +980,9 @@ pub(super) mod tests {
         }
         fn cancel(&mut self, drag: DragId) -> bool {
             self.log(Call::CancelSource(drag));
+            self.session
+        }
+        fn session_live(&mut self, _drag: DragId, _crossing: Crossing) -> bool {
             self.session
         }
     }
@@ -1939,8 +1954,26 @@ pub(super) mod tests {
         r.handle(InjectMsg::CancelDrag { drag: 7 });
         assert_eq!(take(&calls), vec![Call::CancelSource(7), LEFT_UP]);
         // A session that started late asks for its Esc.
-        r.handle(InjectMsg::EscapeSession { drag: 7 });
+        r.drags.session = true;
+        r.handle(InjectMsg::EscapeSession {
+            drag: 7,
+            crossing: 1,
+        });
         assert_eq!(take(&calls), vec![ESC_DOWN, ESC_UP]);
+    }
+
+    #[test]
+    fn a_late_escape_request_for_an_ended_session_posts_nothing() {
+        // Going home: the up ended the session before its Esc request came.
+        let (mut r, calls) = riding(false);
+        r.drags.session = false;
+        r.handle(input(1, Input::Motion { dx: -9, dy: 0 }));
+        take(&calls);
+        r.handle(InjectMsg::EscapeSession {
+            drag: 7,
+            crossing: 1,
+        });
+        assert_eq!(take(&calls), vec![], "no Esc for the front-most app");
     }
 
     #[test]
