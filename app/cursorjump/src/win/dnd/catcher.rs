@@ -39,6 +39,7 @@ use windows::core::{HSTRING, Ref, implement};
 
 use super::{OutState, WinDndEv, with_out};
 use crate::common::dnd_link::Source;
+use crate::common::link_fetch::{LINK_MAX_BYTES, LinkError, fetch_link, shortcut_url, url_host};
 
 /// How near the Mac edge (physical px) a held left button shows the strip.
 pub const CATCH_ZONE_PX: i32 = 48;
@@ -155,22 +156,6 @@ pub(super) fn link_name(name: &str) -> Option<String> {
     suffix
         .eq_ignore_ascii_case(".url")
         .then(|| name[..cut].to_string())
-}
-
-/// The target of an InternetShortcut file: its `[InternetShortcut]` `URL=` line.
-fn shortcut_url(text: &str) -> Option<String> {
-    let mut in_section = false;
-    for line in text.lines().map(str::trim) {
-        if line.starts_with('[') {
-            in_section = line.eq_ignore_ascii_case("[InternetShortcut]");
-        } else if in_section
-            && let Some((key, value)) = line.split_once('=')
-            && key.trim().eq_ignore_ascii_case("URL")
-        {
-            return Some(value.trim().to_string());
-        }
-    }
-    None
 }
 
 // ---------------------------------------------------------------- formats
@@ -391,7 +376,7 @@ pub(super) struct Pending {
 enum Spool {
     /// Every entry of the item's tree.
     Tree(Vec<Entry>),
-    /// A web link: Task 11b downloads its target.
+    /// A web link: its target is downloaded (`start_link_fetch`).
     Link {
         index: u32,
         /// From UniformResourceLocatorW at `DragEnter`; the shortcut's own
@@ -490,32 +475,35 @@ fn spool_dir(drag: DragId) -> Result<PathBuf> {
         .join(drag.to_string()))
 }
 
-/// Write every pending item out and resolve it. Runs inside `Drop`.
+/// Write every pending item out and resolve it, or start its download (a
+/// web link). Runs inside `Drop`.
 pub(super) fn spool(drag: DragId, data: &IDataObject, pending: Vec<Pending>) {
     let dir = spool_dir(drag);
     for p in pending {
+        let entries = match &p.what {
+            Spool::Tree(entries) => entries,
+            Spool::Link { index, link_url } => {
+                // Read while the data is there; the download runs on its own.
+                let url = read_link(data, *index).or_else(|| link_url.clone());
+                start_link_fetch(drag, &dir, url, p);
+                continue;
+            }
+        };
         let unreadable = || FailReason::Unreadable {
             name: p.name.clone(),
         };
         let started = Instant::now();
-        let result = match (&dir, &p.what) {
-            (Err(e), _) => {
+        let result = match &dir {
+            Err(e) => {
                 warn!("catcher: no spool folder: {e:#}");
                 Err(FailReason::Unwritable)
             }
-            (Ok(dir), Spool::Tree(entries)) => {
+            Ok(dir) => {
                 let item_dir = dir.join(p.item.to_string());
                 spool_tree(data, &item_dir, entries).map_err(|e| {
                     warn!(drag, item = p.item, "catcher: spooling failed: {e:#}");
                     unreadable()
                 })
-            }
-            (Ok(_), Spool::Link { index, link_url }) => {
-                let url = read_link(data, *index).or_else(|| link_url.clone());
-                let url = url.as_deref().map(url_for_log);
-                debug!(drag, item = p.item, ?url, "catcher: web link");
-                // Task 11b: download the link's target and resolve with its path.
-                Err(unreadable())
             }
         };
         let took = started.elapsed();
@@ -527,6 +515,64 @@ pub(super) fn spool(drag: DragId, data: &IDataObject, pending: Vec<Pending>) {
             "catcher: spooled"
         );
         p.resolve(result);
+    }
+}
+
+/// Where a web link's target is downloaded: under the item's folder, by
+/// the name offered at `DragEnter`.
+fn link_dest(dir: &Path, item: u32, name: &str) -> PathBuf {
+    let name = if name.is_empty() { "download" } else { name };
+    dir.join(item.to_string()).join(sanitize_component(name))
+}
+
+/// Download a web link's target on a thread of its own ("cj-link-fetch",
+/// never cj-dnd-out: `Drop` must not wait), then resolve the item: its
+/// path, or `Unreadable` on any failure. The download stops once nobody
+/// holds the item's source any more (the drag ended or was cancelled).
+fn start_link_fetch(drag: DragId, dir: &Result<PathBuf>, url: Option<String>, p: Pending) {
+    let Pending { item, name, tx, .. } = p;
+    let unreadable = FailReason::Unreadable { name: name.clone() };
+    let Some(url) = url else {
+        warn!(drag, item, "catcher: a web link with no URL");
+        let _ = tx.send(Some(Err(unreadable)));
+        return;
+    };
+    let dir = match dir {
+        Ok(dir) => dir.clone(),
+        Err(e) => {
+            warn!("catcher: no spool folder: {e:#}");
+            let _ = tx.send(Some(Err(FailReason::Unwritable)));
+            return;
+        }
+    };
+    let host = url_host(&url);
+    debug!(drag, item, %host, "catcher: fetching a web link");
+    let fetch = move || {
+        let dest = link_dest(&dir, item, &name);
+        let cancelled = || tx.is_closed();
+        let fetched = match dest.parent().map(std::fs::create_dir_all) {
+            Some(Err(e)) => Err(LinkError::Io(e)),
+            _ => fetch_link(&url, &dest, LINK_MAX_BYTES, &cancelled),
+        };
+        let result = match fetched {
+            Ok(bytes) => {
+                debug!(drag, item, %host, bytes, "catcher: web link fetched");
+                Ok(dest)
+            }
+            Err(e) => {
+                warn!(drag, item, %host, error = e.kind(), "catcher: web link not fetched");
+                Err(unreadable)
+            }
+        };
+        // No receiver left means nobody wants it any more.
+        let _ = tx.send(Some(result));
+    };
+    let spawned = std::thread::Builder::new()
+        .name("cj-link-fetch".into())
+        .spawn(fetch);
+    if let Err(e) = spawned {
+        // The sender went with the closure: the item reads as unreadable.
+        warn!(drag, item, "catcher: no thread for a web link: {e}");
     }
 }
 
@@ -617,16 +663,11 @@ fn stream_limit(size: Option<u64>) -> u64 {
     size.map_or(UNSIZED_STREAM_CAP, |s| s.saturating_add(STREAM_SLACK))
 }
 
-/// A link for the log: no query or fragment (they may carry tokens).
-fn url_for_log(url: &str) -> &str {
-    url.split(['?', '#']).next().unwrap_or_default()
-}
-
 /// A web link's target, from its shortcut file's contents.
 fn read_link(data: &IDataObject, lindex: u32) -> Option<String> {
     let f = formatetc(formats().contents, TYMED_HGLOBAL, lindex as i32);
     let m = get(data, &f).ok()?;
-    shortcut_url(&String::from_utf8_lossy(&hglobal_bytes(&m, None).ok()?))
+    shortcut_url(&hglobal_bytes(&m, None).ok()?)
 }
 
 // ---------------------------------------------------------------- IDropTarget
@@ -865,18 +906,6 @@ mod tests {
     }
 
     #[test]
-    fn shortcut_url_reads_the_internet_shortcut_section() {
-        let text = "[{000214A0-0000-0000-C000-000000000046}]\r\nProp3=19,11\r\n\
-                    [InternetShortcut]\r\nIDList=\r\nURL=https://cdn.example/image.png?ex=1\r\n";
-        assert_eq!(
-            shortcut_url(text).as_deref(),
-            Some("https://cdn.example/image.png?ex=1")
-        );
-        assert_eq!(shortcut_url("URL=https://outside/section"), None);
-        assert_eq!(shortcut_url("[InternetShortcut]\nIconIndex=0\n"), None);
-    }
-
-    #[test]
     fn virtual_links_are_offered_without_suffix_or_size() {
         let names = vec![
             ("image.png.url".to_string(), false, Some(218)),
@@ -918,13 +947,107 @@ mod tests {
     }
 
     #[test]
-    fn logged_urls_lose_their_query() {
+    fn web_links_land_in_the_item_folder_by_their_offered_name() {
+        let dir = Path::new(r"C:\spool\7");
         assert_eq!(
-            url_for_log("https://cdn.example/a/image.png?ex=1&hm=secret#x"),
-            "https://cdn.example/a/image.png"
+            link_dest(dir, 2, "image.png"),
+            dir.join("2").join("image.png")
         );
-        assert_eq!(url_for_log("https://x/y#frag"), "https://x/y");
-        assert_eq!(url_for_log("https://x/y"), "https://x/y");
+        assert_eq!(link_dest(dir, 0, ""), dir.join("0").join("download"));
+        assert_eq!(
+            link_dest(dir, 0, "a:b?.png"),
+            dir.join("0").join("a_b_.png")
+        );
+    }
+
+    /// A link item's pending source, as `into_offer` makes it.
+    fn link_item(
+        name: &str,
+    ) -> (
+        Pending,
+        watch::Receiver<Option<Result<PathBuf, FailReason>>>,
+    ) {
+        let (_, mut sources, mut pending) = into_offer(Offered::Virtual {
+            names: vec![(format!("{name}.url"), false, Some(218))],
+            url: None,
+        });
+        let Some(Source::Pending(rx)) = sources.pop() else {
+            panic!("a link is pending");
+        };
+        (pending.remove(0), rx)
+    }
+
+    fn resolved(
+        rx: &mut watch::Receiver<Option<Result<PathBuf, FailReason>>>,
+    ) -> Result<PathBuf, FailReason> {
+        let until = Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(r) = rx.borrow_and_update().clone() {
+                return r;
+            }
+            assert!(Instant::now() < until, "never resolved");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_web_link_is_fetched_off_the_drop_thread() {
+        use std::io::{Read, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/image.png?ex=1", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = conn.read(&mut buf);
+            // Slow, so that returning before it ends shows Drop doesn't wait.
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let _ = conn.write_all(
+                b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 4\r\n\r\npng!",
+            );
+        });
+        let spool = tempfile::tempdir().unwrap();
+        let (p, mut rx) = link_item("image.png");
+        let started = Instant::now();
+        start_link_fetch(7, &Ok(spool.path().to_path_buf()), Some(url), p);
+        assert!(started.elapsed() < std::time::Duration::from_millis(400));
+        let path = resolved(&mut rx).unwrap();
+        assert_eq!(path, spool.path().join("0").join("image.png"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"png!");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_web_link_that_cant_be_fetched_is_unreadable() {
+        let spool = tempfile::tempdir().unwrap();
+        let unreadable = Err(FailReason::Unreadable {
+            name: "image.png".into(),
+        });
+        let (p, mut rx) = link_item("image.png");
+        start_link_fetch(
+            7,
+            &Ok(spool.path().to_path_buf()),
+            Some("ftp://x/y.png".into()),
+            p,
+        );
+        assert_eq!(resolved(&mut rx), unreadable);
+        let (p, mut rx) = link_item("image.png");
+        start_link_fetch(7, &Ok(spool.path().to_path_buf()), None, p);
+        assert_eq!(resolved(&mut rx), unreadable);
+        // Nothing half-written is left behind.
+        let left: Vec<_> = walk(spool.path());
+        assert!(left.iter().all(|p| p.is_dir()), "{left:?}");
+    }
+
+    fn walk(dir: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        for e in std::fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                out.extend(walk(&p));
+            }
+            out.push(p);
+        }
+        out
     }
 
     #[test]

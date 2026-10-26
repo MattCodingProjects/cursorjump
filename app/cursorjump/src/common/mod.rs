@@ -9,6 +9,11 @@ pub mod config_file;
 pub mod dnd_link;
 #[cfg_attr(
     not(test),
+    expect(dead_code, reason = "the catchers fetch dragged links through it")
+)]
+pub mod link_fetch;
+#[cfg_attr(
+    not(test),
     expect(dead_code, reason = "the pill windows draw with it in later tasks")
 )]
 pub mod pill_render;

@@ -432,10 +432,14 @@ fn place(dest: &Dest, header: &FilesHeader) -> Option<(PathBuf, String, PathBuf)
 
 /// A part to remove when dropped, unless disarmed once the item is in
 /// place. It removes synchronously, since a drop can't await.
-struct PartGuard(Option<PathBuf>);
+pub(crate) struct PartGuard(Option<PathBuf>);
 
 impl PartGuard {
-    fn disarm(&mut self) {
+    pub(crate) fn new(part: PathBuf) -> PartGuard {
+        PartGuard(Some(part))
+    }
+
+    pub(crate) fn disarm(&mut self) {
         self.0 = None;
     }
 }
@@ -616,7 +620,7 @@ async fn remove_any(p: &Path) -> io::Result<()> {
 /// `.{name}.cjpart`, or, if that would be too long for a file name, `name`
 /// cut short with a hash of it added, so long names that differ only past
 /// the cut still get different part names.
-fn part_name(name: &str) -> String {
+pub(crate) fn part_name(name: &str) -> String {
     let fits = |bytes: usize, units: usize| bytes <= MAX_NAME_LEN && units <= MAX_NAME_LEN;
     let plain = format!(".{name}.cjpart");
     if fits(plain.len(), plain.encode_utf16().count()) {
