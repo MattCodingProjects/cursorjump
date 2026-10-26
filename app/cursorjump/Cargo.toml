@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+ab_glyph = "0.2.32"
 anyhow = "1"
 cj-core = { path = "../../crates/cj-core" }
 cj-net = { path = "../../crates/cj-net" }
@@ -11,6 +12,7 @@ crossbeam-channel = "0.5.17"
 eframe = { version = "0.37.0", default-features = false, features = ["default_fonts", "glow"] }
 rfd = "0.17.2"
 tao = "0.37.1"
+tiny-skia = "0.12.0"
 tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util"] }
 tokio-util = "0.7.20"
 tracing = "0.1.44"

@@ -7,6 +7,11 @@ pub mod config_file;
     expect(dead_code, reason = "the apps drive drags through it in later tasks")
 )]
 pub mod dnd_link;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the pill windows draw with it in later tasks")
+)]
+pub mod pill_render;
 pub mod session_tasks;
 pub mod settings_window;
 #[cfg_attr(

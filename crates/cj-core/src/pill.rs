@@ -122,6 +122,9 @@ pub struct PillView {
     pub opacity: f32,
     /// Persists until `dismiss`; drawn with a ✕.
     pub failed: bool,
+    /// The copy is still going: false once done, cancelled or failed. A
+    /// running pill without a `fraction` gets an indeterminate track.
+    pub running: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -374,6 +377,7 @@ impl PillBoard {
             check_scale: 0.0,
             opacity: 1.0,
             failed: false,
+            running: false,
         };
         match &p.stage {
             Stage::Running => {
@@ -381,6 +385,7 @@ impl PillBoard {
                 if since < SHOW_AFTER {
                     return None;
                 }
+                v.running = true;
                 v.sub = format_sub(self.from, p.done, p.total, p.eta(now));
                 if let Some(total) = p.bar_total() {
                     let done = p.done.min(total);
@@ -711,6 +716,7 @@ mod tests {
                 check_scale: 0.0,
                 opacity: 1.0,
                 failed: false,
+                running: true,
             }]
         );
         // The sheen animates while running.
@@ -878,6 +884,27 @@ mod tests {
         assert_eq!(board.next_frame(back + ms(500)), Some(back + DONE_HOLD));
         assert_eq!(board.views(back + ms(1_000))[0].sub, "Cancelled");
         assert!(board.views(back + ms(1_300)).is_empty());
+    }
+
+    #[test]
+    fn running_only_until_the_copy_ends() {
+        let t0 = Instant::now();
+        let mut board = PillBoard::new(Peer::Mac, Peer::Pc);
+        board.start(1, &[file("a.mov", 10_000_000)], t0);
+        board.start(2, &[dir("Photos")], t0);
+        board.start(3, &[file("c.mov", 10_000_000)], t0);
+        board.start(4, &[file("d.mov", 10_000_000)], t0);
+        // Running, with and without a known total.
+        let views = board.views(t0 + ms(600));
+        assert!(views.iter().all(|v| v.running));
+        assert_eq!(views[1].fraction, None);
+
+        board.finish(1, Ok(()), t0 + ms(1_000));
+        board.finish(3, Err(FailReason::Cancelled), t0 + ms(1_000));
+        board.finish(4, Err(FailReason::Disconnected), t0 + ms(1_000));
+        let views = board.views(t0 + ms(1_000));
+        let running: Vec<bool> = views.iter().map(|v| v.running).collect();
+        assert_eq!(running, [false, true, false, false]);
     }
 
     #[test]
