@@ -372,7 +372,8 @@ impl App {
             PcAction::CancelSourceDrag { .. }
             | PcAction::SourceDragHome { .. }
             | PcAction::StartIncomingDrag { .. }
-            | PcAction::CancelIncomingDrag { .. } => {}
+            | PcAction::CancelIncomingDrag { .. }
+            | PcAction::RefuseIncomingDrag { .. } => {}
         }
     }
 
@@ -446,9 +447,11 @@ impl App {
 
     fn on_net(&mut self, ev: NetEv) {
         match ev {
-            NetEv::Control(Control::Leave { frac, .. }) => {
-                self.feed(PcEvent::MacLeave { frac, drag: None })
-            }
+            NetEv::Control(Control::Leave { frac, .. }) => self.feed(PcEvent::MacLeave {
+                frac,
+                drag: None,
+                game: false,
+            }),
             NetEv::Control(Control::MacReady { ready }) => {
                 if ready != self.machine.mac_ready() {
                     info!(ready, "the Mac's readiness changed");

@@ -66,14 +66,20 @@ impl MacMachine {
     pub fn on(&mut self, ev: MacEvent) -> Vec<MacAction> {
         match ev {
             MacEvent::Enter { edge, frac, drag } => {
+                let mut actions = if self.incoming != drag {
+                    // A stale drag from an earlier crossing must not linger.
+                    self.cancel_incoming()
+                } else {
+                    Vec::new()
+                };
                 self.controlled = true;
                 self.entry = Some(edge);
                 self.incoming = drag;
-                let mut actions = vec![
+                actions.extend([
                     MacAction::WakeDisplay,
                     MacAction::WarpTo { edge, frac },
                     MacAction::StartControl,
-                ];
+                ]);
                 actions.extend(drag.map(|drag| MacAction::BeginDrag { drag }));
                 actions
             }
@@ -422,6 +428,52 @@ mod tests {
                     drag: None
                 },
                 MacAction::StopControl
+            ]
+        );
+    }
+
+    #[test]
+    fn enter_over_a_stale_incoming_drag_cancels_it_first() {
+        let warp = MacAction::WarpTo {
+            edge: Side::Left,
+            frac: 0.4,
+        };
+        let enter = |drag| MacEvent::Enter {
+            edge: Side::Left,
+            frac: 0.4,
+            drag,
+        };
+        let mut m = entered_with_drag();
+        assert_eq!(
+            m.on(enter(Some(8))),
+            vec![
+                MacAction::CancelDrag { drag: 7 },
+                MacAction::WakeDisplay,
+                warp.clone(),
+                MacAction::StartControl,
+                MacAction::BeginDrag { drag: 8 }
+            ]
+        );
+        assert_eq!(m.incoming(), Some(8));
+        assert_eq!(
+            m.on(enter(None)),
+            vec![
+                MacAction::CancelDrag { drag: 8 },
+                MacAction::WakeDisplay,
+                warp.clone(),
+                MacAction::StartControl
+            ]
+        );
+        assert_eq!(m.incoming(), None);
+        // The same drag again is not cancelled.
+        let mut m = entered_with_drag();
+        assert_eq!(
+            m.on(enter(Some(7))),
+            vec![
+                MacAction::WakeDisplay,
+                warp,
+                MacAction::StartControl,
+                MacAction::BeginDrag { drag: 7 }
             ]
         );
     }

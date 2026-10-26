@@ -51,6 +51,8 @@ pub enum PcEvent {
     MacLeave {
         frac: f32,
         drag: Option<DragId>,
+        /// A game holds the mouse on the PC at the moment of return.
+        game: bool,
     },
     /// The Mac: our outgoing drag was released on a target.
     DragDropped {
@@ -103,6 +105,10 @@ pub enum PcAction {
     CancelIncomingDrag {
         drag: DragId,
     },
+    /// Net: `DragCancel { drag, Cancelled }` to the Mac; no OS drag is started.
+    RefuseIncomingDrag {
+        drag: DragId,
+    },
 }
 
 #[derive(Debug)]
@@ -119,6 +125,7 @@ pub struct PcMachine {
     /// Whether the Mac can take the cursor. True until it says otherwise:
     /// a crossing before its first `MacReady` arrives is bounced back by the Mac.
     mac_ready: bool,
+    /// The file drag riding across the link with the cursor.
     riding: Option<Riding>,
 }
 
@@ -198,7 +205,7 @@ impl PcMachine {
                     drag: offer,
                 }]
             }
-            PcEvent::MacLeave { frac, drag } => {
+            PcEvent::MacLeave { frac, drag, game } => {
                 if self.where_ != Where::Mac {
                     return vec![];
                 }
@@ -206,10 +213,17 @@ impl PcMachine {
                 let mut actions = vec![PcAction::ReturnToPc {
                     pc_frac: remove_offset(frac, self.entry_offset),
                 }];
-                if let Some(drag) = drag {
-                    if self.riding == Some(Riding::Outgoing(drag)) {
-                        self.riding = None;
-                        actions.push(PcAction::SourceDragHome { drag });
+                // Any leave homes the catcher, whatever the Mac says it carries.
+                let mut homed = None;
+                if let Some(Riding::Outgoing(drag)) = self.riding {
+                    self.riding = None;
+                    homed = Some(drag);
+                    actions.push(PcAction::SourceDragHome { drag });
+                }
+                if let Some(drag) = drag.filter(|&d| Some(d) != homed) {
+                    if game {
+                        // Never start an OS drag while a game holds the mouse.
+                        actions.push(PcAction::RefuseIncomingDrag { drag });
                     } else {
                         self.riding = Some(Riding::Incoming(drag));
                         actions.push(PcAction::StartIncomingDrag { drag });
@@ -226,8 +240,7 @@ impl PcMachine {
                 vec![]
             }
             PcEvent::DragGone { drag } => {
-                if self.riding == Some(Riding::Outgoing(drag))
-                    || self.riding == Some(Riding::Incoming(drag))
+                if matches!(self.riding, Some(Riding::Outgoing(d) | Riding::Incoming(d)) if d == drag)
                 {
                     self.riding = None;
                 }
@@ -375,7 +388,11 @@ mod tests {
     }
 
     fn leave(frac: f32, drag: Option<DragId>) -> PcEvent {
-        PcEvent::MacLeave { frac, drag }
+        PcEvent::MacLeave {
+            frac,
+            drag,
+            game: false,
+        }
     }
 
     /// Connected, with the PC's drag 7 riding on the Mac.
@@ -904,5 +921,71 @@ mod tests {
         );
         assert_eq!(m.riding(), None);
         assert_eq!(m.link(), &Link::Searching);
+    }
+
+    #[test]
+    fn mac_leave_without_drag_while_outgoing_homes_the_catcher() {
+        let mut m = outgoing();
+        match m.on(leave(0.6, None)).as_slice() {
+            [
+                PcAction::ReturnToPc { pc_frac },
+                PcAction::SourceDragHome { drag: 7 },
+            ] => assert!((pc_frac - 0.6).abs() < 1e-5),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(m.where_(), &Where::Pc);
+        assert_eq!(m.riding(), None);
+    }
+
+    #[test]
+    fn mac_leave_with_other_drag_while_outgoing_homes_then_starts_incoming() {
+        let mut m = outgoing();
+        match m.on(leave(0.6, Some(9))).as_slice() {
+            [
+                PcAction::ReturnToPc { pc_frac },
+                PcAction::SourceDragHome { drag: 7 },
+                PcAction::StartIncomingDrag { drag: 9 },
+            ] => assert!((pc_frac - 0.6).abs() < 1e-5),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(m.riding(), Some(Riding::Incoming(9)));
+    }
+
+    #[test]
+    fn mac_drag_coming_home_over_a_game_is_refused() {
+        let mut m = connected(Config::default());
+        m.on(push(0.3, free(), false));
+        let a = m.on(PcEvent::MacLeave {
+            frac: 0.6,
+            drag: Some(9),
+            game: true,
+        });
+        match a.as_slice() {
+            [
+                PcAction::ReturnToPc { pc_frac },
+                PcAction::RefuseIncomingDrag { drag: 9 },
+            ] => assert!((pc_frac - 0.6).abs() < 1e-5),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(m.where_(), &Where::Pc, "the cursor still comes home");
+        assert_eq!(m.riding(), None);
+    }
+
+    #[test]
+    fn forced_return_while_incoming_changes_nothing() {
+        let paused = PcEvent::ConfigChanged(Config {
+            paused: true,
+            ..Config::default()
+        });
+        for ev in [
+            PcEvent::ReturnHotkey,
+            PcEvent::HookLost,
+            paused,
+            PcEvent::MacReady(false),
+        ] {
+            let mut m = incoming();
+            assert_eq!(m.on(ev.clone()), vec![], "{ev:?}");
+            assert_eq!(m.riding(), Some(Riding::Incoming(9)), "{ev:?}");
+        }
     }
 }
