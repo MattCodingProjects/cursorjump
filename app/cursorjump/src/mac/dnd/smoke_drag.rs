@@ -46,6 +46,9 @@ use crate::mac::inject::Injector;
 /// The fake fetch takes this many steps of half a second.
 const FETCH_STEPS: u32 = 20;
 
+/// Set once the fake fetch is Ready or Failed.
+static SETTLED: AtomicBool = AtomicBool::new(false);
+
 /// How the smoke's release behaves.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Release {
@@ -169,7 +172,12 @@ pub fn run_smoke(mode: SmokeMode) -> anyhow::Result<()> {
                 info!(drag, crossing, dropped, "smoke: ended");
                 let _ = ended_tx.send(dropped);
             }
-            other => info!(?other, "smoke: source event"),
+            other => {
+                if matches!(other, MacDndEv::Ready { .. } | MacDndEv::Failed { .. }) {
+                    SETTLED.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                info!(?other, "smoke: source event")
+            }
         }
     });
     let drags = SmokeDrags {
@@ -394,6 +402,14 @@ fn script(
     match ended.recv_timeout(Duration::from_secs(90)) {
         Ok(dropped) => info!(dropped, "smoke: the session ended"),
         Err(_) => warn!("smoke: no end of the session within 90 s"),
+    }
+    // A promise target writes after the drop: let the fake fetch finish
+    // (Ready or Failed) before quitting, else the target gets nothing.
+    for _ in 0..600 {
+        if SETTLED.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+        sleep(100);
     }
     sleep(3000);
     let _ = tx.send(InjectMsg::Quit);
