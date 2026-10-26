@@ -622,3 +622,52 @@ fn a_panic_while_cancelling_still_releases_everything() {
         "{calls:?}"
     );
 }
+
+#[test]
+fn without_accessibility_a_drag_bounces_home_without_a_session() {
+    // Task 17 note (a): the machine hears the real drag, so the Leave
+    // carries it home, but no session starts and nothing is cancelled.
+    let (fake, calls) = Fake::new();
+    let access = Arc::new(AtomicBool::new(false));
+    let mut r = Router::new(fake, FakeDrags::new(&calls), access.clone());
+    r.handle(InjectMsg::Begin { sid: 1 });
+    r.handle(input(
+        1,
+        Input::DragOffer {
+            drag: 7,
+            items: items(2),
+        },
+    ));
+    assert_eq!(
+        r.handle(input(1, enter_with(7))),
+        vec![
+            InjectEv::Controlled { sid: 1, on: true },
+            InjectEv::SendLeave {
+                sid: 1,
+                frac: 0.5,
+                drag: Some(7)
+            },
+            InjectEv::Controlled { sid: 1, on: false },
+        ]
+    );
+    assert_eq!(
+        take(&calls),
+        vec![Call::ReleaseAll],
+        "no prepare, no press, no cancel and no Esc"
+    );
+    assert_eq!(r.machine.incoming(), None, "the drag went home");
+    assert_eq!(r.next_tick(), None);
+
+    // Granted since: the same drag crossing again starts its session.
+    access.store(true, Ordering::Relaxed);
+    r.handle(input(1, enter_with(7)));
+    assert_eq!(
+        take(&calls),
+        vec![
+            Call::Wake,
+            Call::Warp(Side::Left, 0.5),
+            Call::Prepare(7, 2),
+            LEFT_DOWN
+        ]
+    );
+}

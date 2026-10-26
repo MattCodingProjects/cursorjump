@@ -1,11 +1,19 @@
-//! Waking the display and keeping the Mac awake while it is in use.
+//! Waking the display, keeping the Mac awake while it is in use, and
+//! hearing that it is about to sleep.
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::ptr::NonNull;
 use std::sync::Mutex;
 
+use block2::RcBlock;
+use objc2::MainThreadMarker;
 use objc2::rc::Retained;
 use objc2::runtime::{NSObjectProtocol, ProtocolObject};
+use objc2_app_kit::{NSWorkspace, NSWorkspaceWillSleepNotification};
 use objc2_core_foundation::CFString;
-use objc2_foundation::{NSActivityOptions, NSProcessInfo, NSString};
+use objc2_foundation::{
+    NSActivityOptions, NSNotification, NSOperationQueue, NSProcessInfo, NSString,
+};
 use objc2_io_kit::{
     IOPMAssertionCreateWithName, IOPMAssertionDeclareUserActivity, IOPMAssertionID,
     IOPMAssertionRelease, IOPMUserActiveType, kIOPMAssertionLevelOn,
@@ -94,6 +102,31 @@ impl Drop for KeepAwake {
         // SAFETY: `activity` is the token beginActivityWithOptions returned,
         // ended exactly once.
         unsafe { NSProcessInfo::processInfo().endActivity(&self.activity) };
+    }
+}
+
+/// Runs `f` on the main thread each time the Mac is about to sleep
+/// (`NSWorkspaceWillSleepNotification`). The returned observer is never
+/// removed: keep it for the life of the process. `f` must not block.
+pub fn on_will_sleep(
+    _mtm: MainThreadMarker,
+    f: impl Fn() + 'static,
+) -> Retained<ProtocolObject<dyn NSObjectProtocol>> {
+    let block = RcBlock::new(move |_: NonNull<NSNotification>| {
+        if catch_unwind(AssertUnwindSafe(&f)).is_err() {
+            warn!("the will-sleep handler panicked");
+        }
+    });
+    let center = NSWorkspace::sharedWorkspace().notificationCenter();
+    // SAFETY: a static AppKit name; the center copies the block and runs it
+    // on the main queue.
+    unsafe {
+        center.addObserverForName_object_queue_usingBlock(
+            Some(NSWorkspaceWillSleepNotification),
+            None,
+            Some(&NSOperationQueue::mainQueue()),
+            &block,
+        )
     }
 }
 

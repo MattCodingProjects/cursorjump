@@ -26,10 +26,6 @@ pub enum NetEv {
         at: Instant,
     },
     Clipboard(ClipboardData),
-    #[cfg_attr(
-        not(windows),
-        expect(dead_code, reason = "the Mac app takes files streams in a later task")
-    )]
     Files(FilesIn),
     Closed(String),
 }

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use block2::RcBlock;
 use cj_core::dnd::DragId;
 use cj_core::proto::Side;
-use objc2::rc::Retained;
+use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::{NSObject, NSObjectProtocol, ProtocolObject};
 use objc2::{ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{
@@ -23,9 +23,13 @@ use objc2_foundation::{
     NSArray, NSCopying, NSDictionary, NSError, NSOperationQueue, NSPoint, NSRect, NSSize, NSString,
     NSURL, ns_string,
 };
+use objc2_uniform_type_identifiers::UTType;
 use tracing::{debug, info, warn};
 
-use super::{Dragged, Facts, Promise, Reading, STRIP_ALPHA, Shared, strip_frame};
+use super::{
+    Dragged, Facts, Promise, Reading, STRIP_ALPHA, Shared, Taken, TypeKind, copy_all_scratch,
+    fallback_name, in_container_tmp, strip_frame,
+};
 use crate::mac::dnd::{flush_core_animation, guarded};
 use crate::mac::inject::Rectf;
 
@@ -255,9 +259,24 @@ impl StripView {
     /// Takes the drop if a `Leave` carries it, and receives its promises.
     fn perform(&self, sender: &ProtocolObject<dyn NSDraggingInfo>) -> bool {
         let iv = self.ivars();
-        let Some((drag, promises)) = iv.shared.perform(sender.draggingSequenceNumber()) else {
+        let Some(Taken {
+            drag,
+            promises,
+            scratch,
+        }) = iv.shared.perform(sender.draggingSequenceNumber())
+        else {
             return false;
         };
+        if !scratch.is_empty() {
+            // Off the main thread; their sources fail if it can't start.
+            let root = iv.shared.root.clone();
+            let spawned = std::thread::Builder::new()
+                .name("cj-catcher-copy".into())
+                .spawn(move || copy_all_scratch(&root, drag, scratch));
+            if let Err(e) = spawned {
+                warn!(drag, "copying out of the app's tmp folder can't start: {e}");
+            }
+        }
         if !promises.is_empty() {
             let receivers = read_receivers(&sender.draggingPasteboard());
             for p in promises {
@@ -279,7 +298,7 @@ impl StripView {
         let iv = self.ivars();
         let first = p.files.first().map_or(0, |f| f.item);
         let dir = iv.shared.promise_dir(drag, first);
-        let reading = Arc::new(Reading::new(drag, p.files));
+        let reading = Arc::new(Reading::new(drag, iv.shared.root.clone(), p.files));
         if let Err(e) = std::fs::create_dir_all(&dir) {
             // Its files' sources fail as `reading` is dropped.
             warn!(drag, dir = %dir.display(), "the promise's folder can't be made: {e}");
@@ -328,6 +347,7 @@ fn read_dragged(pb: &NSPasteboard) -> Vec<Dragged> {
         .map(|t| t.to_string())
         .collect();
     let receivers = read_receivers(pb);
+    let home = std::env::var_os("HOME").map(PathBuf::from);
     let items = pb.pasteboardItems().map(|a| a.to_vec()).unwrap_or_default();
     let mut out = Vec::with_capacity(items.len());
     // The receivers are one per item with promise types, in item order.
@@ -340,17 +360,23 @@ fn read_dragged(pb: &NSPasteboard) -> Vec<Dragged> {
         });
         if let Some(path) = item.stringForType(file_url).and_then(|s| file_path(&s)) {
             let facts = Facts::of(&path);
-            out.push(Dragged::File { path, facts });
+            let scratch = home.as_deref().is_some_and(|h| in_container_tmp(&path, h));
+            out.push(Dragged::File {
+                path,
+                facts,
+                scratch,
+            });
         } else if let Some(receiver) = receiver {
             let recv = receivers.get(receiver);
             let names = recv.and_then(|r| file_names(r));
-            let dirs = recv
-                .and_then(|r| file_types(r))
-                .map_or_else(Vec::new, |t| t.iter().map(|t| t == FOLDER_UTT).collect());
+            let types = recv.and_then(|r| file_types(r)).unwrap_or_default();
+            let dirs = types.iter().map(|t| t == FOLDER_UTT).collect();
+            let fallback = fallback_for(types.first().map(String::as_str));
             out.push(Dragged::Promise {
                 receiver,
                 names,
                 dirs,
+                fallback,
             });
         }
     }
@@ -363,6 +389,32 @@ fn read_dragged(pb: &NSPasteboard) -> Vec<Dragged> {
     }
     debug!(?out, "what the drag carries");
     out
+}
+
+/// The name for a promised file its source doesn't name (R52), from its
+/// type `uti`: its kind and preferred extension.
+fn fallback_for(uti: Option<&str>) -> String {
+    autoreleasepool(|_| {
+        let ty = uti.and_then(|u| UTType::typeWithIdentifier(&NSString::from_str(u)));
+        let Some(ty) = ty else {
+            return fallback_name(TypeKind::Other, None);
+        };
+        let conforms = |id: &str| {
+            UTType::typeWithIdentifier(&NSString::from_str(id))
+                .is_some_and(|t| ty.conformsToType(&t))
+        };
+        let kind = if conforms(FOLDER_UTT) {
+            TypeKind::Folder
+        } else if conforms("public.image") {
+            TypeKind::Image
+        } else if conforms("public.movie") {
+            TypeKind::Video
+        } else {
+            TypeKind::Other
+        };
+        let ext = ty.preferredFilenameExtension().map(|e| e.to_string());
+        fallback_name(kind, ext.as_deref())
+    })
 }
 
 /// A `public.file-url` value as a path (file reference URLs resolved).
@@ -399,4 +451,20 @@ fn file_names(recv: &NSFilePromiseReceiver) -> Option<Vec<String>> {
     // SAFETY: `fileNames` takes no arguments and returns an NSArray or nil.
     let names: Option<Retained<NSArray<NSString>>> = unsafe { msg_send![recv, fileNames] };
     names.map(|n| n.iter().map(|s| s.to_string()).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nameless_promises_are_named_from_their_type() {
+        assert_eq!(fallback_for(Some("public.jpeg")), "image.jpeg");
+        assert_eq!(fallback_for(Some("public.png")), "image.png");
+        assert_eq!(fallback_for(Some("public.mpeg-4")), "video.mp4");
+        assert_eq!(fallback_for(Some("public.folder")), "folder");
+        assert_eq!(fallback_for(Some("com.adobe.pdf")), "file.pdf");
+        assert_eq!(fallback_for(Some("no.such.type")), "file");
+        assert_eq!(fallback_for(None), "file");
+    }
 }

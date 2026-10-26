@@ -2,7 +2,7 @@
 //!
 //! While the PC controls this Mac and the user drags with only the left
 //! button near the entry edge, cj-inject shows the strip there
-//! ([`Catcher::zone`]): a 2 pt, nearly invisible panel along that edge of
+//! ([`Catcher::zone`]): an 8 pt, nearly invisible panel along that edge of
 //! the main display, registered for file URLs and file promises.
 //!
 //! - `draggingEntered:` reads what the drag carries and emits `Offer`
@@ -10,7 +10,10 @@
 //!   size from the file system; a folder's size is left unknown, so the
 //!   main thread never walks a tree: its total comes with the transfer).
 //!   A file promise is `Source::Pending`, named from `fileNames` when the
-//!   source gives them before the drop (Chrome gives nil: name "").
+//!   source gives them before the drop; Chrome gives nil, so the name comes
+//!   from the promise's type instead ("image.jpg", R52). A file in another
+//!   app's container tmp (WhatsApp's) is pending too: it is copied at the
+//!   drop, before its app can delete it (R53).
 //! - `draggingExited:` emits `OfferGone`, unless a push-out carries it.
 //! - A push-out with only the left button held ([`CatchPort::push_out`],
 //!   just before cj-inject posts the release) carries the strip's drag
@@ -25,7 +28,8 @@
 //!   the strip is refused (NO), so the drag ends without dropping. A taken
 //!   drop receives its promises into
 //!   `~/Library/Caches/CursorJump/outgoing/<drag>/<item>/` on the
-//!   catcher's own queue; each read resolves its item's source.
+//!   catcher's own queue; each read resolves its item's source, renamed to
+//!   the offered name if it came under another (R52).
 //!
 //! The decisions live in [`Shared`], behind one lock, so cj-inject and the
 //! main thread see one order of events; AppKit is in `appkit`, on the main
@@ -34,19 +38,21 @@
 mod appkit;
 
 use std::collections::VecDeque;
+use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use cj_core::dnd::{DragId, DragItem, FailReason, ItemKind};
+use cj_core::dnd::{DragId, DragItem, FailReason, ItemKind, sanitize_component};
 use cj_core::proto::Side;
 use objc2::rc::autoreleasepool;
 use objc2_app_kit::{NSPasteboard, NSPasteboardNameDrag};
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
+use super::source::copy_item;
 use super::{MacDndEv, cache_dir, on_main};
 use crate::common::dnd_link::{Source, fresh_drag_id};
 use crate::mac::control::CatchPort;
@@ -58,8 +64,10 @@ use crate::mac::inject::Rectf;
 pub const LATE_DRAG_WAIT: Duration = Duration::from_millis(150);
 /// How near the entry edge (points) a held left button shows the strip.
 pub const CATCH_ZONE_PT: f64 = 48.0;
-/// The strip's thickness along the edge, in points.
-const STRIP_PT: f64 = 2.0;
+/// The strip's thickness along the edge, in points (R54): a posted drag
+/// reaches an 8 pt strip before the release; at 2 or 4 pt Chrome's drag
+/// only arrived after the up.
+const STRIP_PT: f64 = 8.0;
 /// Nearly invisible, but drawn: the window server hit-tests per pixel.
 const STRIP_ALPHA: f64 = 0.01;
 
@@ -146,21 +154,69 @@ impl Facts {
     }
 }
 
+/// What a promised file's type is, for its fallback name (R52).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum TypeKind {
+    Image,
+    Video,
+    Folder,
+    Other,
+}
+
+/// The name of a promised file whose source gave none before the drop
+/// (R52): "image", "video", "folder" or "file", with its type's preferred
+/// extension (none for a folder), made safe as the PC would make it.
+fn fallback_name(kind: TypeKind, ext: Option<&str>) -> String {
+    let stem = match kind {
+        TypeKind::Image => "image",
+        TypeKind::Video => "video",
+        TypeKind::Folder => "folder",
+        TypeKind::Other => "file",
+    };
+    let name = match ext.filter(|e| !e.is_empty() && kind != TypeKind::Folder) {
+        Some(ext) => format!("{stem}.{ext}"),
+        None => stem.to_string(),
+    };
+    sanitize_component(&name)
+}
+
+/// Whether `path` is inside another app's container tmp folder,
+/// `<home>/Library/Containers/<app>/Data/tmp/…`, which its app may empty
+/// as soon as the drag ends (R53: WhatsApp's dragged photos).
+fn in_container_tmp(path: &Path, home: &Path) -> bool {
+    let Ok(rest) = path.strip_prefix(home) else {
+        return false;
+    };
+    let parts: Vec<_> = rest.components().map(|c| c.as_os_str()).collect();
+    parts.len() > 5
+        && parts[0] == "Library"
+        && parts[1] == "Containers"
+        && parts[3] == "Data"
+        && parts[4] == "tmp"
+}
+
 /// One pasteboard item of a drag on the strip, as read on the main thread.
 #[derive(Debug, Clone, PartialEq)]
 enum Dragged {
     /// A file or folder on disk (`public.file-url`); `facts` is None if
     /// it can't be read (offered as a file of unknown size; sending it
-    /// fails the drag).
-    File { path: PathBuf, facts: Option<Facts> },
+    /// fails the drag). `scratch`: it is in another app's container tmp
+    /// (`in_container_tmp`), so it is copied at the drop (R53).
+    File {
+        path: PathBuf,
+        facts: Option<Facts>,
+        scratch: bool,
+    },
     /// A file promise: `receiver` is its index among the pasteboard's
     /// promise receivers; `names` are the files it promises, None when
     /// the source doesn't say before the drop; `dirs`, one per promised
-    /// file type, whether it is `public.folder`.
+    /// file type, whether it is `public.folder`; `fallback`, the name of a
+    /// file the source doesn't name (R52).
     Promise {
         receiver: usize,
         names: Option<Vec<String>>,
         dirs: Vec<bool>,
+        fallback: String,
     },
 }
 
@@ -171,7 +227,7 @@ type Resolve = watch::Sender<Option<Result<PathBuf, FailReason>>>;
 struct Promised {
     /// Its item in the offer: names its folder under `outgoing/<drag>/`.
     item: usize,
-    /// "" when the source didn't say.
+    /// The name it is offered under.
     name: String,
     tx: Resolve,
 }
@@ -189,11 +245,18 @@ struct Promise {
     files: Vec<Promised>,
 }
 
-/// What `draggingEntered:` offers, and what a drop must receive.
+/// A file in another app's container tmp, copied at the drop (R53).
+struct Scratch {
+    from: PathBuf,
+    to: Promised,
+}
+
+/// What `draggingEntered:` offers, and what a drop must receive or copy.
 struct Built {
     items: Vec<DragItem>,
     sources: Vec<Source>,
     promises: Vec<Promise>,
+    scratch: Vec<Scratch>,
 }
 
 /// One item per file URL and per promised file (one per promise whose
@@ -203,17 +266,22 @@ fn build_offer(dragged: Vec<Dragged>) -> Built {
         items: Vec::new(),
         sources: Vec::new(),
         promises: Vec::new(),
+        scratch: Vec::new(),
     };
     for d in dragged {
         match d {
-            Dragged::File { path, facts } => {
+            Dragged::File {
+                path,
+                facts,
+                scratch,
+            } => {
                 let name = path
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
                 let is_dir = facts.is_some_and(|f| f.is_dir);
                 b.items.push(DragItem {
-                    name,
+                    name: name.clone(),
                     kind: if is_dir {
                         ItemKind::Dir
                     } else {
@@ -222,16 +290,28 @@ fn build_offer(dragged: Vec<Dragged>) -> Built {
                     // A folder's total comes with its transfer.
                     size: facts.filter(|f| !f.is_dir).map(|f| f.len),
                 });
-                b.sources.push(Source::Ready(path));
+                if scratch {
+                    let (tx, rx) = watch::channel(None);
+                    let item = b.items.len() - 1;
+                    b.sources.push(Source::Pending(rx));
+                    let to = Promised { item, name, tx };
+                    b.scratch.push(Scratch { from: path, to });
+                } else {
+                    b.sources.push(Source::Ready(path));
+                }
             }
             Dragged::Promise {
                 receiver,
                 names,
                 dirs,
+                fallback,
             } => {
-                let names = names
+                let names: Vec<String> = names
                     .filter(|n| !n.is_empty())
-                    .unwrap_or_else(|| vec![String::new()]);
+                    .unwrap_or_else(|| vec![String::new()])
+                    .into_iter()
+                    .map(|n| if n.is_empty() { fallback.clone() } else { n })
+                    .collect();
                 let n = names.len();
                 // A type per file; otherwise, any folder type makes every
                 // file of the promise a folder.
@@ -269,13 +349,16 @@ fn build_offer(dragged: Vec<Dragged>) -> Built {
 /// the next. Files it never reads fail when this is dropped.
 struct Reading {
     drag: DragId,
+    /// Each item's folder is `<root>/<drag>/<item>/`.
+    root: PathBuf,
     files: Mutex<VecDeque<Promised>>,
 }
 
 impl Reading {
-    fn new(drag: DragId, files: Vec<Promised>) -> Reading {
+    fn new(drag: DragId, root: PathBuf, files: Vec<Promised>) -> Reading {
         Reading {
             drag,
+            root,
             files: Mutex::new(files.into()),
         }
     }
@@ -302,7 +385,9 @@ impl Reading {
                 ?path,
                 "promised file received"
             );
-            p.resolve(Ok(path));
+            let dir = item_dir(&self.root, self.drag, p.item);
+            let served = serve_as(&path, &dir, &p.name);
+            p.resolve(Ok(served));
         } else {
             let name = if p.name.is_empty() {
                 path.file_name()
@@ -318,6 +403,89 @@ impl Reading {
                 "a promised file could not be received"
             );
             p.resolve(Err(FailReason::Unreadable { name }));
+        }
+    }
+}
+
+/// `<root>/<drag>/<item>/`: where an item's promised or copied file goes.
+fn item_dir(root: &Path, drag: DragId, item: usize) -> PathBuf {
+    root.join(drag.to_string()).join(item.to_string())
+}
+
+/// The path to serve a promised file `received` from, so that the PC gets
+/// it under its offered name `offered` (R52): the PC made its placeholder
+/// from that name, and the transfer names the file after the path it
+/// reads. When the two differ (as the PC would sanitize them), it is
+/// moved into its item's own folder `dir` under the offered name. If that
+/// can't be done (that name is taken there, or the move fails), it is
+/// served as received.
+fn serve_as(received: &Path, dir: &Path, offered: &str) -> PathBuf {
+    let Some(got) = received.file_name() else {
+        return received.to_path_buf();
+    };
+    let want = sanitize_component(offered);
+    if offered.is_empty() || sanitize_component(&got.to_string_lossy()) == want {
+        return received.to_path_buf();
+    }
+    let to = dir.join(&want);
+    if std::fs::symlink_metadata(&to).is_ok() {
+        warn!(
+            ?received,
+            ?to,
+            "the offered name is taken; served as received"
+        );
+        return received.to_path_buf();
+    }
+    match std::fs::create_dir_all(dir).and_then(|()| std::fs::rename(received, &to)) {
+        Ok(()) => {
+            info!(?received, ?to, "promised file renamed to its offered name");
+            to
+        }
+        Err(e) => {
+            warn!(?received, ?to, "renaming to the offered name failed: {e}");
+            received.to_path_buf()
+        }
+    }
+}
+
+/// Copies a dragged file or folder out of another app's container tmp
+/// into its item's folder `dir`, under its own name (R53); a file copy is
+/// a clone on APFS. Never overwrites. Returns the copy.
+fn copy_scratch(from: &Path, dir: &Path) -> io::Result<PathBuf> {
+    let name = from
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no file name"))?;
+    std::fs::create_dir_all(dir)?;
+    let to = dir.join(name);
+    copy_item(from, &to)?;
+    Ok(to)
+}
+
+/// Copies each of `drag`'s files that sit in another app's container tmp,
+/// resolving its source with the copy (R53). Off the main thread.
+fn copy_all_scratch(root: &Path, drag: DragId, scratch: Vec<Scratch>) {
+    for Scratch { from, to } in scratch {
+        let dir = item_dir(root, drag, to.item);
+        match copy_scratch(&from, &dir) {
+            Ok(copy) => {
+                info!(
+                    drag,
+                    item = to.item,
+                    ?copy,
+                    "copied out of its app's tmp folder"
+                );
+                to.resolve(Ok(copy));
+            }
+            Err(e) => {
+                warn!(
+                    drag,
+                    item = to.item,
+                    ?from,
+                    "copying out of its app's tmp folder failed: {e}"
+                );
+                let name = to.name.clone();
+                to.resolve(Err(FailReason::Unreadable { name }));
+            }
         }
     }
 }
@@ -343,6 +511,14 @@ struct Catch {
     /// Its session's `draggingSequenceNumber`.
     seq: isize,
     promises: Vec<Promise>,
+    scratch: Vec<Scratch>,
+}
+
+/// A drop the strip took: what it must receive or copy.
+struct Taken {
+    drag: DragId,
+    promises: Vec<Promise>,
+    scratch: Vec<Scratch>,
 }
 
 struct State {
@@ -393,6 +569,10 @@ impl Shared {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    #[cfg_attr(
+        all(not(test), not(debug_assertions)),
+        expect(dead_code, reason = "only the tests and the catcher smoke read it")
+    )]
     fn offer(&self) -> Option<DragId> {
         Some(self.offer.load(Ordering::SeqCst)).filter(|&d| d != 0)
     }
@@ -411,6 +591,7 @@ impl Shared {
             items,
             sources,
             promises,
+            scratch,
         } = build_offer(dragged);
         let mut st = self.lock();
         let old = st.catch.take();
@@ -427,6 +608,7 @@ impl Shared {
             drag,
             seq,
             promises,
+            scratch,
         });
         self.offer.store(drag, Ordering::SeqCst);
         Some(drag)
@@ -459,8 +641,8 @@ impl Shared {
     }
 
     /// `performDragOperation:` of drag session `seq`: the drag and what
-    /// to receive if the drop is taken; None to refuse it.
-    fn perform(&self, seq: isize) -> Option<(DragId, Vec<Promise>)> {
+    /// to receive or copy if the drop is taken; None to refuse it.
+    fn perform(&self, seq: isize) -> Option<Taken> {
         let mut st = self.lock();
         let c = st.catch.take_if(|c| c.seq == seq)?;
         self.offer.store(0, Ordering::SeqCst);
@@ -480,7 +662,11 @@ impl Shared {
                 return None;
             }
         }
-        Some((c.drag, c.promises))
+        Some(Taken {
+            drag: c.drag,
+            promises: c.promises,
+            scratch: c.scratch,
+        })
     }
 
     /// See [`CatchPort::push_out`].
@@ -534,7 +720,7 @@ impl Shared {
 
     /// Where promise receiver files of `drag`'s item `item` go.
     fn promise_dir(&self, drag: DragId, item: usize) -> PathBuf {
-        self.root.join(drag.to_string()).join(item.to_string())
+        item_dir(&self.root, drag, item)
     }
 }
 
@@ -567,6 +753,10 @@ impl Catcher {
     }
 
     /// The drag on the strip now, if any.
+    #[cfg_attr(
+        not(debug_assertions),
+        expect(dead_code, reason = "only the catcher smoke reads it")
+    )]
     pub fn offer(&self) -> Option<DragId> {
         self.shared.offer()
     }
@@ -631,17 +821,18 @@ mod tests {
     #[test]
     fn the_strip_runs_along_the_edge_in_cocoa_coordinates() {
         let at = |x, y, w, h| Rectf { x, y, w, h };
-        assert_eq!(strip_frame(MBP, Side::Left), at(0.0, 0.0, 2.0, 982.0));
-        assert_eq!(strip_frame(MBP, Side::Right), at(1510.0, 0.0, 2.0, 982.0));
+        assert_eq!(strip_frame(MBP, Side::Left), at(0.0, 0.0, 8.0, 982.0));
+        assert_eq!(strip_frame(MBP, Side::Right), at(1504.0, 0.0, 8.0, 982.0));
         // Cocoa's y grows upwards: the top edge is at the frame's top.
-        assert_eq!(strip_frame(MBP, Side::Top), at(0.0, 980.0, 1512.0, 2.0));
-        assert_eq!(strip_frame(MBP, Side::Bottom), at(0.0, 0.0, 1512.0, 2.0));
+        assert_eq!(strip_frame(MBP, Side::Top), at(0.0, 974.0, 1512.0, 8.0));
+        assert_eq!(strip_frame(MBP, Side::Bottom), at(0.0, 0.0, 1512.0, 8.0));
     }
 
     fn file(path: &str, facts: Option<(bool, u64)>) -> Dragged {
         Dragged::File {
             path: path.into(),
             facts: facts.map(|(is_dir, len)| Facts { is_dir, len }),
+            scratch: false,
         }
     }
 
@@ -654,6 +845,7 @@ mod tests {
             receiver,
             names: names.map(|n| n.iter().map(|s| s.to_string()).collect()),
             dirs: dirs.to_vec(),
+            fallback: String::new(),
         }
     }
 
@@ -717,7 +909,7 @@ mod tests {
             pending(&b.sources[1]).clone(),
         );
         let [p] = <[Promise; 1]>::try_from(b.promises).ok().unwrap();
-        let reading = Reading::new(5, p.files);
+        let reading = Reading::new(5, "/out".into(), p.files);
         reading.read("/out/5/0/a.pdf".into(), true);
         assert_eq!(*a.borrow(), Some(Ok("/out/5/0/a.pdf".into())));
         reading.read("/out/5/0/b.pdf".into(), false);
@@ -812,9 +1004,9 @@ mod tests {
         let (s, log) = shared();
         let drag = s.entered(1, photo()).unwrap();
         assert_eq!(s.push_out(), Some(drag));
-        let (got, promises) = s.perform(1).expect("taken");
-        assert_eq!(got, drag);
-        assert!(promises.is_empty());
+        let taken = s.perform(1).expect("taken");
+        assert_eq!(taken.drag, drag);
+        assert!(taken.promises.is_empty() && taken.scratch.is_empty());
         assert_eq!(s.offer(), None);
         assert_eq!(events(&log), ["Offer(1)"], "no OfferGone, no LateDrop");
         assert_eq!(s.end_late_wait(true), None, "no late wait");
@@ -890,7 +1082,7 @@ mod tests {
         assert_eq!(s.push_out(), None, "nothing on the strip yet");
         s.await_late();
         let drag = s.entered(4, photo()).unwrap();
-        assert_eq!(s.perform(4).map(|(d, _)| d), Some(drag));
+        assert_eq!(s.perform(4).map(|t| t.drag), Some(drag));
         assert_eq!(events(&log), ["Offer(1)", "LateDrop"]);
         assert_eq!(s.end_late_wait(true), Some(drag));
         assert_eq!(s.end_late_wait(true), None, "once");
@@ -916,6 +1108,170 @@ mod tests {
         events(&log);
         assert_eq!(s.end_late_wait(false), Some(drag));
         assert_eq!(events(&log), ["OfferGone"]);
+    }
+
+    #[test]
+    fn a_nameless_promise_is_named_after_its_type() {
+        use TypeKind::{Folder, Image, Other, Video};
+        assert_eq!(fallback_name(Image, Some("jpeg")), "image.jpeg");
+        assert_eq!(fallback_name(Video, Some("mp4")), "video.mp4");
+        assert_eq!(fallback_name(Folder, None), "folder");
+        assert_eq!(fallback_name(Folder, Some("x")), "folder", "no extension");
+        assert_eq!(fallback_name(Other, Some("pdf")), "file.pdf");
+        assert_eq!(fallback_name(Other, None), "file");
+        assert_eq!(fallback_name(Image, Some("")), "image");
+        assert_eq!(
+            fallback_name(Other, Some("a:b")),
+            "file.a_b",
+            "made safe as the PC would"
+        );
+
+        let named = |fallback: &str, names: Option<&[&str]>| {
+            let mut d = promise(0, names);
+            if let Dragged::Promise { fallback: f, .. } = &mut d {
+                *f = fallback.into();
+            }
+            let b = build_offer(vec![d]);
+            let promised: Vec<String> =
+                b.promises[0].files.iter().map(|f| f.name.clone()).collect();
+            let offered: Vec<String> = b.items.into_iter().map(|i| i.name).collect();
+            assert_eq!(offered, promised, "offered as promised");
+            offered
+        };
+        assert_eq!(named("image.jpeg", None), ["image.jpeg"]);
+        assert_eq!(named("image.jpeg", Some(&[])), ["image.jpeg"]);
+        assert_eq!(
+            named("image.jpeg", Some(&["a.png", ""])),
+            ["a.png", "image.jpeg"]
+        );
+    }
+
+    #[test]
+    fn container_tmp_files_are_scratch() {
+        let home = Path::new("/Users/me");
+        let wa = "/Users/me/Library/Containers/net.whatsapp.WhatsApp/Data/tmp/x/IMG.jpg";
+        assert!(in_container_tmp(Path::new(wa), home));
+        assert!(in_container_tmp(
+            Path::new("/Users/me/Library/Containers/a/Data/tmp/IMG.jpg"),
+            home
+        ));
+        for not in [
+            "/Users/me/Library/Containers/a/Data/tmp",
+            "/Users/me/Library/Containers/a/Data/Documents/IMG.jpg",
+            "/Users/me/Library/Caches/a/tmp/x/IMG.jpg",
+            "/Users/me/Desktop/IMG.jpg",
+            "/Users/other/Library/Containers/a/Data/tmp/IMG.jpg",
+            "/private/var/folders/x/T/IMG.jpg",
+        ] {
+            assert!(!in_container_tmp(Path::new(not), home), "{not}");
+        }
+
+        let mut d = file(wa, Some((false, 7)));
+        if let Dragged::File { scratch, .. } = &mut d {
+            *scratch = true;
+        }
+        let b = build_offer(vec![file("/Users/me/a.txt", Some((false, 1))), d]);
+        assert_eq!(b.items[1], item("IMG.jpg", ItemKind::File, Some(7)));
+        assert!(matches!(&b.sources[0], Source::Ready(_)));
+        let rx = pending(&b.sources[1]).clone();
+        assert_eq!(b.scratch.len(), 1);
+        assert_eq!(b.scratch[0].from, Path::new(wa));
+        assert_eq!(
+            (b.scratch[0].to.item, b.scratch[0].to.name.as_str()),
+            (1, "IMG.jpg")
+        );
+        drop(b.scratch);
+        assert!(rx.has_changed().is_err(), "a drop that never came fails it");
+    }
+
+    #[test]
+    fn scratch_files_are_copied_into_their_item_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_tmp = tmp.path().join("app");
+        std::fs::create_dir_all(app_tmp.join("Album")).unwrap();
+        std::fs::write(app_tmp.join("IMG.jpg"), b"jpeg").unwrap();
+        std::fs::write(app_tmp.join("Album").join("a.jpg"), b"a").unwrap();
+        let root = tmp.path().join("outgoing");
+        let mut d = file(&app_tmp.join("IMG.jpg").to_string_lossy(), Some((false, 4)));
+        let mut album = file(&app_tmp.join("Album").to_string_lossy(), Some((true, 0)));
+        let mut gone = file(&app_tmp.join("gone.jpg").to_string_lossy(), None);
+        for x in [&mut d, &mut album, &mut gone] {
+            if let Dragged::File { scratch, .. } = x {
+                *scratch = true;
+            }
+        }
+        let b = build_offer(vec![d, album, gone]);
+        let rxs: Vec<_> = b.sources.iter().map(|s| pending(s).clone()).collect();
+        copy_all_scratch(&root, 9, b.scratch);
+        let copy = root.join("9").join("0").join("IMG.jpg");
+        assert_eq!(*rxs[0].borrow(), Some(Ok(copy.clone())));
+        assert_eq!(std::fs::read(&copy).unwrap(), b"jpeg");
+        let tree = root.join("9").join("1").join("Album");
+        assert_eq!(*rxs[1].borrow(), Some(Ok(tree.clone())));
+        assert_eq!(std::fs::read(tree.join("a.jpg")).unwrap(), b"a");
+        assert_eq!(
+            *rxs[2].borrow(),
+            Some(Err(FailReason::Unreadable {
+                name: "gone.jpg".into()
+            }))
+        );
+        // The app emptying its tmp folder no longer matters.
+        std::fs::remove_dir_all(&app_tmp).unwrap();
+        assert!(copy.exists());
+    }
+
+    #[test]
+    fn a_promised_file_is_served_under_its_offered_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let dir0 = item_dir(&root, 5, 0);
+        std::fs::create_dir_all(&dir0).unwrap();
+        let mut d = promise(0, Some(&["", "b.pdf", "c?.pdf", "d.pdf"]));
+        if let Dragged::Promise { fallback, .. } = &mut d {
+            *fallback = "image.jpeg".into();
+        }
+        let b = build_offer(vec![d]);
+        let rxs: Vec<_> = b.sources.iter().map(|s| pending(s).clone()).collect();
+        let [p] = <[Promise; 1]>::try_from(b.promises).ok().unwrap();
+        let reading = Reading::new(5, root.clone(), p.files);
+        let got = |name: &str| {
+            let path = dir0.join(name);
+            std::fs::write(&path, name).unwrap();
+            path
+        };
+        // Chrome's image, nameless before the drop: renamed in its folder.
+        reading.read(got("images.jpg"), true);
+        let image = dir0.join("image.jpeg");
+        assert_eq!(*rxs[0].borrow(), Some(Ok(image.clone())));
+        assert_eq!(std::fs::read(&image).unwrap(), b"images.jpg");
+        assert!(!dir0.join("images.jpg").exists());
+        // Received as named: served where it is.
+        reading.read(got("b.pdf"), true);
+        assert_eq!(*rxs[1].borrow(), Some(Ok(dir0.join("b.pdf"))));
+        // The same name once made safe: nothing to do.
+        reading.read(got("c_.pdf"), true);
+        assert_eq!(*rxs[2].borrow(), Some(Ok(dir0.join("c_.pdf"))));
+        // Another name: moved into its own item's folder.
+        reading.read(got("d 2.pdf"), true);
+        let d = item_dir(&root, 5, 3).join("d.pdf");
+        assert_eq!(*rxs[3].borrow(), Some(Ok(d.clone())));
+        assert!(d.exists());
+    }
+
+    #[test]
+    fn a_taken_offered_name_serves_the_file_as_received() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("0");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("image.jpeg"), b"other").unwrap();
+        std::fs::write(dir.join("x.jpg"), b"x").unwrap();
+        assert_eq!(
+            serve_as(&dir.join("x.jpg"), &dir, "image.jpeg"),
+            dir.join("x.jpg"),
+            "never overwrites"
+        );
+        assert_eq!(std::fs::read(dir.join("image.jpeg")).unwrap(), b"other");
+        assert_eq!(serve_as(&dir.join("x.jpg"), &dir, ""), dir.join("x.jpg"));
     }
 
     #[test]

@@ -201,12 +201,12 @@ impl Live {
             let _ = tx.send(net(NetEv::Closed(reason)));
         }));
 
-        let tx = events.clone();
+        let (tx, files_tx) = (events.clone(), events.clone());
         let (clip_out, stream_tasks) = spawn_stream_tasks(
             &session,
             clip_max,
             move |d| tx.send(net(NetEv::Clipboard(d))).is_ok(),
-            |_| true,
+            move |f| files_tx.send(net(NetEv::Files(f))).is_ok(),
         );
         tasks.extend(stream_tasks);
 

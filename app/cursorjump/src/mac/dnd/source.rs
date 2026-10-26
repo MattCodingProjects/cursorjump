@@ -238,7 +238,7 @@ fn put_in_place(fetched: &Path, placeholder: &Path) -> io::Result<()> {
 /// Copies a completed item (a file, or a folder's tree) to `dest`, which
 /// must not exist yet: a promise never overwrites (R20). On APFS a file
 /// copy is a clone.
-fn copy_item(src: &Path, dest: &Path) -> io::Result<()> {
+pub(super) fn copy_item(src: &Path, dest: &Path) -> io::Result<()> {
     if fs::symlink_metadata(dest).is_ok() {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
@@ -656,6 +656,10 @@ impl Drag {
         }
     }
 
+    #[cfg_attr(
+        all(not(test), not(debug_assertions)),
+        expect(dead_code, reason = "only the tests and the drag smoke ask")
+    )]
     fn all_complete(&self) -> bool {
         self.lock().items.iter().all(|x| *x == Item::Complete)
     }

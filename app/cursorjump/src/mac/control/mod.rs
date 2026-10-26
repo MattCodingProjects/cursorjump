@@ -130,6 +130,13 @@ pub trait DragPort {
 }
 
 /// For a Mac without a drag source: no PC drag starts here.
+#[cfg_attr(
+    all(not(test), not(debug_assertions)),
+    expect(
+        dead_code,
+        reason = "the tests and the catcher smoke run without a drag source"
+    )
+)]
 pub struct NoDrags;
 
 impl DragPort for NoDrags {
@@ -288,10 +295,6 @@ pub enum InjectMsg {
     },
     /// Cancel `drag` (the pill's ✕, the PC's `DragCancel`): Esc, then the
     /// button goes up if the PC doesn't hold it any more.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Task 17 sends it for the pill's ✕ and DragCancel")
-    )]
     CancelDrag {
         drag: DragId,
     },
@@ -395,6 +398,10 @@ pub struct Router<I: Inject, D: DragPort, C: CatchPort = NoCatcher> {
     late_until: Option<Instant>,
     /// How long that wait and the strip's linger last.
     late_wait: Duration,
+    /// The drag of a crossing bounced for want of Accessibility, while
+    /// the bounce runs: its `BeginDrag` and `CancelDrag` do nothing, as no
+    /// session ever starts for it (Task 17 note a).
+    no_session: Option<DragId>,
 }
 
 #[cfg(test)]
@@ -423,6 +430,7 @@ impl<I: Inject, D: DragPort, C: CatchPort> Router<I, D, C> {
             linger: None,
             late_until: None,
             late_wait: LATE_DRAG_WAIT,
+            no_session: None,
         }
     }
 
@@ -594,17 +602,15 @@ impl<I: Inject, D: DragPort, C: CatchPort> Router<I, D, C> {
                     );
                 }
                 // Neither wake nor warp: the Mac's cursor must not jump to
-                // the edge for a crossing that is undone at once. The drag
-                // is left out: no session may start (Task 17 note a).
-                let mut out = self.feed_quietly(
-                    sid,
-                    MacEvent::Enter {
-                        edge,
-                        frac,
-                        drag: None,
-                    },
-                );
+                // the edge for a crossing that is undone at once. The
+                // machine hears the real drag, so the `Leave` carries it
+                // home, but no session starts or is cancelled for it
+                // (Task 17 note a); one already riding here is left to the
+                // machine as usual.
+                self.no_session = drag.filter(|&d| self.ride.is_none_or(|r| r.drag != d));
+                let mut out = self.feed_quietly(sid, MacEvent::Enter { edge, frac, drag });
                 out.extend(self.bounce(sid, frac));
+                self.no_session = None;
                 out
             }
             // A held drop keeps the cursor on the drop spot.
@@ -714,6 +720,9 @@ impl<I: Inject, D: DragPort, C: CatchPort> Router<I, D, C> {
                 MacAction::ReleaseAllInjected => self.inj.release_all(),
                 MacAction::StartControl => out.push(InjectEv::Controlled { sid, on: true }),
                 MacAction::StopControl => out.push(InjectEv::Controlled { sid, on: false }),
+                // A bounced crossing's drag: no session, so nothing to do.
+                MacAction::BeginDrag { drag } | MacAction::CancelDrag { drag }
+                    if self.no_session == Some(drag) => {}
                 MacAction::BeginDrag { drag } => self.begin_drag(drag),
                 // Before any ReleaseAllInjected or BeginDrag of the list.
                 MacAction::CancelDrag { drag } => {

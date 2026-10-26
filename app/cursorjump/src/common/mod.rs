@@ -2,13 +2,6 @@
 
 pub mod clipboard_bridge;
 pub mod config_file;
-#[cfg_attr(
-    all(not(test), not(windows)),
-    expect(
-        dead_code,
-        reason = "the Mac app drives drags through it in later tasks"
-    )
-)]
 pub mod dnd_link;
 #[cfg_attr(
     all(not(test), not(windows)),
@@ -18,20 +11,9 @@ pub mod dnd_link;
     )
 )]
 pub mod link_fetch;
-#[cfg_attr(
-    all(not(test), not(windows), not(debug_assertions)),
-    expect(
-        dead_code,
-        reason = "release Mac builds draw pills once Task 17 wires them in (debug builds draw them in --smoke-pill)"
-    )
-)]
 pub mod pill_render;
 pub mod session_tasks;
 pub mod settings_window;
-#[cfg_attr(
-    all(not(test), not(windows)),
-    expect(dead_code, reason = "the Mac app uses it in later tasks")
-)]
 pub mod transfer;
 
 use cj_core::config::Config;

@@ -5,19 +5,24 @@
 //! Input never goes through the loop: the session readers (`link.rs`) send
 //! it straight to the injection thread (`control.rs`), which reports back
 //! only when to send `Leave`. The listener, the advertiser, the injection
-//! thread and the clipboard bridge live as long as the process.
+//! thread, the clipboard bridge, the drag source, the edge catcher and the
+//! pills live as long as the process; the drags' part of the loop is in
+//! `drags.rs`.
+
+mod drags;
 
 use std::fs::{File, OpenOptions, TryLockError};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 use cj_core::clipboard::ClipboardData;
 use cj_core::config::Config;
+use cj_core::dnd::DragId;
 use cj_core::latency::LatencyStats;
 use cj_core::proto::{Control, Datagram};
 use cj_net::discovery::{Advertiser, DISCOVERY_PORT, QUIC_PORT};
@@ -26,14 +31,16 @@ use cj_net::{Identity, Trust};
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::JoinHandle;
-use tokio::time::{Instant, MissedTickBehavior, interval, sleep_until};
+use tokio::time::{Instant, MissedTickBehavior, interval, interval_at, sleep_until};
 use tracing::{debug, error, info, warn};
 
 use super::clipboard::{read_clipboard, spawn_clipboard_watcher, write_clipboard};
 use super::control::{
-    InjectEv, InjectMsg, NoCatcher, NoDrags, set_user_interactive_qos, spawn_inject_thread,
-    update_access,
+    InjectEv, InjectMsg, set_user_interactive_qos, spawn_inject_thread, update_access,
 };
+use super::dnd::MacDndEv;
+use super::dnd::catcher::Catcher;
+use super::dnd::source::DragSource;
 use super::inject::Injector;
 use super::link::{Live, run_pairing};
 use super::netd::AwdlKeeper;
@@ -41,15 +48,18 @@ use super::permissions::{
     AccessState, RelaunchVia, access_state, may_relaunch, read_relaunch_stamp, relaunch_via,
     reopen_command, request_post_event_access, write_relaunch_stamp,
 };
-use super::power::KeepAwake;
+use super::pill::pill_host;
+use super::power::{KeepAwake, on_will_sleep};
 use crate::common::clipboard_bridge::{ClipboardLink, bridge_clipboard};
 use crate::common::config_file::ConfigFile;
+use crate::common::dnd_link::DndEv;
 use crate::common::paired_fingerprint;
 use crate::common::session_tasks::NetEv;
 use crate::common::settings_window::SettingsWindow;
 use crate::paths;
 use crate::ui::dialogs;
 use crate::ui::tray::{TrayCmd, TrayModel, latency_text, run_tray};
+use drags::{Drags, Pills, SWEEP_EVERY};
 
 const PING_EVERY: Duration = Duration::from_millis(100);
 const CONFIG_POLL: Duration = Duration::from_millis(500);
@@ -127,17 +137,56 @@ pub fn run_mac() -> Result<()> {
             "Accessibility is on, but posting events is not confirmed"
         );
     }
-    // Task 17 passes the drag source (dnd::source::DragSource) and the
-    // catcher (dnd::catcher::Catcher) instead.
+    // The drag source's and the catcher's events: what cj-inject must hear
+    // goes to it directly; everything goes to the loop, on the one channel
+    // cj-inject reports on too, so a catcher `Offer` is always in the loop
+    // before the `SendLeave` that carries it. Never blocks, and never
+    // calls back into the source or the catcher.
+    let to_inject: Arc<OnceLock<crossbeam_channel::Sender<InjectMsg>>> = Arc::default();
+    let dnd_events = {
+        let (to_inject, events) = (to_inject.clone(), events.clone());
+        move |ev: MacDndEv| {
+            if let Some(msg) = ev.inject_msg()
+                && let Some(tx) = to_inject.get()
+            {
+                let _ = tx.send(msg);
+            }
+            let _ = events.send(Ev::MacDnd(ev));
+        }
+    };
+    let source = DragSource::new(dnd_events.clone());
+    let catcher = Catcher::new(dnd_events);
     let inject = spawn_inject_thread(
         Injector::new()?,
-        NoDrags,
-        None::<NoCatcher>,
+        source,
+        Some(catcher),
         access.clone(),
         move |ev| {
             let _ = inject_events.send(Ev::Inject(ev));
         },
     )?;
+    // Nothing is armed or caught before a session, so no event is lost.
+    let _ = to_inject.set(inject.clone());
+    let pills: Pills = {
+        let events = events.clone();
+        Arc::new(pill_host(move |drag| {
+            let _ = events.send(Ev::PillCancel(drag));
+        }))
+    };
+    let (drags, drag_events) = Drags::new(pills, inject.clone());
+    // Kept until the process ends.
+    let _sleep = match objc2::MainThreadMarker::new() {
+        Some(mtm) => {
+            let events = events.clone();
+            Some(on_will_sleep(mtm, move || {
+                let _ = events.send(Ev::WillSleep);
+            }))
+        }
+        None => {
+            warn!("not on the main thread: drags won't end before sleep");
+            None
+        }
+    };
     let clip_link = Arc::new(ClipboardLink::new(cfg.clipboard_max_bytes));
     let clip_events = events.clone();
     let clip_write = bridge_clipboard(
@@ -160,7 +209,14 @@ pub fn run_mac() -> Result<()> {
     std::thread::Builder::new()
         .name("cj-link".into())
         .spawn(move || {
-            let app = App::new(cfg, config_file, listener, advertiser, channels);
+            let app = App::new(
+                cfg,
+                config_file,
+                listener,
+                advertiser,
+                channels,
+                (drags, drag_events),
+            );
             runtime.block_on(app.run(events_rx));
             // Dropping the app drops the tray's model sender, which ends the process.
         })
@@ -236,6 +292,17 @@ pub(super) enum Ev {
         ev: NetEv,
     },
     Inject(InjectEv),
+    /// From the drag source and the edge catcher.
+    MacDnd(MacDndEv),
+    /// The drag source stopped waiting for item `item` of `drag`.
+    FetchUnwanted {
+        drag: DragId,
+        item: u32,
+    },
+    /// A running pill's close button.
+    PillCancel(DragId),
+    /// The Mac is about to sleep.
+    WillSleep,
     /// A local copy that passed the clipboard gate.
     LocalClipboard(ClipboardData),
     /// The result of Accessibility poll number `seq`.
@@ -389,6 +456,9 @@ struct App {
     /// Started by hand, and the Accessibility grant needs a new process:
     /// open this app bundle again on the way out.
     reopen: Option<PathBuf>,
+    drags: Drags,
+    /// The links' events; taken by `run`.
+    drag_events: Option<UnboundedReceiver<DndEv>>,
 }
 
 impl App {
@@ -398,6 +468,7 @@ impl App {
         listener: Listener,
         advertiser: Option<Advertiser>,
         ch: Channels,
+        (drags, drag_events): (Drags, UnboundedReceiver<DndEv>),
     ) -> App {
         let latency = LatencyStats::new();
         let awdl = AwdlKeeper::spawn()
@@ -425,6 +496,8 @@ impl App {
             done: false,
             restart: false,
             reopen: None,
+            drags,
+            drag_events: Some(drag_events),
         }
     }
 
@@ -440,6 +513,12 @@ impl App {
         let mut sigterm = signal(SignalKind::terminate())
             .inspect_err(|e| warn!("SIGTERM will not quit cleanly: {e}"))
             .ok();
+        let mut sweep = interval_at(Instant::now() + SWEEP_EVERY, SWEEP_EVERY);
+        sweep.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let Some(mut drag_events) = self.drag_events.take() else {
+            return;
+        };
+        self.sweep_temp_dirs(true);
         self.publish();
         loop {
             let quit_by = self.quit_by;
@@ -457,6 +536,8 @@ impl App {
                 _ = latency_refresh.tick() => self.latency_text = latency_text(&self.latency),
                 _ = latency_log.tick() => self.log_latency(),
                 _ = access_poll.tick() => self.poll_access(),
+                Some(ev) = drag_events.recv() => self.on_link_dnd(ev).await,
+                _ = sweep.tick() => self.sweep_temp_dirs(false),
                 () = terminated(&mut sigterm) => {
                     info!("SIGTERM received");
                     self.begin_quit();
@@ -531,10 +612,14 @@ impl App {
             Ev::PairDone { sid, result } => self.on_pair_done(sid, result).await,
             Ev::Net { sid, ev } => {
                 if self.live().is_some_and(|l| l.sid == sid) {
-                    self.on_net(ev);
+                    self.on_net(ev).await;
                 }
             }
             Ev::Inject(ev) => self.on_inject(ev).await,
+            Ev::MacDnd(ev) => self.on_mac_dnd(ev).await,
+            Ev::FetchUnwanted { drag, item } => self.on_fetch_unwanted(drag, item),
+            Ev::PillCancel(drag) => self.on_pill_cancel(drag).await,
+            Ev::WillSleep => self.on_will_sleep().await,
             Ev::LocalClipboard(d) => {
                 // The bridge already gated it; the session may have ended since.
                 if let Some(live) = self.live() {
@@ -545,17 +630,25 @@ impl App {
         }
     }
 
-    fn on_net(&mut self, ev: NetEv) {
+    async fn on_net(&mut self, ev: NetEv) {
         match ev {
+            NetEv::Control(
+                c @ (Control::DragOffer { .. }
+                | Control::DragCancel { .. }
+                | Control::FileFetch { .. }
+                | Control::DragFinished { .. }),
+            ) => self.on_drag_control(c).await,
             NetEv::Control(c) => debug!(?c, "ignoring unexpected control message"),
-            NetEv::Pong { rtt, at } => self.latency.record(at, rtt),
+            NetEv::Pong { rtt, at } => {
+                self.latency.record(at, rtt);
+                self.drags.on_rtt(rtt, at);
+            }
             NetEv::Clipboard(d) => {
                 if !d.is_empty() && self.ch.clip_write.send(d).is_err() {
                     warn!("clipboard bridge is gone; clipboard from the PC dropped");
                 }
             }
-            // Dropping it refuses the stream.
-            NetEv::Files(_) => {}
+            NetEv::Files(files) => self.on_files(files),
             NetEv::Closed(reason) => {
                 info!("disconnected: {reason}");
                 self.set_conn(Conn::Waiting);
@@ -565,10 +658,7 @@ impl App {
 
     async fn on_inject(&mut self, ev: InjectEv) {
         match ev {
-            // Task 17 sends the catcher's offer first and passes `drag`
-            // (`leave_needs_offer`); without a catcher or a drag source,
-            // nothing rides either way yet.
-            InjectEv::SendLeave { sid, frac, .. } => {
+            InjectEv::SendLeave { sid, frac, drag } => {
                 let Some(session) = self
                     .live()
                     .filter(|l| l.sid == sid)
@@ -576,11 +666,10 @@ impl App {
                 else {
                     return;
                 };
+                // The catcher's drag is offered first.
+                let drag = self.leave_drag(drag).await;
                 // Awaited here, outside any select!: send_control is not cancel-safe.
-                if let Err(e) = session
-                    .send_control(&Control::Leave { frac, drag: None })
-                    .await
-                {
+                if let Err(e) = session.send_control(&Control::Leave { frac, drag }).await {
                     info!("disconnected: control stream: {e:#}");
                     self.set_conn(Conn::Waiting);
                 }
@@ -622,8 +711,12 @@ impl App {
     }
 
     /// Replaces the connection; the old one is closed (a live one first
-    /// releases everything on the injection thread).
+    /// ends its drags, then releases everything on the injection thread).
     fn set_conn(&mut self, conn: Conn) {
+        if matches!(self.conn, Conn::Live(_)) {
+            // Before the machine's `Disconnected`, which dropping it sends.
+            self.drags.disconnected();
+        }
         self.conn = conn;
         match (&self.conn, &self.awake) {
             (Conn::Live(_), None) => match KeepAwake::start() {
@@ -708,7 +801,9 @@ impl App {
             &self.ch.events,
         );
         info!(peer = %live.peer_name, "connected");
+        let session = live.session.clone();
         self.set_conn(Conn::Live(live));
+        self.drags.connect(&session);
         self.send_mac_ready().await;
     }
 

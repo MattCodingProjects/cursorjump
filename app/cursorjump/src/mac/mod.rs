@@ -5,25 +5,11 @@ pub mod app;
 pub mod autostart;
 pub mod clipboard;
 pub mod control;
-#[cfg_attr(
-    not(debug_assertions),
-    expect(
-        dead_code,
-        reason = "the pills, the drag source and the catcher are used once Task 17 wires them in"
-    )
-)]
 mod dnd;
 pub mod inject;
 mod link;
 mod netd;
 pub mod permissions;
-#[cfg_attr(
-    not(debug_assertions),
-    expect(
-        dead_code,
-        reason = "Task 17 wires the pills into the app; debug builds run them in --smoke-pill"
-    )
-)]
 pub mod pill;
 pub mod power;
 

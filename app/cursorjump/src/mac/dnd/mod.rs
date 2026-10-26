@@ -54,10 +54,6 @@ pub enum MacDndEv {
     },
     /// The user let go while the drag rode here, at `at` (global points,
     /// origin top left of the main display): R49, the pill starts now.
-    #[cfg_attr(
-        debug_assertions,
-        expect(dead_code, reason = "Task 17 starts the pill from it")
-    )]
     Released { drag: DragId, at: (f64, f64) },
     /// Every item of `drag`'s `crossing` is in place.
     Ready { drag: DragId, crossing: Crossing },
@@ -66,10 +62,6 @@ pub enum MacDndEv {
     NeedsEscape { drag: DragId, crossing: Crossing },
     /// Item `item` of `drag`'s `crossing` failed; cj-inject cancels the
     /// drag.
-    #[cfg_attr(
-        all(debug_assertions, not(test)),
-        expect(dead_code, reason = "Task 17 tells the pill why")
-    )]
     Failed {
         drag: DragId,
         crossing: Crossing,

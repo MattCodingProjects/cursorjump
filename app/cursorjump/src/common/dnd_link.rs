@@ -617,6 +617,34 @@ impl DndLink {
         true
     }
 
+    /// Stops one fetch of an incoming drag, quietly: the target no longer
+    /// wants that item (the Mac's prefetch for a drag that went home or
+    /// was cancelled). The origin is not told and the drag goes on; only
+    /// that item's send stops. Received as `Cancelled` (or the drag's
+    /// cancel reason). Nothing if the item isn't being fetched.
+    #[cfg_attr(
+        all(windows, not(test)),
+        expect(dead_code, reason = "only the Mac's prefetch drops a single fetch")
+    )]
+    pub fn stop_fetch(&mut self, drag: DragId, item: u32) {
+        let mut st = self.lock();
+        let Some(inc) = st.incoming.get_mut(&drag) else {
+            return;
+        };
+        let Some(f) = inc.fetches.get(&item) else {
+            return;
+        };
+        if f.started {
+            // Its transfer stops and is received then.
+            f.cancel.cancel();
+            return;
+        }
+        // Its stream, if it still comes, finds no fetch and is refused.
+        inc.fetches.remove(&item);
+        let result = Err(inc.reason.clone().unwrap_or(FailReason::Cancelled));
+        self.shared.emit(DndEv::Received { drag, item, result });
+    }
+
     /// Cancels a drag, either way, and tells the other computer.
     pub async fn cancel(&mut self, drag: DragId, reason: FailReason) -> Result<()> {
         if !self.cancel_here(drag, &reason) {
@@ -1352,6 +1380,57 @@ mod tests {
         assert_eq!(p.finished(At::Origin, 9), [&cancelled]);
         assert_eq!(p.finished(At::Receiver, 9), [&cancelled]);
         assert_eq!(p.received(9, 0).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_stopped_fetch_ends_quietly_and_the_drag_goes_on() {
+        let (src, dest) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let big = write(src.path(), "big.iso", BIG, 5);
+        let small = write(src.path(), "small.txt", 1000, 6);
+        let (_never, never_rx) = watch::channel(None);
+        let mut p = Pair::new().await;
+        let items = vec![
+            file("big.iso", BIG),
+            file("small.txt", 1000),
+            file("later.txt", 10),
+        ];
+        let sources = vec![
+            Source::Ready(big),
+            Source::Ready(small),
+            Source::Pending(never_rx),
+        ];
+        p.offer(9, items, sources).await;
+        for item in 0..3 {
+            fs::create_dir(dest.path().join(item.to_string())).unwrap();
+        }
+        for item in [0, 2] {
+            let into = Dest::InDir(dest.path().join(item.to_string()));
+            p.receiver.link.fetch(9, item, into).await.unwrap();
+        }
+        p.until(|p| p.has_progress(9)).await;
+
+        // In flight, and not started yet (its source isn't ready).
+        p.receiver.link.stop_fetch(9, 0);
+        p.receiver.link.stop_fetch(9, 2);
+        p.receiver.link.stop_fetch(9, 1); // Not fetched: nothing.
+        p.until(|p| !p.received(9, 0).is_empty() && !p.received(9, 2).is_empty())
+            .await;
+        assert_eq!(p.received(9, 0), [&Err(FailReason::Cancelled)]);
+        assert_eq!(p.received(9, 2), [&Err(FailReason::Cancelled)]);
+        assert!(names(&dest.path().join("0")).is_empty(), "no part left");
+
+        // The drag goes on: nobody was told, and another item still comes.
+        let into = Dest::InDir(dest.path().join("1"));
+        p.receiver.link.fetch(9, 1, into).await.unwrap();
+        p.until(|p| !p.received(9, 1).is_empty()).await;
+        assert_eq!(
+            p.received(9, 1),
+            [&Ok(dest.path().join("1").join("small.txt"))]
+        );
+        assert!(p.cancels_to(At::Receiver, 9).is_empty());
+        assert!(p.cancels_to(At::Origin, 9).is_empty());
+        assert!(p.finished(At::Origin, 9).is_empty());
+        assert!(p.receiver.link.items(9).is_some());
     }
 
     #[tokio::test]
