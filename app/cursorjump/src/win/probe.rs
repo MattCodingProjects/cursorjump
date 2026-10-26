@@ -9,7 +9,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
 
-fn virtual_screen() -> Rect {
+pub(super) fn virtual_screen() -> Rect {
     // SAFETY: GetSystemMetrics has no preconditions.
     let (x, y, w, h) = unsafe {
         (

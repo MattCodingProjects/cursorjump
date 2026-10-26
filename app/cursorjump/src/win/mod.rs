@@ -4,6 +4,14 @@ pub mod autostart;
 mod bridges;
 pub mod clipboard;
 pub mod cursor;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the app starts the drag-and-drop thread in a later task"
+    )
+)]
+pub mod dnd;
 pub mod input_thread;
 mod link;
 pub mod monitors;
@@ -65,7 +73,7 @@ const RECROSS_COOLDOWN: Duration = Duration::from_secs(2);
 /// and simulates crossing on edge pushes and returning on the hotkey.
 pub fn run_diagnose(run_for: Duration) {
     set_diagnose_logging(true);
-    let (cmd_tx, msg_rx) = spawn_input_thread(Config::default());
+    let (cmd_tx, msg_rx) = spawn_input_thread(Config::default(), None);
     info!(
         seconds = run_for.as_secs(),
         "diagnose: push against the Mac edge to cross; Ctrl+Alt+Shift+H or Ctrl+Alt+Home returns (auto-return after {} s)",
@@ -188,7 +196,7 @@ impl Diagnose {
                 } else if self.on_mac_since.is_none() {
                     self.frac = frac;
                     self.on_mac_since = Some(Instant::now());
-                    let _ = self.cmd_tx.send(InputCmd::EnterMac);
+                    let _ = self.cmd_tx.send(InputCmd::EnterMac { drag: None });
                 }
             }
             InputMsg::Edge(ev @ (PcEvent::ReturnHotkey | PcEvent::HookLost)) => {

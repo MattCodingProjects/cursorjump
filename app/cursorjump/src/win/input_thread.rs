@@ -3,6 +3,9 @@
 //! On the PC it only watches Raw Input (no hooks) and reports pushes against
 //! the edge that leads to the Mac. Between `EnterMac` and `ReturnToPc` it owns
 //! low-level mouse and keyboard hooks that swallow local input and forward it.
+//! The one exception: real left presses and releases also reach Windows while
+//! one of CursorJump's own drag-and-drop windows lies under the park point
+//! (see `hook_verdict`), so a drag can end on, or start from, that window.
 //!
 //! All state lives in a thread-local: the hook procedures and the window
 //! procedure run on this same thread, so no locks are needed.
@@ -14,6 +17,8 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use cj_core::config::Config;
+use cj_core::dnd::DragId;
+use cj_core::gaming::game_locked;
 use cj_core::input::{MotionScaler, WheelAxis};
 use cj_core::keymap::{KeyRouter, PcKey, Route, is_return_hotkey, pc_to_mac};
 use cj_core::layout::{Rect, edge_frac, is_pushing_out, point_on_edge};
@@ -41,16 +46,17 @@ use windows::Win32::UI::Input::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos,
     GetMessageW, HHOOK, KBDLLHOOKSTRUCT, KillTimer, LLKHF_EXTENDED, LLKHF_INJECTED, LLMHF_INJECTED,
-    MSG, MSLLHOOKSTRUCT, PostThreadMessageW, RegisterClassExW, SetCursorPos, SetTimer,
-    SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE, WM_APP,
-    WM_DISPLAYCHANGE, WM_INPUT, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
-    WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_SETTINGCHANGE, WM_SYSKEYDOWN, WM_TIMER, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSEXW, WS_POPUP,
-    XBUTTON1, XBUTTON2,
+    MSG, MSLLHOOKSTRUCT, PostThreadMessageW, RI_MOUSE_LEFT_BUTTON_DOWN, RI_MOUSE_LEFT_BUTTON_UP,
+    RegisterClassExW, SetCursorPos, SetTimer, SetWindowsHookExW, UnhookWindowsHookEx,
+    WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE, WM_APP, WM_DISPLAYCHANGE, WM_INPUT, WM_KEYDOWN,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_SYSKEYDOWN, WM_TIMER,
+    WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSEXW, WS_POPUP, XBUTTON1, XBUTTON2,
 };
 use windows::core::w;
 
 use super::cursor::{hide_system_cursors, restore_system_cursors};
+use super::dnd::{DndCmd, DndPort, in_catch_zone, ours_under};
 use super::monitors::{edge_monitor, monitors};
 use super::probe::probe_game;
 
@@ -75,6 +81,14 @@ const MAX_HOOK_DELTA: i32 = 200;
 const DESKTOP_POLL: Duration = Duration::from_millis(150);
 /// The input window's timer id for the desktop check.
 const DESKTOP_TIMER: usize = 1;
+/// While on the Mac, how often the window under the park point is checked (`PARK_TIMER`).
+const PARK_POLL: Duration = Duration::from_millis(250);
+/// The input window's timer id for the park-point check.
+const PARK_TIMER: usize = 2;
+/// Longest wait for the catcher to cover the screen before parking with a drag.
+const PARK_WAIT: Duration = Duration::from_millis(100);
+/// While the strip's other conditions hold, a game check is reused this long.
+const ZONE_PROBE_EVERY: Duration = Duration::from_millis(100);
 
 /// When set (diagnose mode), log every raw key event and the entry key snapshot.
 static DIAGNOSE_LOG: AtomicBool = AtomicBool::new(false);
@@ -110,8 +124,14 @@ pub enum InputMsg {
 /// App → input thread.
 #[derive(Debug, Clone)]
 pub enum InputCmd {
-    EnterMac,
-    ReturnToPc { pc_frac: f32 },
+    /// `drag`: the PC's file drag rides along (the catcher then covers the
+    /// screen before the cursor is parked).
+    EnterMac {
+        drag: Option<DragId>,
+    },
+    ReturnToPc {
+        pc_frac: f32,
+    },
     ApplyConfig(Config),
     Quit,
 }
@@ -119,8 +139,12 @@ pub enum InputCmd {
 /// Start the input thread. Commands sent on the returned `Sender` are relayed
 /// to the thread and it is woken with `PostThreadMessageW(WM_APP)`. Dropping
 /// every `Sender` stops the thread as if `Quit` had been sent.
+///
+/// `dnd`: the drag-and-drop thread, for the edge catcher and the shield;
+/// `None` keeps phase 1's behaviour (Task 13 passes it).
 pub fn spawn_input_thread(
     cfg: Config,
+    dnd: Option<DndPort>,
 ) -> (
     mpsc::Sender<InputCmd>,
     crossbeam_channel::Receiver<InputMsg>,
@@ -136,7 +160,7 @@ pub fn spawn_input_thread(
 
     std::thread::Builder::new()
         .name("cj-input".into())
-        .spawn(move || run(cfg, msg_tx, relay_rx, alive, ready_tx))
+        .spawn(move || run(cfg, dnd, msg_tx, relay_rx, alive, ready_tx))
         .expect("spawn input thread");
 
     // The thread reports its id once its window (and so its message queue)
@@ -237,6 +261,8 @@ struct MacStay {
     entered_at: Instant,
     last_hook_motion: Instant,
     hook_lost_sent: bool,
+    /// The last real left press was passed to Windows, so its release must be too.
+    left_passed: bool,
 }
 
 impl MacStay {
@@ -247,6 +273,7 @@ impl MacStay {
             entered_at: now,
             last_hook_motion: now,
             hook_lost_sent: false,
+            left_passed: false,
         }
     }
 
@@ -323,6 +350,12 @@ struct State {
     entry_twins: HashSet<PcKey>,
     /// Motion and wheel rounding remainders; reset at each entry.
     scaler: MotionScaler,
+    /// The drag-and-drop thread; `None` until Task 13 wires it.
+    dnd: Option<DndPort>,
+    /// The last `CatcherZone` sent.
+    zone: bool,
+    /// The last game check made for the strip, and when.
+    zone_game: Option<(Instant, bool)>,
 }
 
 thread_local! {
@@ -340,6 +373,7 @@ fn with_state<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> {
 
 fn run(
     cfg: Config,
+    dnd: Option<DndPort>,
     out: crossbeam_channel::Sender<InputMsg>,
     cmds: mpsc::Receiver<InputCmd>,
     receiver_alive: Arc<AtomicBool>,
@@ -361,6 +395,7 @@ fn run(
     info!(?edge, side = ?cfg.mac_side, "input thread: edge monitor");
     let mut state = State::new(cfg, out, edge);
     state.hwnd = hwnd;
+    state.dnd = dnd;
     STATE.with(|cell| *cell.borrow_mut() = Some(state));
 
     if ready.send(unsafe { GetCurrentThreadId() }).is_ok() {
@@ -416,6 +451,15 @@ impl State {
             held: HashSet::with_capacity(32),
             entry_twins: HashSet::with_capacity(8),
             scaler: MotionScaler::default(),
+            dnd: None,
+            zone: false,
+            zone_game: None,
+        }
+    }
+
+    fn send_dnd(&self, cmd: DndCmd) {
+        if let Some(dnd) = &self.dnd {
+            dnd.send(cmd);
         }
     }
 
@@ -426,9 +470,10 @@ impl State {
     fn on_command(&mut self, cmd: InputCmd) {
         self.edge_quiet_until = None;
         match cmd {
-            InputCmd::EnterMac => self.enter_mac(),
+            InputCmd::EnterMac { drag } => self.enter_mac(drag),
             InputCmd::ReturnToPc { pc_frac } => self.return_to_pc(pc_frac),
             InputCmd::ApplyConfig(cfg) => {
+                self.send_dnd(DndCmd::ApplyConfig(cfg.clone()));
                 self.cfg = cfg;
                 self.refresh_monitors();
             }
@@ -445,9 +490,40 @@ impl State {
         if let (Some(stay), Some(edge)) = (&mut self.mac, edge) {
             stay.center = park_and_read_back(rect_center(&edge));
         }
+        self.check_park();
     }
 
-    fn enter_mac(&mut self) {
+    /// Whether one of our drag-and-drop windows lies under the park point,
+    /// for the mouse hook (which must not ask Windows itself).
+    fn check_park(&mut self) {
+        let (Some(stay), Some(dnd)) = (&self.mac, &self.dnd) else {
+            return;
+        };
+        let ours = ours_under(&dnd.shared, stay.center);
+        let was = dnd.shared.under_park_is_ours.swap(ours, Ordering::AcqRel);
+        if ours != was {
+            debug!(ours, "park point: our window under it changed");
+        }
+    }
+
+    /// Before parking with a drag: the catcher must already cover the park
+    /// point, or the drag would leave it for whatever window is there.
+    fn cover_park_point(&self) {
+        let Some(dnd) = &self.dnd else {
+            return;
+        };
+        dnd.send(DndCmd::Park(true));
+        let until = Instant::now() + PARK_WAIT;
+        while !dnd.shared.parked.load(Ordering::Acquire) {
+            if Instant::now() >= until {
+                warn!("catcher did not cover the screen in time; parking anyway");
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn enter_mac(&mut self, drag: Option<DragId>) {
         if self.mac.is_some() {
             debug!("EnterMac ignored: already on the Mac");
             return;
@@ -467,6 +543,9 @@ impl State {
         // or jumps; park again in case it moved while the hooks were installed.
         let before = cursor_pos();
         hide_system_cursors();
+        if drag.is_some() {
+            self.cover_park_point();
+        }
         let target = rect_center(&edge);
         park_cursor(target);
         let hooks = match install_hooks() {
@@ -479,6 +558,9 @@ impl State {
                 }
                 restore_system_cursors();
                 self.forget_entry_keys();
+                if drag.is_some() {
+                    self.send_dnd(DndCmd::Park(false));
+                }
                 self.enter_failed();
                 return;
             }
@@ -494,6 +576,18 @@ impl State {
                 "desktop check: SetTimer failed: {}",
                 windows::core::Error::from_thread()
             );
+        }
+        if self.dnd.is_some() {
+            self.send_dnd(DndCmd::Shield(true));
+            self.check_park();
+            // SAFETY: as above.
+            let ms = PARK_POLL.as_millis() as u32;
+            if unsafe { SetTimer(Some(self.hwnd), PARK_TIMER, ms, None) } == 0 {
+                warn!(
+                    "park check: SetTimer failed: {}",
+                    windows::core::Error::from_thread()
+                );
+            }
         }
     }
 
@@ -581,8 +675,15 @@ impl State {
         };
         remove_hooks(stay.hooks);
         info!("hooks: removed");
-        // SAFETY: kills this thread's own timer; failure means it was not running.
+        // SAFETY: kills this thread's own timers; failure means one was not running.
         let _ = unsafe { KillTimer(Some(self.hwnd), DESKTOP_TIMER) };
+        let _ = unsafe { KillTimer(Some(self.hwnd), PARK_TIMER) };
+        if let Some(dnd) = &self.dnd {
+            dnd.shared
+                .under_park_is_ours
+                .store(false, Ordering::Release);
+            dnd.send(DndCmd::Shield(false));
+        }
         self.recross.disarm();
         if let Some(pt) = park_at {
             park_cursor(pt);
@@ -597,10 +698,22 @@ impl State {
         restore_system_cursors();
     }
 
-    /// Relative motion from Raw Input (absolute devices report 0, 0).
-    fn on_raw_mouse(&mut self, dx: i32, dy: i32) {
+    /// Relative motion from Raw Input (absolute devices report 0, 0) and its
+    /// button flags (`RI_MOUSE_*`).
+    fn on_raw_mouse(&mut self, dx: i32, dy: i32, buttons: u32) {
         let moved = dx != 0 || dy != 0;
         let now = Instant::now();
+        if let Some(dnd) = &self.dnd {
+            if buttons & RI_MOUSE_LEFT_BUTTON_DOWN != 0 {
+                dnd.shared.left_down.store(true, Ordering::Release);
+            }
+            if buttons & RI_MOUSE_LEFT_BUTTON_UP != 0 {
+                dnd.shared.left_down.store(false, Ordering::Release);
+            }
+        }
+        if self.mac.is_none() && (moved || buttons != 0) {
+            self.update_catch_zone(now);
+        }
         if let Some(stay) = &mut self.mac {
             if stay.watchdog_trips(moved, now) {
                 warn!("watchdog: raw motion but no mouse hook events; hook lost");
@@ -635,12 +748,52 @@ impl State {
             return;
         }
         self.edge_quiet_until = Some(now + EDGE_DEBOUNCE);
+        let (left, others) = (is_down(VK_LBUTTON.0), other_buttons_held());
+        let offer = self
+            .dnd
+            .as_ref()
+            .and_then(|d| offer_for(left, others, d.shared.offer.load(Ordering::Acquire)));
         self.send(InputMsg::Edge(PcEvent::EdgePush {
             frac: edge_frac(&edge, side, x, y),
             game: probe_game(),
-            buttons_held: mouse_buttons_held(),
-            offer: None,
+            buttons_held: left || others,
+            offer,
         }));
+    }
+
+    /// Show the edge strip while the left button alone is held near the Mac
+    /// edge and no game holds the mouse; hide it once any of that stops.
+    fn update_catch_zone(&mut self, now: Instant) {
+        if self.dnd.is_none() {
+            return;
+        }
+        let want = self.catch_zone_wanted(now);
+        if want != self.zone {
+            self.zone = want;
+            debug!(want, "catcher zone");
+            self.send_dnd(DndCmd::CatcherZone(want));
+        }
+    }
+
+    fn catch_zone_wanted(&mut self, now: Instant) -> bool {
+        let near = || {
+            let (edge, (x, y)) = (self.edge?, cursor_pos()?);
+            Some(in_catch_zone(&edge, self.cfg.mac_side, x, y))
+        };
+        if !is_down(VK_LBUTTON.0) || other_buttons_held() || near() != Some(true) {
+            self.zone_game = None;
+            return false;
+        }
+        // Probed only once the rest holds, and not on every packet.
+        let locked = match self.zone_game {
+            Some((at, locked)) if now.saturating_duration_since(at) < ZONE_PROBE_EVERY => locked,
+            _ => {
+                let locked = game_locked(&probe_game());
+                self.zone_game = Some((now, locked));
+                locked
+            }
+        };
+        !locked
     }
 
     /// Returns true to swallow the event.
@@ -648,6 +801,20 @@ impl State {
         let Some(stay) = &mut self.mac else {
             return false;
         };
+        let over_ours = self
+            .dnd
+            .as_ref()
+            .is_some_and(|d| d.shared.under_park_is_ours.load(Ordering::Acquire));
+        let injected = info.flags & LLMHF_INJECTED != 0;
+        let verdict = hook_verdict(msg, injected, over_ours, stay.left_passed);
+        if !verdict.forward {
+            return !verdict.pass;
+        }
+        match msg {
+            WM_LBUTTONDOWN => stay.left_passed = verdict.pass,
+            WM_LBUTTONUP => stay.left_passed = false,
+            _ => {}
+        }
         let hiword = (info.mouseData >> 16) as u16;
         let button = |button, down| Some(InputMsg::Button { button, down });
         let out = match msg {
@@ -695,7 +862,7 @@ impl State {
         if let Some(m) = out {
             self.send(m);
         }
-        true
+        !verdict.pass
     }
 
     fn wheel(&mut self, axis: WheelAxis, hiword: u16) -> i32 {
@@ -755,9 +922,8 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
     if code >= 0 {
         // SAFETY: for HC_ACTION, lParam points to an MSLLHOOKSTRUCT.
         let info = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
-        if info.flags & LLMHF_INJECTED == 0
-            && with_state(|s| s.on_mouse_hook(wparam.0 as u32, info)) == Some(true)
-        {
+        // Injected events pass untouched (`hook_verdict`).
+        if with_state(|s| s.on_mouse_hook(wparam.0 as u32, info)) == Some(true) {
             return LRESULT(1);
         }
     }
@@ -785,8 +951,8 @@ unsafe extern "system" fn wnd_proc(
 ) -> LRESULT {
     match msg {
         WM_INPUT => {
-            if let Some((dx, dy)) = read_raw_mouse(HRAWINPUT(lparam.0 as _)) {
-                with_state(|s| s.on_raw_mouse(dx, dy));
+            if let Some((dx, dy, buttons)) = read_raw_mouse(HRAWINPUT(lparam.0 as _)) {
+                with_state(|s| s.on_raw_mouse(dx, dy, buttons));
             }
         }
         WM_DISPLAYCHANGE | WM_SETTINGCHANGE => {
@@ -795,14 +961,18 @@ unsafe extern "system" fn wnd_proc(
         WM_TIMER if wparam.0 == DESKTOP_TIMER => {
             with_state(State::check_desktop);
         }
+        WM_TIMER if wparam.0 == PARK_TIMER => {
+            with_state(State::check_park);
+        }
         _ => {}
     }
     // DefWindowProcW also performs the required WM_INPUT cleanup.
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
-/// Relative (dx, dy) of a raw mouse packet; absolute devices yield (0, 0).
-fn read_raw_mouse(handle: HRAWINPUT) -> Option<(i32, i32)> {
+/// Relative (dx, dy) of a raw mouse packet (absolute devices yield (0, 0))
+/// and its button flags.
+fn read_raw_mouse(handle: HRAWINPUT) -> Option<(i32, i32, u32)> {
     let mut raw = RAWINPUT::default();
     let mut size = size_of::<RAWINPUT>() as u32;
     // SAFETY: `raw` is a RAWINPUT-sized buffer and `size` says so.
@@ -818,12 +988,14 @@ fn read_raw_mouse(handle: HRAWINPUT) -> Option<(i32, i32)> {
     if n == 0 || n == u32::MAX || raw.header.dwType != RIM_TYPEMOUSE.0 {
         return None;
     }
-    // SAFETY: dwType says the union holds mouse data.
+    // SAFETY: dwType says the union holds mouse data, whose button flags
+    // are always valid.
     let mouse = unsafe { raw.data.mouse };
+    let buttons = unsafe { mouse.Anonymous.Anonymous.usButtonFlags } as u32;
     if mouse.usFlags.0 & MOUSE_MOVE_ABSOLUTE.0 != 0 {
-        return Some((0, 0));
+        return Some((0, 0, buttons));
     }
-    Some((mouse.lLastX, mouse.lLastY))
+    Some((mouse.lLastX, mouse.lLastY, buttons))
 }
 
 fn module_instance() -> windows::core::Result<HINSTANCE> {
@@ -898,7 +1070,46 @@ fn remove_hooks(hooks: Hooks) {
     }
 }
 
-fn rect_center(r: &Rect) -> (i32, i32) {
+/// What the mouse hook does with one event while on the Mac.
+#[derive(Debug, PartialEq, Eq)]
+struct HookVerdict {
+    /// Translate it and send it to the Mac.
+    forward: bool,
+    /// Hand it on to Windows (`CallNextHookEx`) instead of swallowing it.
+    pass: bool,
+}
+
+/// Everything real is forwarded and swallowed, except that real left presses
+/// and releases also reach Windows while `over_ours`: one of CursorJump's own
+/// drag-and-drop windows lies under the park point
+/// (`DndShared::under_park_is_ours`). A release whose press Windows saw
+/// (`down_passed`) always reaches it, so the button never sticks down.
+/// Injected events pass untouched and are never forwarded. The hook only
+/// ever swallows less than phase 1; it never makes input up.
+fn hook_verdict(msg: u32, injected: bool, over_ours: bool, down_passed: bool) -> HookVerdict {
+    if injected {
+        return HookVerdict {
+            forward: false,
+            pass: true,
+        };
+    }
+    let pass = match msg {
+        WM_LBUTTONDOWN => over_ours,
+        WM_LBUTTONUP => over_ours || down_passed,
+        _ => false,
+    };
+    HookVerdict {
+        forward: true,
+        pass,
+    }
+}
+
+/// The catcher's drag rides along only when the left button alone is held.
+fn offer_for(left: bool, others: bool, offer: u64) -> Option<DragId> {
+    (left && !others && offer != 0).then_some(offer)
+}
+
+pub(super) fn rect_center(r: &Rect) -> (i32, i32) {
     ((r.left + r.right) / 2, (r.top + r.bottom) / 2)
 }
 
@@ -973,8 +1184,9 @@ fn is_down(vk: u16) -> bool {
     (unsafe { GetAsyncKeyState(vk as i32) } as u16) & 0x8000 != 0
 }
 
-fn mouse_buttons_held() -> bool {
-    [VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2]
+/// Any mouse button but the left.
+fn other_buttons_held() -> bool {
+    [VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2]
         .into_iter()
         .any(|vk| is_down(vk.0))
 }
@@ -1506,6 +1718,132 @@ mod tests {
         let alive = AtomicBool::new(true);
         let post = || unsafe { PostThreadMessageW(0, WM_APP, WPARAM(0), LPARAM(0)) };
         assert_eq!(retry(post, &alive), WakeOutcome::ThreadGone);
+    }
+
+    #[test]
+    fn edge_push_offer_only_with_left_alone() {
+        assert_eq!(offer_for(true, false, 7), Some(7));
+        assert_eq!(offer_for(true, true, 7), None, "another button too");
+        assert_eq!(offer_for(false, true, 7), None);
+        assert_eq!(offer_for(false, false, 7), None, "no button");
+        assert_eq!(offer_for(true, false, 0), None, "the catcher holds nothing");
+    }
+
+    #[test]
+    fn hook_passes_real_left_buttons_only_over_our_window() {
+        let v = |forward, pass| HookVerdict { forward, pass };
+        for down_passed in [false, true] {
+            // Over our own window: real left presses and releases reach Windows too.
+            assert_eq!(
+                hook_verdict(WM_LBUTTONDOWN, false, true, down_passed),
+                v(true, true)
+            );
+            assert_eq!(
+                hook_verdict(WM_LBUTTONUP, false, true, down_passed),
+                v(true, true)
+            );
+            // Anything else is still only forwarded.
+            for msg in [
+                WM_RBUTTONDOWN,
+                WM_RBUTTONUP,
+                WM_MBUTTONDOWN,
+                WM_XBUTTONUP,
+                WM_MOUSEMOVE,
+                WM_MOUSEWHEEL,
+                WM_MOUSEHWHEEL,
+            ] {
+                assert_eq!(hook_verdict(msg, false, true, down_passed), v(true, false));
+                assert_eq!(hook_verdict(msg, false, false, down_passed), v(true, false));
+            }
+            // Injected events pass untouched and are never forwarded, as before.
+            for msg in [WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONDOWN] {
+                for over_ours in [false, true] {
+                    assert_eq!(
+                        hook_verdict(msg, true, over_ours, down_passed),
+                        v(false, true)
+                    );
+                }
+            }
+        }
+        // Not over our window: a press is swallowed, as in phase 1...
+        assert_eq!(
+            hook_verdict(WM_LBUTTONDOWN, false, false, false),
+            v(true, false)
+        );
+        assert_eq!(
+            hook_verdict(WM_LBUTTONDOWN, false, false, true),
+            v(true, false)
+        );
+        assert_eq!(
+            hook_verdict(WM_LBUTTONUP, false, false, false),
+            v(true, false)
+        );
+        // ...but the release of a press Windows saw always reaches it.
+        assert_eq!(
+            hook_verdict(WM_LBUTTONUP, false, false, true),
+            v(true, true)
+        );
+    }
+
+    #[test]
+    fn mouse_hook_lets_left_buttons_through_while_our_window_is_under_the_park_point() {
+        let (mut s, rx) = on_mac(&[]);
+        let shared = Arc::new(super::super::dnd::DndShared::default());
+        let (cmds, _cmd_rx) = mpsc::channel();
+        s.dnd = Some(DndPort {
+            shared: shared.clone(),
+            cmds,
+        });
+        let at = MSLLHOOKSTRUCT {
+            pt: POINT {
+                x: CENTER.0,
+                y: CENTER.1,
+            },
+            ..Default::default()
+        };
+        let swallowed = |s: &mut State, msg| s.on_mouse_hook(msg, &at);
+        // Not ours under the park point: swallowed as in phase 1.
+        assert!(swallowed(&mut s, WM_LBUTTONDOWN));
+        assert!(swallowed(&mut s, WM_LBUTTONUP));
+        shared.under_park_is_ours.store(true, Ordering::Release);
+        assert!(!swallowed(&mut s, WM_LBUTTONDOWN));
+        assert!(swallowed(&mut s, WM_RBUTTONDOWN));
+        assert!(swallowed(&mut s, WM_RBUTTONUP));
+        // A window covers the park point mid-click: the release still follows its press.
+        shared.under_park_is_ours.store(false, Ordering::Release);
+        assert!(!swallowed(&mut s, WM_LBUTTONUP));
+        assert!(swallowed(&mut s, WM_LBUTTONDOWN));
+        assert!(swallowed(&mut s, WM_LBUTTONUP));
+        // Every real button still reached the Mac.
+        let buttons: Vec<_> = drain(&rx)
+            .into_iter()
+            .filter_map(|m| match m {
+                InputMsg::Button { button, down } => Some((button, down)),
+                _ => None,
+            })
+            .collect();
+        use MouseButton::{Left, Right};
+        assert_eq!(
+            buttons,
+            [
+                (Left, true),
+                (Left, false),
+                (Left, true),
+                (Right, true),
+                (Right, false),
+                (Left, false),
+                (Left, true),
+                (Left, false)
+            ]
+        );
+        // Injected: passed, not forwarded.
+        let injected = MSLLHOOKSTRUCT {
+            flags: LLMHF_INJECTED,
+            ..at
+        };
+        assert!(!s.on_mouse_hook(WM_LBUTTONDOWN, &injected));
+        assert!(!s.on_mouse_hook(WM_MOUSEMOVE, &injected));
+        assert!(drain(&rx).is_empty());
     }
 
     #[test]

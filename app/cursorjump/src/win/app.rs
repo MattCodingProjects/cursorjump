@@ -71,7 +71,8 @@ pub fn run_pc() -> Result<()> {
 
     // Before the input thread: see `TrayLoop::new`.
     let tray = TrayLoop::new();
-    let (input, input_rx) = spawn_input_thread(cfg.clone());
+    // Task 13 passes the drag-and-drop thread.
+    let (input, input_rx) = spawn_input_thread(cfg.clone(), None);
     let (events, events_rx) = unbounded_channel();
     bridge_input(input_rx, events.clone())?;
     let clip_link = Arc::new(ClipboardLink::new(cfg.clipboard_max_bytes));
@@ -357,7 +358,8 @@ impl App {
                 }
             }
             PcAction::EnterMac { mac_edge, frac, .. } => {
-                self.send_input(InputCmd::EnterMac);
+                // Task 13 passes the riding drag, with the catcher wired.
+                self.send_input(InputCmd::EnterMac { drag: None });
                 self.control(Control::Enter {
                     edge: mac_edge,
                     frac,
