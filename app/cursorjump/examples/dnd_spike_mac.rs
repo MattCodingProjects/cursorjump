@@ -234,6 +234,8 @@ mod mac {
     /// When the scripted Escape was posted (µs since start), or NOT_YET.
     static ESC_AT: AtomicU64 = AtomicU64::new(NOT_YET);
     /// A posted LeftMouseDown has no matching up yet.
+    static LAST_DRAG_CC: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
+    static DOWN_EVNUM: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
     static DOWN_OUTSTANDING: AtomicBool = AtomicBool::new(false);
     /// Provider, promise writer or promise reader work still running.
     static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
@@ -411,13 +413,67 @@ mod mac {
             if ty != CGEventType::MouseMoved {
                 set(CGEventField::MouseEventClickState, 1);
             }
+            // CJ_PRESSURE=1: pressure 1.0 on down/dragged (0 on up), like a real click.
+            if std::env::var_os("CJ_PRESSURE").is_some() {
+                let pressed = matches!(
+                    ty,
+                    CGEventType::LeftMouseDown | CGEventType::LeftMouseDragged
+                );
+                CGEvent::set_double_value_field(
+                    Some(&ev),
+                    CGEventField::MouseEventPressure,
+                    if pressed { 1.0 } else { 0.0 },
+                );
+            }
+            // CJ_EVNUM=1: dragged/up events reuse the down's mouse event number,
+            // as a real click sequence does.
+            let num = CGEvent::integer_value_field(Some(&ev), CGEventField::MouseEventNumber);
+            // Deskflow's recipe: each press gets a fresh non-zero number (the
+            // system's down counters + 1), kept on its dragged and up events.
+            if std::env::var_os("CJ_EVNUM").is_some() {
+                if ty == CGEventType::LeftMouseDown {
+                    let st = CGEventSourceStateID::HIDSystemState;
+                    let downs: u32 = [
+                        CGEventType::LeftMouseDown,
+                        CGEventType::RightMouseDown,
+                        CGEventType::OtherMouseDown,
+                    ]
+                    .into_iter()
+                    .map(|t| CGEventSource::counter_for_event_type(st, t))
+                    .sum();
+                    DOWN_EVNUM.store(i64::from(downs) + 1, Ordering::SeqCst);
+                }
+                if matches!(
+                    ty,
+                    CGEventType::LeftMouseDown
+                        | CGEventType::LeftMouseDragged
+                        | CGEventType::LeftMouseUp
+                ) {
+                    set(
+                        CGEventField::MouseEventNumber,
+                        DOWN_EVNUM.load(Ordering::SeqCst),
+                    );
+                }
+            }
+            if ty != CGEventType::LeftMouseDragged {
+                log!(
+                    "posted {ty:?}: created event number {num}, sent {}",
+                    CGEvent::integer_value_field(Some(&ev), CGEventField::MouseEventNumber)
+                );
+            }
             CGEvent::set_flags(Some(&ev), CGEventFlags(0));
             match ty {
                 CGEventType::LeftMouseDown => DOWN_OUTSTANDING.store(true, Ordering::SeqCst),
                 CGEventType::LeftMouseUp => DOWN_OUTSTANDING.store(false, Ordering::SeqCst),
                 _ => {}
             }
-            CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&ev));
+            // CJ_TAP=session posts at the session tap (Chrome Remote Desktop's choice).
+            let tap = if std::env::var("CJ_TAP").is_ok_and(|v| v == "session") {
+                CGEventTapLocation::SessionEventTap
+            } else {
+                CGEventTapLocation::HIDEventTap
+            };
+            CGEvent::post(tap, Some(&ev));
         }
 
         fn key(&self, kc: u16, down: bool) {
@@ -454,11 +510,35 @@ mod mac {
                 path.len()
             );
             let mut prev = from;
-            for p in path {
+            for (i, p) in path.into_iter().enumerate() {
                 let d = ((p.0 - prev.0).round() as i64, (p.1 - prev.1).round() as i64);
                 self.mouse(CGEventType::LeftMouseDragged, p, d);
                 prev = p;
                 sleep_ms(STEP_MS);
+                // The drag pasteboard changes when a drag session is set up.
+                let drag_pb = unsafe {
+                    objc2_app_kit::NSPasteboard::pasteboardWithName(
+                        objc2_app_kit::NSPasteboardNameDrag,
+                    )
+                };
+                let cc = drag_pb.changeCount();
+                if cc != LAST_DRAG_CC.swap(cc as i64, Ordering::SeqCst) as isize {
+                    log!("drag step {i}: drag pasteboard changeCount -> {cc}");
+                }
+                if i % 40 == 0 {
+                    log!(
+                        "drag step {i}: pressedMouseButtons {:#x}, HID left {}, combined left {}",
+                        objc2_app_kit::NSEvent::pressedMouseButtons(),
+                        CGEventSource::button_state(
+                            CGEventSourceStateID::HIDSystemState,
+                            CGMouseButton::Left
+                        ),
+                        CGEventSource::button_state(
+                            CGEventSourceStateID::CombinedSessionState,
+                            CGMouseButton::Left
+                        )
+                    );
+                }
             }
         }
     }
@@ -1660,7 +1740,7 @@ mod mac {
                     log!("creating {} failed: {e}", dir.display());
                     continue;
                 }
-                let files = recv.fileNames().count().max(1);
+                let files = file_names(&recv).map_or(0, |n| n.count()).max(1);
                 IN_FLIGHT.fetch_add(files, Ordering::SeqCst);
                 let left = AtomicUsize::new(files);
                 let t0 = now_us();
@@ -1764,14 +1844,21 @@ mod mac {
             log!("[{when}] file URL {path} ({})", size_of(Path::new(&path)));
         }
         for (i, recv) in read_promises(&pb).iter().enumerate() {
-            let names = recv.fileNames();
+            let names = file_names(recv);
             log!(
                 "[{when}] file promise {i}: types [{}], names [{}] (names known: {})",
                 join(&recv.fileTypes()),
-                join(&names),
-                names.count() > 0
+                names.as_deref().map(join).unwrap_or_else(|| "nil".into()),
+                names.is_some_and(|n| n.count() > 0)
             );
         }
+    }
+
+    /// `fileNames`, which Chrome leaves nil before the drop (the generated
+    /// binding assumes non-null and panics).
+    fn file_names(recv: &NSFilePromiseReceiver) -> Option<Retained<NSArray<NSString>>> {
+        // SAFETY: `fileNames` takes no arguments and returns an NSArray or nil.
+        unsafe { msg_send![recv, fileNames] }
     }
 
     fn catcher_summary() {
@@ -1807,7 +1894,13 @@ mod mac {
         let strip = (main_bounds().0 + 1.0, at.1);
         log!("post LeftMouseDown at P ({:.1}, {:.1})", at.0, at.1);
         p.mouse(CGEventType::LeftMouseDown, at, (0, 0));
-        sleep_ms(200);
+        // CJ_STILL_MS: how long to hold still after the press (default 200).
+        let still = std::env::var("CJ_STILL_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(200);
+        log!("holding still {still} ms after the press");
+        sleep_ms(still);
         p.drag(at, strip, move_ms);
         log!("on the strip; hovering {hover_ms} ms");
         sleep_ms(hover_ms);

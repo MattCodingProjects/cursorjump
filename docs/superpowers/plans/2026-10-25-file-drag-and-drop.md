@@ -116,13 +116,13 @@ docs/superpowers/progress/dnd-spike.md   spike findings (Task 1)                
 
 | Id | Assumption | Default used by | Fallback if false |
 |---|---|---|---|
-| A1 | Mac targets accept `NSFilePromiseProvider` drops | Task 15 | A2 for that target |
-| A2 | A lazy `public.file-url` pasteboard item can block about 60 s at drop time | Task 15 | file-url after prefetch, pill shown during prefetch |
-| A3 | An `NSDraggingSession` starts from a CGEvent-posted LeftMouseDown on our panel, follows posted drags, drops on posted up, and Esc cancels it | Task 15 | stop and rethink with the user |
+| A1 | Mac targets accept `NSFilePromiseProvider` drops | Task 15 | A2 for that target. **Spike 1b: holds for Finder, the Desktop and WhatsApp; fails for Chrome/Gmail. See R47.** |
+| A2 | A lazy `public.file-url` pasteboard item can block about 60 s at drop time | Task 15 | file-url after prefetch, pill shown during prefetch. **Spike 1b: fails (the URL is read once at drag start). Replaced by R47: prefetch from BeginDrag and hold the posted release until complete.** |
+| A3 | An `NSDraggingSession` starts from a CGEvent-posted LeftMouseDown on our panel, follows posted drags, drops on posted up, and Esc cancels it | Task 15 | stop and rethink with the user. **Spike 1b: holds.** |
 | A4 | Windows targets accept our `IDataObject`, in some format order | Task 12 | the per-target order found |
 | A5 | ~~`DoDragDrop` runs while Windows thinks the left button is up~~ **Failed in the spike (no mouse input reaches OLE without a press on our own window). Replaced by Ruling R11 — see `docs/superpowers/progress/dnd-spike.md`:** the hook passes the real left down/up through to the catcher window under the park point, so `DoDragDrop` runs on the catcher thread with the button truly down | Tasks 11–13 | drop-on-release with no hover (when the park point isn't over our window) |
 | A6 | A 1/255-alpha layered topmost window gets `DragEnter` from Explorer, WhatsApp, browser and Discord drags. Grown to the full screen, the user's real release over it ends the source's drag with `Drop` (accept mode) or without one (reject mode), and FILECONTENTS can be read inside `Drop` | Task 11 | stop and rethink with the user |
-| A7 | A near-transparent Mac panel at the edge gets drags from Finder, WhatsApp, browser and Discord, and a posted LeftMouseUp over it triggers `performDragOperation` | Task 16 | stop and rethink with the user |
+| A7 | A near-transparent Mac panel at the edge gets drags from Finder, WhatsApp, browser and Discord, and a posted LeftMouseUp over it triggers `performDragOperation` | Task 16 | stop and rethink with the user. **Spike 1b: holds for Finder; WhatsApp and Chrome start their drags late under posted input (F1), so they reach the strip only after the posted up — see R48.** |
 
 ---
 
@@ -858,6 +858,12 @@ fn stack_origin_pt(visible: (f64, f64, f64, f64), index: usize) -> (f64, f64);  
 
 ### Task 15 [Mac]: Mac drags arriving from the PC (`mac/dnd/source.rs`, `mac/control.rs`, `mac/inject.rs`)
 
+> **Amended 2026-10-26 after spike 1b (R47, R49; user approved the held release).** The rules below replace "Dragging items" and the A2 line:
+> - **One kind of dragging item for every target.** Each item's writer is an `NSFilePromiseProvider` subclass that *also* writes `public.file-url` pointing at a placeholder `~/Library/Caches/CursorJump/incoming/<drag>/<sanitized name>`. The placeholder is an empty file, or an empty folder for a folder item, created at `prepare`. Promise targets (Finder, the Desktop, WhatsApp) use the promise. Chromium targets (Gmail, Discord) read the URL.
+> - **Prefetch.** Fetching every item starts at `BeginDrag`, into a staging dir `incoming/<drag>/.fetch/` (`Dest::InDir`, so R20 never fires). Each completed item is renamed over its placeholder. A drag that goes home or is cancelled cancels its fetches. The promise writer waits for its item, then copies it (APFS clone) to the promise URL.
+> - **Held release.** When the PC's left-up arrives while the incoming drag rides, cj-inject posts the up at once if every item is complete, or if the app owning the window under the cursor is a known promise taker (`com.apple.finder`, `net.whatsapp.WhatsApp`). Otherwise it *holds* the up: Mac motion from the PC is ignored (the cursor stays on the drop spot), a ±1 pt dragged jiggle goes out every 500 ms, and the up is posted when the last item is complete. ✕, Esc, a forced return or a disconnect during the hold → `CancelDrag` (posted Esc, then the up). A failed fetch during the hold → cancel the same way, and the pill says why.
+> - **Pill (replaces R5's Mac clause):** the pill starts at the user's release (the PC's left-up while riding), on the screen under the cursor, showing the prefetch's progress so far. No pill appears for a drag that goes home or is cancelled before the release.
+
 **Files:**
 - Create: `app/cursorjump/src/mac/dnd/source.rs`
 - Modify: `mac/control.rs`, `mac/inject.rs`, `mac/dnd/mod.rs`, `Cargo.toml` (NSDragging*, NSFilePromiseProvider, NSPasteboardItem, NSWorkspace, NSOperation, NSURL, objc2-uniform-type-identifiers)
@@ -899,6 +905,10 @@ fn utt_for_name(name: &str) -> String; // UTType identifier from the extension, 
 ---
 
 ### Task 16 [Mac]: Mac catcher and drags leaving the Mac (`mac/dnd/catcher.rs`)
+
+> **Amended 2026-10-26 after spike 1b (R48; F1 still being investigated, so this may tighten).**
+> - `NSFilePromiseReceiver.fileNames` can be nil before the drop (Chrome). Read it with a nullable `msg_send`, and use name "" with `Source::Pending` then.
+> - **Late drags.** Under posted input, sources that start their drag late (Chrome, WhatsApp) reach the strip only after the posted up. At a push-out with only Left held and no offer yet, cj-inject posts the up as today with the strip showing. The Mac then waits up to `LATE_DRAG_WAIT` (150 ms) for the strip's `performDragOperation` before sending `Leave`. If one arrives, `Leave` carries that drag as the offer (the PC gets drop-on-release with no hover; the promise or URLs are received as usual). Otherwise it sends `Leave{drag: None}`. The strip stays up at least `LATE_DRAG_WAIT` after every push-out with Left held, so a late drag always ends on it, never left running (a never-ended Chrome drag leaves the tab refusing clicks).
 
 **Files:** Create `app/cursorjump/src/mac/dnd/catcher.rs`. Modify `mac/control.rs` and `mac/dnd/mod.rs` (`NSFilePromiseReceiver`).
 

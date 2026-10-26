@@ -50,3 +50,37 @@ Nothing is injected. The hook only swallows less, and is still only installed wh
 - During the wait, **WhatsApp and Gmail froze**, with the browser window not responding, for the whole wait. Then both recovered and attached the file. The desktop did not freeze. This matches the spec's "waiting (a)".
 - The default browser is Chromium-based: the Gmail drop showed the same Chromium formats.
 - The drag image (`--image`) was not working in the spike, because our `SetData` refused DragContext with `E_NOTIMPL`. Task 12's `IDataObject` must accept arbitrary `SetData` (store it and return it) so that `IDragSourceHelper` can attach an image.
+
+---
+
+# Task 1b (Mac) findings
+
+Date: 2026-10-26, on the MacBook (macOS Tahoe 26). Runs used `app/cursorjump/examples/dnd_spike_mac.rs`. Every drag was driven by posted CGEvents made like `inject.rs` (R45), with the user pointing at the target or source during a countdown. Logs are in `$TMPDIR/cursorjump-spike/`. The default browser is Google Chrome. Discord is not installed on the Mac, so the user chose to skip it there. No new permission prompt appeared: the terminal's Accessibility grant was enough to post events.
+
+## Verdicts
+
+| # | Assumption | Verdict |
+|---|---|---|
+| A1 | Mac targets accept `NSFilePromiseProvider` drops | **Holds for Finder, the Desktop, a Finder folder (Downloads behaves the same) and WhatsApp. Fails for Chrome (Gmail).** Finder asked for the write 15 ms after the release. WhatsApp asked 35 ms after the release, into its own container tmp, then showed its own "transferring" popup through a 30 s wait and attached the photo. Chrome refused: the operation was None and no drop zone appeared. |
+| A2 | A lazy `public.file-url` item can block about 60 s at drop time | **Fails.** The data provider is called once, about 75 ms after the drag starts (the system fills the drag pasteboard up front), and is never asked again. Gmail attached the empty placeholder and said "This file is 0 bytes". **What works instead:** hold the posted LeftMouseUp (the button stays down, with a ±1 pt jiggle every 500 ms) until the real bytes have been renamed over the placeholder, then post the up. Gmail then attached the full 4.8 MB photo after an 11 s hold. Chrome keeps the path, not the hover-time inode. |
+| A3 | An `NSDraggingSession` starts from a posted LeftMouseDown on our panel, follows posted drags, drops on a posted up, and Esc cancels it | **Holds.** An 8×8 pt borderless non-activating panel at alpha 0.01, with `acceptsFirstMouse:` YES and a 2 pt inset from the left edge, received the posted down. `beginDraggingSessionWithItems:event:source:` inside `mouseDown:` followed every posted drag (180+ moves) with another app frontmost, and dropped on the posted up. A posted Esc key (kVK_Escape, frontmost app Finder) ended the session with None 22 ms later, and nothing was dropped. |
+| A7 | A near-transparent edge panel gets drags, and a posted up over it runs `performDragOperation` | **Holds for drags the source starts at once (Finder): `draggingEntered` came before the release, and perform came 4.6 ms after the posted up.** WhatsApp and Chrome start their drags late (see F1). Their drags reached the strip only right after the posted up, but perform still ran and the files arrived. WhatsApp gave a `public.file-url` in its container tmp (Ready). Chrome gave a file promise whose `fileNames` is **nil** before the drop: the generated binding panics, so read it with a nullable `msg_send`. `receivePromisedFiles` delivered `images.jpg` in about 275 ms. Real trackpad drags from Chrome reach the strip normally before the release. |
+
+## Mixed items: promise plus file URL in one dragging item
+
+An `NSFilePromiseProvider` subclass that also writes `public.file-url` (in `writableTypesForPasteboard:` and `pasteboardPropertyListForType:`):
+- **Finder** and **WhatsApp** still used the **promise**: `writePromiseToURL` was called, and the URL was ignored.
+- **Gmail** used the **URL**. With the release held until the bytes were complete, it attached the photo.
+
+So one item kind serves every tested target.
+
+## F1: Chrome doesn't follow posted drags (open; investigation continues)
+
+Chrome starts a renderer-initiated drag late, after an IPC round trip. It calls `beginDraggingSession` with a synthesized LeftMouseDragged event, which has event number 0 and the current event's timestamp. Run 19's drag-pasteboard probe shows Chrome set up its session about 240 ms into the posted drag. The system did not let that session follow our later posted drags: it came alive only at the posted up and dropped at once where the cursor was.
+
+- Changes that did not help: pressure 1.0; a unique per-press `kCGMouseEventNumber` (Deskflow's recipe); posting at the session tap.
+- The button state the system reports (`pressedMouseButtons`, HID and combined) is "down" throughout.
+- A late session that is never ended leaves Chrome's tab refusing clicks until a reload. After the bad run, image drags in Chrome with the PC mouse (the installed phase 1 injector) didn't start at all, even after relaunching Chrome. The MacBook trackpad works, and Safari works with the PC mouse.
+- Research notes (Chromium's `startDragWithDropData`, the Deskflow and Chrome Remote Desktop event-number fixes) are summarised in the ledger under F1.
+
+To be investigated autonomously while the user is away (a Chrome test page, posted drags, field comparisons). Until then, Task 16 handles late drags at push-out (R48).
