@@ -11,6 +11,8 @@ use dispatch2::DispatchQueue;
 use objc2::MainThreadMarker;
 use tracing::warn;
 
+#[cfg(debug_assertions)]
+pub mod smoke_drag;
 pub mod source;
 
 /// Run `f` on the main thread, later: queued on GCD's main queue, even when

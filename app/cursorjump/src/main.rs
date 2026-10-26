@@ -60,16 +60,18 @@ fn main() {
     }
 
     // A drag from a fake PC, driven through the real injection thread and
-    // drag source (mac/dnd/source.rs `run_smoke`): `--smoke-drag [auto|promise|hold]`.
+    // drag source (mac/dnd/smoke_drag.rs):
+    // `--smoke-drag [auto|promise|hold] [file|dir] [drop|esc|home]`.
     #[cfg(all(target_os = "macos", debug_assertions))]
     if has("--smoke-drag") {
-        let mode = args
+        let words = args
             .iter()
             .skip_while(|a| *a != "--smoke-drag")
-            .nth(1)
+            .skip(1)
+            .take_while(|a| !a.starts_with("--"))
             .map(String::as_str);
-        let Some(mode) = mac::SmokeMode::parse(mode) else {
-            error!("--smoke-drag takes auto, promise or hold");
+        let Some(mode) = mac::SmokeMode::parse(words) else {
+            error!("--smoke-drag takes auto|promise|hold, file|dir and drop|esc|home");
             std::process::exit(2);
         };
         if let Err(e) = mac::run_smoke_drag(mode) {

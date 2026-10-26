@@ -29,4 +29,4 @@ pub mod power;
 
 /// The drag smoke (`--smoke-drag`, debug builds).
 #[cfg(debug_assertions)]
-pub use dnd::source::{SmokeMode, run_smoke as run_smoke_drag};
+pub use dnd::smoke_drag::{SmokeMode, run_smoke as run_smoke_drag};

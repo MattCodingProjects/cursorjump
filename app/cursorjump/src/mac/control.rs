@@ -325,8 +325,13 @@ impl<I: Inject, D: DragPort> Router<I, D> {
         }
     }
 
-    /// Lets go of every key and button the Injector holds.
-    pub fn release_all(&mut self) {
+    /// After a panic: cancels a drag still riding (Esc ends its session
+    /// undropped), then lets go of every key and button the Injector holds.
+    pub fn let_go_after_panic(&mut self) {
+        if let Some(r) = self.ride.take() {
+            self.escape();
+            self.drags.cancel(r.drag);
+        }
         self.inj.release_all();
     }
 
@@ -501,6 +506,11 @@ impl<I: Inject, D: DragPort> Router<I, D> {
                 Vec::new()
             }
         };
+        // A ride cancelled by this crossing's Enter leaves the button down
+        // (no ReleaseAllInjected comes): let go before pressing again.
+        if self.inj.button_held(MouseButton::Left) {
+            self.inj.button(MouseButton::Left, false);
+        }
         let at = self.inj.cursor();
         if self.drags.prepare(drag, items, at) {
             self.inj.button(MouseButton::Left, true);
@@ -632,13 +642,10 @@ impl<I: Inject, D: DragPort> Router<I, D> {
                 MacAction::StopControl => out.push(InjectEv::Controlled { sid, on: false }),
                 MacAction::BeginDrag { drag } => self.begin_drag(drag),
                 // Always before ReleaseAllInjected, which posts the up.
-                MacAction::CancelDrag { drag } => {
-                    if self.ride.is_some_and(|r| r.drag == drag) {
-                        self.escape();
-                    }
-                    self.ride = None;
-                    self.drags.cancel(drag);
-                }
+                // Esc, and a held up goes out; the rest of the buttons go
+                // with ReleaseAllInjected, which follows unless this is an
+                // Enter (then BeginDrag lets go of a left still down).
+                MacAction::CancelDrag { drag } => self.abort_drag(drag),
             }
         }
         out
@@ -689,7 +696,7 @@ pub fn spawn_inject_thread<I: Inject + Send + 'static, D: DragPort + Send + 'sta
                 // Never leave a key or button held down: let go of
                 // everything, then report Stopped like any other ending.
                 error!("injection thread panicked; releasing everything");
-                if catch_unwind(AssertUnwindSafe(|| router.release_all())).is_err() {
+                if catch_unwind(AssertUnwindSafe(|| router.let_go_after_panic())).is_err() {
                     error!("releasing after the panic failed too");
                 }
             }
@@ -740,6 +747,8 @@ pub(super) mod tests {
         calls: Arc<Mutex<Vec<Call>>>,
         /// `key` panics, like a bug in the Injector would.
         key_panics: bool,
+        /// `motion` panics.
+        motion_panics: bool,
         /// What every `motion` returns.
         push_out: Option<f32>,
         /// What `entry_frac` returns: where the cursor is along the entry edge.
@@ -754,6 +763,7 @@ pub(super) mod tests {
             let fake = Fake {
                 calls: calls.clone(),
                 key_panics: false,
+                motion_panics: false,
                 push_out: None,
                 at_frac: 0.5,
                 keys: BTreeSet::new(),
@@ -775,6 +785,7 @@ pub(super) mod tests {
             self.log(Call::Warp(edge, frac));
         }
         fn motion(&mut self, dx: i16, dy: i16) -> Option<f32> {
+            assert!(!self.motion_panics, "injector bug");
             self.log(Call::Motion(dx, dy));
             self.push_out
         }
@@ -1544,7 +1555,13 @@ pub(super) mod tests {
         );
         assert_eq!(
             take(&calls),
-            vec![ESC_DOWN, ESC_UP, Call::CancelSource(7), Call::ReleaseAll]
+            vec![
+                ESC_DOWN,
+                ESC_UP,
+                Call::CancelSource(7),
+                LEFT_UP,
+                Call::ReleaseAll
+            ]
         );
         assert_eq!(r.next_tick(), None);
 
@@ -1559,8 +1576,28 @@ pub(super) mod tests {
         );
         assert_eq!(
             take(&calls),
+            vec![
+                ESC_DOWN,
+                ESC_UP,
+                Call::CancelSource(7),
+                LEFT_UP,
+                Call::ReleaseAll
+            ]
+        );
+    }
+
+    #[test]
+    fn disconnect_while_riding_cancels_then_releases() {
+        let (mut r, calls) = riding(false);
+        assert_eq!(
+            r.handle(InjectMsg::End { sid: 1 }),
+            vec![InjectEv::Controlled { sid: 1, on: false }]
+        );
+        assert_eq!(
+            take(&calls),
             vec![ESC_DOWN, ESC_UP, Call::CancelSource(7), Call::ReleaseAll]
         );
+        assert_eq!(r.next_tick(), None);
     }
 
     #[test]
@@ -1609,6 +1646,21 @@ pub(super) mod tests {
         assert_eq!(r.next_tick(), None);
     }
 
+    /// Never a second left-down without an up in between.
+    fn assert_downs_and_ups_alternate(calls: &[Call]) {
+        let mut down = true; // Drag 7's down came first.
+        for c in calls {
+            match c {
+                c if *c == LEFT_DOWN => {
+                    assert!(!down, "a second down: {calls:?}");
+                    down = true;
+                }
+                c if *c == LEFT_UP => down = false,
+                _ => {}
+            }
+        }
+    }
+
     #[test]
     fn a_new_crossing_over_a_riding_drag_cancels_it_first() {
         let (mut r, calls) = riding(false);
@@ -1620,17 +1672,87 @@ pub(super) mod tests {
             },
         ));
         r.handle(input(1, enter_with(8)));
+        let got = take(&calls);
         assert_eq!(
-            take(&calls),
+            got,
             vec![
                 ESC_DOWN,
                 ESC_UP,
                 Call::CancelSource(7),
                 Call::Wake,
                 Call::Warp(Side::Left, 0.5),
+                LEFT_UP,
                 Call::Prepare(8, 3),
                 LEFT_DOWN
             ]
+        );
+        assert_downs_and_ups_alternate(&got);
+    }
+
+    #[test]
+    fn a_new_crossing_over_a_held_drop_lets_go_first() {
+        let (mut r, calls) = holding();
+        let due = r.next_tick().unwrap();
+        r.tick(due);
+        r.handle(input(
+            1,
+            Input::DragOffer {
+                drag: 8,
+                items: items(1),
+            },
+        ));
+        r.handle(input(1, enter_with(8)));
+        let got = take(&calls);
+        assert_eq!(
+            got,
+            vec![
+                Call::Jiggle(true),
+                ESC_DOWN,
+                ESC_UP,
+                Call::CancelSource(7),
+                Call::Jiggle(false),
+                LEFT_UP,
+                Call::Wake,
+                Call::Warp(Side::Left, 0.5),
+                Call::Prepare(8, 1),
+                LEFT_DOWN
+            ]
+        );
+        assert_downs_and_ups_alternate(&got);
+        assert_eq!(r.next_tick(), None, "the new drag rides, not held");
+    }
+
+    #[test]
+    fn a_panic_during_a_ride_cancels_the_drag_then_releases() {
+        let (mut fake, calls) = Fake::new();
+        fake.motion_panics = true;
+        let drags = FakeDrags::new(&calls);
+        let (ev_tx, ev_rx) = crossbeam_channel::unbounded();
+        let tx = spawn_inject_thread(fake, drags, granted(), move |ev| {
+            let _ = ev_tx.send(ev);
+        })
+        .unwrap();
+        for msg in [
+            InjectMsg::Begin { sid: 4 },
+            input(
+                4,
+                Input::DragOffer {
+                    drag: 7,
+                    items: items(1),
+                },
+            ),
+            input(4, enter_with(7)),
+            input(4, Input::Motion { dx: 1, dy: 0 }),
+        ] {
+            tx.send(msg).unwrap();
+        }
+        let t = Duration::from_secs(2);
+        while ev_rx.recv_timeout(t).unwrap() != InjectEv::Stopped {}
+        let calls = take(&calls);
+        assert_eq!(
+            calls[calls.len() - 4..],
+            [ESC_DOWN, ESC_UP, Call::CancelSource(7), Call::ReleaseAll],
+            "{calls:?}"
         );
     }
 
