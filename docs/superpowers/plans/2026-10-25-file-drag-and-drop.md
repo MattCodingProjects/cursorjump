@@ -369,7 +369,7 @@ impl PillBoard {
     pub fn progress(&mut self, drag: DragId, done: u64, total: Option<u64>, now: Instant);
     pub fn finish(&mut self, drag: DragId, result: Result<(), FailReason>, now: Instant);
     pub fn dismiss(&mut self, drag: DragId);       // ✕ on a failed pill
-    pub fn set_held(&mut self, held: bool);         // PC game lock: views() empty while held; nothing expires while held
+    pub fn set_held(&mut self, held: bool, now: Instant); // PC game lock: views() empty while held; nothing expires while held (R18: takes now)
     pub fn views(&self, now: Instant) -> Vec<PillView>;  // bottom-most first
     pub fn next_frame(&self, now: Instant) -> Option<Instant>; // None = nothing visible or pending
 }

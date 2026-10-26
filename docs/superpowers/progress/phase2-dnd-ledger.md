@@ -54,3 +54,42 @@ Ruling R10: A drag whose only file is an http(s) ".url" virtual file (Discord, w
 Task 1a: exp 2/3 PASS (park accept catches mid-screen release; park reject ends cleanly with "no" cursor). Exp 5: A5 as written FAILS — DoDragDrop started with no press on our own window gets no mouse input (no DragOver/feedback/drag image; non-fg stalls entirely; fg drops only on a click). With the left button pressed and held on the spike's OWN window before DoDragDrop: icon follows, 230 QCD/s, drop on real release, file landed. Desktop tolerated a 60 s CF_HDROP wait with no freeze.
 Ruling R11: A5 replaced. While the cursor is on the Mac, the PC cursor is parked over the CursorJump catcher window (WS_EX_NOACTIVATE, topmost), and the hook lets the user's REAL left-button down and up pass through to Windows only when WindowFromPoint(park point) is that catcher window (else they are swallowed as today and a Mac->PC drag falls back to drop-on-release with no hover). So the catcher's thread holds the implicit capture; when a Mac drag comes back to the PC, that thread calls DoDragDrop with the button truly down — the normal OLE source state. Still no injection, still "swallow less", hooks still only while on the Mac; never while gaming (crossing is walled then) — why: spike exp 5d/5e; the user asked for the icon to follow ("the drag looks normal", spec goal 6) — cost if wrong: a Mac click reaches our own invisible window (harmless); if the WindowFromPoint guard is wrong, a stray click could reach a PC app — guarded and must be unit-tested. Affects Tasks 11–13 (DndCmd::Park places the catcher under the park point; hook pass-through rule; source DoDragDrop on the catcher thread). Plan amendment to follow after the spike.
 Task 1: 1a complete (dnd-spike.md); 1b pending on the Mac before Task 14
+Task 2: dispatched implementer (opus, impl-task2), BASE b493be5
+Task 2: implementer DONE 382d035 (111/111 cj-core, mac clippy clean via stub CC)
+Task 2: dispatched reviewer (opus, review-task2) on b493be5..382d035
+Task 2: review APPROVED (spec ✅, no Critical/Important). Fix round 1 for the minors (exact .mp4 assertion, no-extension cut test, Normal-components assertion, stale mac/control.rs:183 doc) sent to impl-task2.
+Ruling R12: Add the superscript device names COM¹ COM² COM³ LPT¹ LPT² LPT³ to sanitize_component's reserved list — why: Windows reserves them too, so a Mac file with such a name could not be created on the PC (spec goal 2 "lands exactly where it was dropped") — cost if wrong: none (an extra "_" on very rare names).
+Task 2: fix round 1 DONE 46201bc (113/113)
+Task 2: re-review (sonnet) all findings addressed
+Task 2: complete (382d035, 46201bc)
+Task 3: dispatched implementer (opus, impl-task3), BASE 46201bc
+Task 3: implementer DONE 606bf9a (135/135). Concerns: MacLeave{Some(foreign)} while Outgoing; MacLeave{None} while Outgoing leaves stale riding; forced return while Incoming does nothing; Task 17 note — no-Accessibility bounce path should skip BeginDrag (carry to Task 17 dispatch).
+Task 3: review APPROVED (spec ✅). Ordering ⚠️ answered: DragDropped/DragFinished and Leave are all Control messages on the single ordered control stream.
+Ruling R13: MacLeave while Mac always homes an Outgoing drag first (SourceDragHome{x}, riding cleared), then starts a foreign incoming drag if any — why: keeps "Outgoing ⇒ where_ == Mac" and never leaves the catcher in riding mode (reviewer concern 2/1) — cost if wrong: a harmless extra SourceDragHome for an already-ended drag (Task 13 must make SourceDragHome of an ended drag only move the catcher to the edge strip).
+Ruling R14: PcEvent::MacLeave gains `game: bool`; a Mac drag coming home while a game holds the PC mouse is refused (PcAction::RefuseIncomingDrag{drag} → DragCancel{Cancelled}), the cursor still returns — why: spec anti-goal "a drag can never carry the cursor across while a game holds the mouse", applied to Mac→PC — cost if wrong: a Mac drag released over a PC game does nothing (desired).
+Task 17 notes (carry into dispatch): (a) no-Accessibility bounce path must feed the real drag, never None, and suppress BeginDrag/CancelDrag side effects for the whole bounce round trip with its own "no drag session" flag (bounce() uses feed, not feed_quietly, mac/control.rs:321-330); (b) Mac injector must count the PC-held left button as held from BeginDrag on, so PushOut sees buttons_held after a Mac-side Esc.
+Task 13 note: SourceDragHome for an already-ended drag only moves the catcher back to the edge strip.
+Task 3: fix round 1 sent to impl-task3 (R13, R14, Enter-overwrite cancel, forced-return-while-Incoming test).
+Task 3: fix round 1 DONE 47f0261 (140/140)
+Task 3: re-review (sonnet) all findings addressed
+Task 13 note: MacLeave game field must be the real game probe (app.rs hardcodes false now)
+Task 3: complete (606bf9a, 47f0261)
+Task 4: dispatched implementer (opus, impl-task4), BASE 47f0261
+Task 4: implementer DONE 2e6c333 (149 cj-core). Task 7 notes: idle on_rtt ramps a shared Pacer to 1 GB/s (100 MB burst) — one Pacer per transfer or feed RTT only while data is in flight; RTT signal only meaningful if pings share the congestion path with file streams.
+Task 4: review NEEDS FIXES (Important: rate ramps while the sender isn't using it → up to 100 MB burst when demand returns).
+Ruling R15: Pacer ramps only if delay_for actually held the sender back since the last RTT sample (`limited` flag) — why: spec anti-goal "input path keeps strict priority"; a quiet RTT while under-sending proves nothing (RFC 7661) — cost if wrong: slower ramp-up on a link with headroom.
+Ruling R16: One quiet sample's ramp credit is capped at 2 × 100 ms (≤ +8 MB/s) — why: lost pongs under load must not earn a giant step — cost if wrong: slightly slower ramp after ping loss.
+Ruling R17: The ramp clock resets on every high RTT sample (cut or not) — accepted reading of "since the last increase" — why: standard AIMD; prevents a quiet pong right after a cut refunding congested time — cost if wrong: ≤4 MB/s less ramp per cut.
+Task 4: fix round 1 sent to impl-task4 (R15, R16, saturating cost, doc readings).
+Task 4: fix round 1 DONE c9e30e0 (153 cj-core)
+Ruling R10a: a failed link download (R10) is reported as FailReason::Unreadable{name} ("Copy failed — couldn't read “name” on the PC"), not a new reason — why: avoids a protocol/FailReason change; the text is accurate enough — cost if wrong: slightly less specific wording.
+Task 4: re-review round 1 — R15/R16/docs fixed; new Minor: spike-clock test lost its uncut-spike check → round 2 sent. Parked: Instant-overflow None arm untested (unreachable in practice).
+Task 4: fix round 2 DONE fc5ccb1 (154, mutation-checked)
+Task 4: re-review round 2 all addressed
+Task 4: complete (2e6c333, c9e30e0, fc5ccb1)
+Task 5: dispatched implementer (opus, impl-task5), BASE fc5ccb1
+Task 5: implementer DONE 2d3a996 (167 cj-core). Concerns: Cell anchor makes PillBoard !Sync; '60 min left' at 3599.5 s; unknown total has no bar/indeterminate flag; hosts must always call finish.
+Task 5: review NEEDS FIXES (Important: set_held(false) clears every Finished anchor → already-faded pills replay ✓+fade on each game-lock release).
+Ruling R18: PillBoard::set_held takes `now` (set_held(held, now)); hold prunes expired pills, release anchors surviving Finished pills at now; the Cell goes, views/next_frame are pure — why: reviewer Important 1 + spec "held back until the game no longer does" covers only pills that end while held — cost if wrong: none (no consumer yet; plan line 372 amended).
+Host-task note (T10/T13/T14/T17): every exit path of an incoming drag, including disconnect/session loss, must call PillBoard::finish(Err(..)), or the pill stays forever. If the renderer wants an indeterminate bar for unknown totals, add an explicit PillView field in T9 (don't infer from fraction None).
+Task 5: fix round 1 sent to impl-task5 (R18 + regression test, coalesced ETA samples, done.min(total) in sub, total==0 no bar, title_for(&[]) → "file").
