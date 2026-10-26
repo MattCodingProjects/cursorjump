@@ -93,3 +93,50 @@ Task 5: review NEEDS FIXES (Important: set_held(false) clears every Finished anc
 Ruling R18: PillBoard::set_held takes `now` (set_held(held, now)); hold prunes expired pills, release anchors surviving Finished pills at now; the Cell goes, views/next_frame are pure — why: reviewer Important 1 + spec "held back until the game no longer does" covers only pills that end while held — cost if wrong: none (no consumer yet; plan line 372 amended).
 Host-task note (T10/T13/T14/T17): every exit path of an incoming drag, including disconnect/session loss, must call PillBoard::finish(Err(..)), or the pill stays forever. If the renderer wants an indeterminate bar for unknown totals, add an explicit PillView field in T9 (don't infer from fraction None).
 Task 5: fix round 1 sent to impl-task5 (R18 + regression test, coalesced ETA samples, done.min(total) in sub, total==0 no bar, title_for(&[]) → "file").
+Task 5: fix round 1 DONE 23ac600 (172 cj-core)
+Task 5: re-review all findings addressed (Minors parked: mid-fade pill replays fully after a hold; ETA stays optimistic during a <5 s stall because the rate uses the last sample not now)
+Task 5: complete (2d3a996, 23ac600)
+Task 6: dispatched implementer (opus, impl-task6), BASE 7a77ff9
+Task 6: implementer DONE 508fe04 (cj-net 14+29, session_tasks 3). Concerns: inline header read in acceptor can stall later streams (no timeout); header.kind vs entries unchecked; no sender-side stop-code helper. Added STOP_INVALID=3.
+Task 6: review APPROVED (spec ✅, no Critical/Important). Fix round 1 sent: FilesIn Drop → STOP_CANCELLED, header.kind consistency check, stronger cancel/drop tests, cj-net `files::stop_code(&anyhow::Error) -> Option<u32>` helper (apps never depend on quinn), window-unchanged comment. Parked: inline header read has no timeout (delay not deadlock; add timeout(2s) if smoke runs show it).
+Ruling R19: Connection/stream flow-control windows stay unchanged (48 MB conn, quinn default ~1.25 MB per stream) — why: ~125 MB/s per stream at 10 ms RTT is enough on a LAN, and more in-flight buffering hurts the no-stutter anti-goal — cost if wrong: lower throughput on a fast LAN; revisit if measured short in T18.
+Task 6: fix round 1 DONE dbd4b38 (cj-net 14+34)
+Task 6: re-review all findings addressed
+Task 6: complete (508fe04, dbd4b38)
+Ruling R20: receive_item never overwrites: if the final path already exists it cleans the .cjpart and fails with Unwritable; callers (dnd_link/OS glue) pick unique destinations (per-drag incoming dir on the PC; Finder's promise URL on the Mac) — why: spec "name collisions: follow what the receiving OS does", which the OS does at its own drop step, not in our engine — cost if wrong: a rare collision fails instead of renaming.
+Ruling R21: Stream stop codes map: receiver sees Reset(STOP_CANCELLED) → Cancelled (the real reason arrives via control DragCancel/DragFinished, Task 8); sender sees Stopped(STOP_CANCELLED) → Cancelled, Stopped(STOP_INVALID) → logged at error + Cancelled; other stream errors → Disconnected — why: R19 helper + brief's mapping — cost if wrong: wording only.
+Ruling R22: Received files are written by our own code, so on the Mac they carry no quarantine flag (treated like a local copy, per the spec's recommendation); files are flushed and closed before the rename, no fsync — why: spec "treat them like a local copy"; fsync on 5 GB is slow and crash-safety is beyond "no half-copied files" (temp+rename covers it) — cost if wrong: a power cut mid-rename could leave a truncated final file (very rare).
+Task 7: dispatched implementer (opus, impl-task7), BASE dbd4b38
+Task 7: implementer DONE fe867f5 (18 transfer tests). Concerns: sender Ok ≠ delivered (Task 8 must carry real outcome); sanitize collisions inside a folder fail the item; Windows paths > MAX_PATH fail (not longPathAware); protocol break → Disconnected.
+Task 7: review NEEDS FIXES (Important: dropped/panicking receive future leaves .cjpart behind — spec anti-goal "half-copied files left behind").
+Ruling R23: receive_item holds an armed PartGuard that removes the part on drop (std::fs, sync); the top-level part is FILE_ATTRIBUTE_HIDDEN on Windows; hard-kill leftovers are swept at startup by sweep_temp (Task 8/13) for CursorJump's own incoming dirs — why: anti-goal; Windows doesn't hide dot-files — cost if wrong: a leftover hidden part after a hard kill outside our dirs (Mac Exact promise dest).
+Task 8 notes: (a) the sender's Ok means "sent", not "landed" — the real outcome must come back over control (DragFinished); (b) pick unique InDir destinations so R20 never fires late after a full transfer.
+Polish backlog: uniquify sanitize collisions inside a received folder (today: fail-closed Unwritable). Task 14: run `cargo test -p cursorjump common::transfer -- --nocapture` and confirm no "skipped:" lines for the unix permission test.
+Task 7: fix round 1 sent to impl-task7 (PartGuard + abort test, hidden part, verbatim Win32 paths + >260 test, Exact uses p, spawn_blocking free space, cancel during file I/O, no error-path flush, HRESULT facility check, cfg(macos), FNV-1a, warn on protocol break).
+Task 7: fix round 1 DONE e23e020 (22 transfer tests); receive_item space is now &'static dyn FreeSpace (spawn_blocking)
+Task 7: re-review round 1 — all 10 fixed; new: Important A (&'static dyn FreeSpace vs plan's Arc<dyn FreeSpace> in DndLink) and Minor B (macOS spawn_blocking rename races the drop guard for folders) → round 2 sent.
+Task 8 notes: (c) serialize or refuse concurrent items with the same sanitized name into the same Dest (shared part name); (d) on disconnect cancel receives by token, never abort tasks/drop a JoinSet (keeps cleanup on the async path). Task 13 note: measure a 300-tiny-file drop for cursor smoothness (sync creates on the 2-worker link runtime).
+Task 7: fix round 2 DONE 9d4b62a (Arc<dyn FreeSpace>; sync macOS rename; C skipped — APFS refuses non-UTF-8 names)
+Task 7: re-review round 2 all addressed; controller verified disarm follows rename Ok with no await between (transfer.rs:537-538 → 362-365)
+Task 7: complete (fe867f5, e23e020, 9d4b62a)
+Task 8: dispatched implementer (opus, impl-task8), BASE 9d4b62a
+Task 8: implementer DONE 42167e2 (dnd_link 11/11). Concerns: REASON_WAIT 2 s for origin's DragCancel after a reset; dup-dest check not case-folded; out-of-range FileFetch warned+ignored.
+Task 8: review NEEDS FIXES (Important: case-variant destinations share one .cjpart → possible corrupt file reported Ok; Pending source resolving to Err(Cancelled|Disconnected) strands the drag; progress cap broken by forced item-end reports). REASON_WAIT 2 s accepted (in practice one control-message latency).
+Ruling R24: Destination clash detection folds case (Unicode lowercase + NFC) on every platform — why: NTFS/APFS are case-insensitive and part names collide — cost if wrong: a rare second fetch of a case-variant name fails Unwritable.
+Wiring notes (T11–T17): DndLink's offer/fetch/finish/cancel are not cancel-safe (partial control frame if dropped mid-write) — never put them in a select! that can drop them; Tally counts every offered item, so totals stay short / None (Dir) if items are never fetched — the PillBoard wiring must tolerate it.
+Task 8: fix round 1 sent to impl-task8.
+Task 8: fix round 1 DONE_WITH_CONCERNS 3688ca6 (dnd_link 15/15).
+Ruling R25: Progress cap is strict (throttle + trailing flush at last+100 ms, no force at item end) instead of "force when nothing in flight" — why: Windows reads FILECONTENTS serially, so the force rule still gave ~N events; strict cap meets note 6 — cost if wrong: the final Progress can trail its Received by ≤100 ms (PillBoard ignores progress after finish).
+Parked: case folding is to_lowercase, not full Unicode case folding (ß vs SS not caught).
+Task 8: fix round 2 DONE 36ea0e0 (16/16) — controller reviewed the small diff directly: held progress emitted in end_incoming after removal (flush then finds nothing), test fails without it. OK.
+Task 8: complete (42167e2, 3688ca6, 36ea0e0)
+Ruling R26: PillView gains `running: bool` (cj-core pill.rs, set while the copy is in progress); the renderer draws the indeterminate track only when running && fraction is None — why: Task 9's "indeterminate thin track if None while running" can't be derived (a Cancelled pill also has fraction None, check 0) — cost if wrong: none (one field).
+Task 9: dispatched implementer (opus, impl-task9), BASE 36ea0e0
+Task 9: implementer DONE c081c6a (pill_render 7 + ignored preview; ~93/140 µs). Concerns: shadow softened to fit SHADOW_PAD 12; layout slightly tighter; vector ✓/✕/icons; no shaping (emoji/CJK → .notdef); ✕ replaces ✓ on hover of a done pill. Preview viewed by controller: matches the mockup closely.
+Task 9: review NEEDS FIXES (Important: hover ✕ drawn on done/cancelled pills, where it has no action and hides the ✓). Fix round 1 sent (close_shown predicate, glyph fallback + NFC, NaN-safe sheen, R26 render test, polish).
+Ruling R27: SHADOW_PAD stays 12 with the eased shadow — why: layered/transparent windows hit-test every alpha>0 pixel; a 30 px halo would swallow clicks and cover neighbouring pills' ✕ — cost if wrong: a slightly softer shadow than the CSS mockup.
+Task 10 notes: alpha>0 pixels of the pixmap hit-test; neighbouring pill windows overlap by 16 px at pad 12 (upper pill's pad covers 4 px of the lower body) — z-order pills or hit-test only the body rect; use pill_render::close_shown for clicks.
+Task 9: fix round 1 DONE 950f235 (pill_render 10 + 1 ignored)
+Task 9: re-review all addressed
+Task 9: complete (c081c6a, 950f235) — preview shown to user; any look adjustments come as a later change
+Task 10: dispatched implementer (opus, impl-task10), BASE 950f235
