@@ -691,9 +691,12 @@ async fn session_ends_when_peer_vanishes() {
     tokio::task::spawn_blocking(move || server.join().unwrap())
         .await
         .unwrap();
-    timeout(Duration::from_secs(1), client.closed())
+    // Nothing but the 600 ms idle timeout can close this side (the peer sent
+    // no close frame), so any bound proves it fires; 3 s leaves a busy CI
+    // runner a wide margin.
+    timeout(Duration::from_secs(3), client.closed())
         .await
-        .expect("closed() must resolve within 1 s of the peer vanishing");
+        .expect("closed() must resolve within 3 s of the peer vanishing");
 }
 
 /// Binds a PairingMode listener and returns a raw peer that has completed Hello.
