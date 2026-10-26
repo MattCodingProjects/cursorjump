@@ -40,7 +40,7 @@ use tracing::{info, warn};
 use super::on_main;
 use super::source::{DragSource, KVK_ESCAPE, MacDndEv, copy_tree};
 use crate::common::transfer::Dest;
-use crate::mac::control::{DragPort, InjectMsg, Input, spawn_inject_thread};
+use crate::mac::control::{Crossing, DragPort, InjectMsg, Input, spawn_inject_thread};
 use crate::mac::inject::Injector;
 
 const DRAG: DragId = 0x5EED;
@@ -113,7 +113,7 @@ struct SmokeDrags {
 }
 
 impl DragPort for SmokeDrags {
-    fn prepare(&mut self, drag: DragId, items: Vec<DragItem>, at: (f64, f64)) -> bool {
+    fn prepare(&mut self, drag: DragId, items: Vec<DragItem>, at: (f64, f64)) -> Option<Crossing> {
         self.source.prepare(drag, items, at)
     }
     fn released(&mut self, drag: DragId, at: (f64, f64)) {
@@ -128,8 +128,8 @@ impl DragPort for SmokeDrags {
         info!(?self.release, may, "smoke: may the up go out now?");
         may
     }
-    fn cancel(&mut self, drag: DragId) {
-        self.source.cancel(drag);
+    fn cancel(&mut self, drag: DragId) -> bool {
+        self.source.cancel(drag)
     }
 }
 
@@ -159,8 +159,12 @@ pub fn run_smoke(mode: SmokeMode) -> anyhow::Result<()> {
                 info!(drag, item, ?dest, "smoke: fetch (fake, about 10 s)");
                 fake_fetch(src.clone(), dest, reply);
             }
-            MacDndEv::Ended { drag, dropped } => {
-                info!(drag, dropped, "smoke: ended");
+            MacDndEv::Ended {
+                drag,
+                crossing,
+                dropped,
+            } => {
+                info!(drag, crossing, dropped, "smoke: ended");
                 let _ = ended_tx.send(dropped);
             }
             other => info!(?other, "smoke: source event"),

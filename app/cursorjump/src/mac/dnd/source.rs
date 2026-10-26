@@ -60,7 +60,7 @@ use unicode_normalization::UnicodeNormalization;
 
 use super::{on_main, on_main_sync};
 use crate::common::transfer::Dest;
-use crate::mac::control::{DragPort, InjectMsg};
+use crate::mac::control::{Crossing, DragPort, InjectMsg};
 
 /// The Escape key's virtual keycode: a posted Esc cancels a drag session.
 pub const KVK_ESCAPE: u16 = 0x35;
@@ -98,11 +98,18 @@ static ATTEMPT: AtomicU64 = AtomicU64::new(1);
 /// What the drag source tells the app (Task 17).
 #[derive(Debug)]
 pub enum MacDndEv {
-    /// The drag's session ended here, on a target that took it (`dropped`)
-    /// or not. Exactly one per `prepare`d drag, a failed `prepare`
-    /// included. A drop whose promise writes still wait is dropped: the
-    /// outcome comes from the fetches (`incoming_outcome`).
-    Ended { drag: DragId, dropped: bool },
+    /// The session of `drag`'s `crossing` ended here, on a target that
+    /// took it (`dropped`) or not. Exactly one per crossing, a failed
+    /// `prepare` included (crossing 0 if it never got a token). A drag
+    /// that went home and came back ends once per crossing: only its
+    /// latest crossing's end counts for the drag. A drop whose promise
+    /// writes still wait is dropped: the outcome comes from the fetches
+    /// (`incoming_outcome`).
+    Ended {
+        drag: DragId,
+        crossing: Crossing,
+        dropped: bool,
+    },
     /// Fetch item `item` of `drag` into `dest`, a staging folder
     /// (`Dest::InDir`), and reply with the received path or why it failed.
     /// One per item not already here, sent from the prefetch thread just
@@ -121,15 +128,20 @@ pub enum MacDndEv {
         expect(dead_code, reason = "Task 17 starts the pill from it")
     )]
     Released { drag: DragId, at: (f64, f64) },
-    /// Every item is in place.
-    Ready { drag: DragId },
-    /// Item `item` failed; cj-inject cancels the drag.
+    /// Every item of `drag`'s `crossing` is in place.
+    Ready { drag: DragId, crossing: Crossing },
+    /// A session started just as its drag was cancelled: cj-inject posts
+    /// Esc to end it undropped.
+    NeedsEscape { drag: DragId },
+    /// Item `item` of `drag`'s `crossing` failed; cj-inject cancels the
+    /// drag.
     #[cfg_attr(
         all(debug_assertions, not(test)),
         expect(dead_code, reason = "Task 17 tells the pill why")
     )]
     Failed {
         drag: DragId,
+        crossing: Crossing,
         item: u32,
         reason: FailReason,
     },
@@ -140,9 +152,12 @@ impl MacDndEv {
     /// callback sends it on the injection thread's channel.
     pub fn inject_msg(&self) -> Option<InjectMsg> {
         match *self {
-            MacDndEv::Ended { drag, .. } => Some(InjectMsg::DragEnded { drag }),
-            MacDndEv::Ready { drag } => Some(InjectMsg::DragReady { drag }),
-            MacDndEv::Failed { drag, .. } => Some(InjectMsg::DragFailed { drag }),
+            MacDndEv::Ended { drag, crossing, .. } => Some(InjectMsg::DragEnded { drag, crossing }),
+            MacDndEv::Ready { drag, crossing } => Some(InjectMsg::DragReady { drag, crossing }),
+            MacDndEv::Failed { drag, crossing, .. } => {
+                Some(InjectMsg::DragFailed { drag, crossing })
+            }
+            MacDndEv::NeedsEscape { drag } => Some(InjectMsg::EscapeSession { drag }),
             MacDndEv::Fetch { .. } | MacDndEv::Released { .. } => None,
         }
     }
@@ -468,8 +483,11 @@ struct DragState {
     /// Gone home, cancelled or ended undropped: fetches stop, waiting
     /// promise writes fail.
     cancelled: bool,
-    /// Its session started (the posted down reached the panel).
+    /// Its session is starting or started: the posted down reached the
+    /// panel (set before `beginDraggingSession…`).
     began: bool,
+    /// `beginDraggingSession…` returned: Esc reaches the session now.
+    started: bool,
     /// `Ended` was sent.
     ended: bool,
     /// A later crossing of the same drag took over its placeholders: a
@@ -481,6 +499,8 @@ struct DragState {
 /// prefetch thread and the promise writers.
 struct Drag {
     id: DragId,
+    /// This crossing's token (its attempt number).
+    crossing: Crossing,
     slots: Vec<Slot>,
     /// This crossing's staging folder.
     staging: PathBuf,
@@ -494,13 +514,21 @@ struct Drag {
 
 impl Drag {
     /// `items`: each slot's state at the start (Complete if carried over).
-    fn new(id: DragId, slots: Vec<Slot>, staging: PathBuf, items: Vec<Item>) -> Drag {
+    fn new(
+        id: DragId,
+        crossing: Crossing,
+        slots: Vec<Slot>,
+        staging: PathBuf,
+        items: Vec<Item>,
+    ) -> Drag {
         Drag {
             id,
+            crossing,
             state: Mutex::new(DragState {
                 items,
                 cancelled: false,
                 began: false,
+                started: false,
                 ended: false,
                 superseded: false,
             }),
@@ -516,17 +544,38 @@ impl Drag {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Cancels it; whether its session had begun, read under the same
-    /// lock that starting it takes, so the two can't cross.
-    fn cancel(&self) -> bool {
-        let began = {
+    /// Cancels it. Decided under the lock that starting a session takes,
+    /// so the two can't cross. Returns (whether a session began, whether
+    /// one is live: started and not ended, so that Esc ends it). A session
+    /// still starting asks for its own Esc (`session_started`).
+    fn cancel(&self) -> (bool, bool) {
+        let (began, live) = {
             let mut st = self.lock();
             st.cancelled = true;
-            st.began
+            (st.began, st.started && !st.ended)
         };
         self.changed.notify_all();
         self.stop.notify_one();
-        began
+        (began, live)
+    }
+
+    /// Main thread, at the posted down: whether to start a session. Not
+    /// once cancelled (nor twice).
+    fn try_begin(&self) -> bool {
+        let mut st = self.lock();
+        if st.began || st.cancelled {
+            return false;
+        }
+        st.began = true;
+        true
+    }
+
+    /// Main thread, once `beginDraggingSession…` returned: whether the drag
+    /// was cancelled meanwhile, so the new session needs an Esc.
+    fn session_started(&self) -> bool {
+        let mut st = self.lock();
+        st.started = true;
+        st.cancelled && !st.ended
     }
 
     /// Item `i`'s fetch finished: puts it in place. Returns what to tell
@@ -563,7 +612,7 @@ impl Drag {
         let cancelled = st.cancelled;
         drop(st);
         self.changed.notify_all();
-        let (drag, item) = (self.id, i as u32);
+        let (drag, crossing, item) = (self.id, self.crossing, i as u32);
         match outcome {
             _ if cancelled => Vec::new(),
             Err(reason) => {
@@ -573,13 +622,18 @@ impl Drag {
                     ?reason,
                     "an item of the drag from the PC failed"
                 );
-                vec![MacDndEv::Failed { drag, item, reason }]
+                vec![MacDndEv::Failed {
+                    drag,
+                    crossing,
+                    item,
+                    reason,
+                }]
             }
             Ok(()) if all => {
                 info!(drag, "every item of the drag from the PC is here");
                 // Only empty folders are left there.
                 let _ = fs::remove_dir_all(&self.staging);
-                vec![MacDndEv::Ready { drag }]
+                vec![MacDndEv::Ready { drag, crossing }]
             }
             Ok(()) => Vec::new(),
         }
@@ -700,6 +754,11 @@ impl Inner {
         past.push(drag.clone());
     }
 
+    /// The latest earlier crossing of `drag`, left in the list.
+    fn find_past(&self, drag: DragId) -> Option<Arc<Drag>> {
+        self.past().iter().rev().find(|d| d.id == drag).cloned()
+    }
+
     /// The latest earlier crossing of `drag`, taken out of the list.
     fn take_past(&self, drag: DragId) -> Option<Arc<Drag>> {
         let mut past = self.past();
@@ -727,9 +786,15 @@ impl Inner {
             drag.cancel();
             self.remember(drag);
         }
-        info!(drag = drag.id, dropped, "the drag from the PC ended here");
+        info!(
+            drag = drag.id,
+            crossing = drag.crossing,
+            dropped,
+            "the drag from the PC ended here"
+        );
         self.emit(MacDndEv::Ended {
             drag: drag.id,
+            crossing: drag.crossing,
             dropped,
         });
     }
@@ -766,18 +831,20 @@ impl DragSource {
 
     /// Arms `drag` under `at` (global points): its placeholders and the
     /// drag panel there; a prefetch thread then sends a `Fetch` per item
-    /// still missing. All within [`PREPARE_TIMEOUT`]. False if it can't
-    /// (no items, the disk, the main thread too slow): `Ended` (not
-    /// dropped) then follows, and nothing must be pressed.
-    pub fn prepare(&self, drag: DragId, items: Vec<DragItem>, at: (f64, f64)) -> bool {
+    /// still missing. All within [`PREPARE_TIMEOUT`]. Returns this
+    /// crossing's token; None if it can't start (no items, the disk, the
+    /// main thread too slow): `Ended` (not dropped) then follows, and
+    /// nothing must be pressed.
+    pub fn prepare(&self, drag: DragId, items: Vec<DragItem>, at: (f64, f64)) -> Option<Crossing> {
         let started = Instant::now();
         let fail = |why: &str| {
             warn!(drag, "the drag from the PC can't start here: {why}");
             self.inner.emit(MacDndEv::Ended {
                 drag,
+                crossing: 0,
                 dropped: false,
             });
-            false
+            None
         };
         if items.is_empty() {
             return fail("no items were offered for it");
@@ -802,20 +869,21 @@ impl DragSource {
                 "the drag panel did not come up in time"
             );
             self.cancel(drag);
-            return false;
+            return None;
         }
         if let Err(e) = spawn_prefetch(self.inner.clone(), d.clone()) {
             warn!(drag, "starting the prefetch thread failed: {e}");
             self.cancel(drag);
-            return false;
+            return None;
         }
         info!(
             drag,
+            crossing = d.crossing,
             items = d.slots.len(),
             ms = started.elapsed().as_millis() as u64,
             "the drag from the PC is armed"
         );
-        true
+        Some(d.crossing)
     }
 
     /// This crossing's placeholders: an earlier crossing of the same drag
@@ -833,7 +901,7 @@ impl DragSource {
         }
         let keep = match self.inner.take_past(drag) {
             Some(old) => {
-                old.cancel();
+                let _ = old.cancel();
                 old.hand_over(&slots)
             }
             None => vec![false; slots.len()],
@@ -847,7 +915,7 @@ impl DragSource {
             .iter()
             .map(|&k| if k { Item::Complete } else { Item::Fetching })
             .collect();
-        Ok(Arc::new(Drag::new(drag, slots, staging, states)))
+        Ok(Arc::new(Drag::new(drag, attempt, slots, staging, states)))
     }
 
     /// The user let go while `drag` rode here, at `at`.
@@ -855,7 +923,15 @@ impl DragSource {
         let Some(d) = self.inner.get(drag) else {
             return;
         };
-        let began = d.lock().began;
+        // Decided under one lock with starting the session: without one
+        // yet, the drag is cancelled there and then, so none can start.
+        let began = {
+            let mut st = d.lock();
+            if !st.began {
+                st.cancelled = true;
+            }
+            st.began
+        };
         if began {
             self.inner.emit(MacDndEv::Released { drag, at });
         } else {
@@ -867,14 +943,22 @@ impl DragSource {
 
     /// Whether the up may be posted now, over `at`: every item is in
     /// place, or the app there takes file promises. True for a drag that
-    /// is over, or never started a session.
+    /// is over, or never started a session. Never for an incomplete drag
+    /// whose session is still on after it was cancelled: its Esc ends it.
     pub fn may_release(&self, drag: DragId, at: (f64, f64)) -> bool {
-        let Some(d) = self.inner.get(drag) else {
-            return true;
+        let found = self.inner.get(drag).or_else(|| self.inner.find_past(drag));
+        let Some(d) = found else {
+            return true; // Never here, or dropped and gone: no session.
         };
         {
             let st = d.lock();
-            if !st.began || st.ended || st.items.iter().all(|x| *x == Item::Complete) {
+            if !st.began || st.ended {
+                return true;
+            }
+            if st.cancelled {
+                return false;
+            }
+            if st.items.iter().all(|x| *x == Item::Complete) {
                 return true;
             }
             if st.items.iter().any(|x| matches!(x, Item::Failed(_))) {
@@ -886,18 +970,21 @@ impl DragSource {
 
     /// `drag` went home or was cancelled: its fetches stop (their replies'
     /// receivers are dropped), waiting promise writes fail and its panel
-    /// goes. The session itself ends by the Esc cj-inject posts. Idempotent.
-    pub fn cancel(&self, drag: DragId) {
+    /// goes. True if its session is live: cj-inject then posts the Esc that
+    /// ends it. A session still starting asks for its Esc itself
+    /// (`NeedsEscape`); one that never began is ended here. Idempotent.
+    pub fn cancel(&self, drag: DragId) -> bool {
         let Some(d) = self.inner.live().remove(&drag) else {
-            return;
+            return false;
         };
-        let began = d.cancel();
+        let (began, live) = d.cancel();
         self.inner.remember(&d);
         if !began {
             // No session will end it.
             self.inner.end(&d, false);
             on_main(move |_| appkit::close_panel(&d));
         }
+        live
     }
 
     /// Whether every item of `drag` is in place (true once it is over).
@@ -908,7 +995,7 @@ impl DragSource {
 }
 
 impl DragPort for DragSource {
-    fn prepare(&mut self, drag: DragId, items: Vec<DragItem>, at: (f64, f64)) -> bool {
+    fn prepare(&mut self, drag: DragId, items: Vec<DragItem>, at: (f64, f64)) -> Option<Crossing> {
         DragSource::prepare(self, drag, items, at)
     }
     fn released(&mut self, drag: DragId, at: (f64, f64)) {
@@ -917,8 +1004,8 @@ impl DragPort for DragSource {
     fn may_release(&mut self, drag: DragId, at: (f64, f64)) -> bool {
         DragSource::may_release(self, drag, at)
     }
-    fn cancel(&mut self, drag: DragId) {
-        DragSource::cancel(self, drag);
+    fn cancel(&mut self, drag: DragId) -> bool {
+        DragSource::cancel(self, drag)
     }
 }
 
@@ -945,7 +1032,10 @@ fn prefetch(inner: &Inner, drag: &Drag) {
             drag = drag.id,
             "every item is here from an earlier crossing"
         );
-        inner.emit(MacDndEv::Ready { drag: drag.id });
+        inner.emit(MacDndEv::Ready {
+            drag: drag.id,
+            crossing: drag.crossing,
+        });
         return;
     }
     let runtime = match tokio::runtime::Builder::new_current_thread().build() {
@@ -1278,7 +1368,7 @@ mod tests {
         let staging = dir.join(STAGING).join("1");
         let s = slots(dir, &staging, &items);
         make_placeholders(dir, &s, &[], &dir.join("aside")).unwrap();
-        Drag::new(7, s, staging, vec![Item::Fetching; n])
+        Drag::new(7, 1, s, staging, vec![Item::Fetching; n])
     }
 
     fn fetched(drag: &Drag, i: usize, bytes: &[u8]) -> PathBuf {
@@ -1298,7 +1388,16 @@ mod tests {
         assert!(!d.all_complete());
         let p = fetched(&d, 0, b"zero");
         let evs = d.resolve(0, Ok(p));
-        assert!(matches!(evs[..], [MacDndEv::Ready { drag: 7 }]), "{evs:?}");
+        assert!(
+            matches!(
+                evs[..],
+                [MacDndEv::Ready {
+                    drag: 7,
+                    crossing: 1
+                }]
+            ),
+            "{evs:?}"
+        );
         assert!(d.all_complete());
         assert_eq!(d.wait_item(0), Ok(()));
         assert!(
@@ -1319,6 +1418,7 @@ mod tests {
                 evs[..],
                 [MacDndEv::Failed {
                     drag: 7,
+                    crossing: 1,
                     item: 1,
                     reason: FailReason::NoSpace
                 }]
@@ -1370,21 +1470,39 @@ mod tests {
             (
                 MacDndEv::Ended {
                     drag: 7,
+                    crossing: 3,
                     dropped: true,
                 },
-                Some(InjectMsg::DragEnded { drag: 7 }),
+                Some(InjectMsg::DragEnded {
+                    drag: 7,
+                    crossing: 3,
+                }),
             ),
             (
-                MacDndEv::Ready { drag: 7 },
-                Some(InjectMsg::DragReady { drag: 7 }),
+                MacDndEv::Ready {
+                    drag: 7,
+                    crossing: 3,
+                },
+                Some(InjectMsg::DragReady {
+                    drag: 7,
+                    crossing: 3,
+                }),
+            ),
+            (
+                MacDndEv::NeedsEscape { drag: 7 },
+                Some(InjectMsg::EscapeSession { drag: 7 }),
             ),
             (
                 MacDndEv::Failed {
                     drag: 7,
+                    crossing: 3,
                     item: 0,
                     reason: FailReason::Cancelled,
                 },
-                Some(InjectMsg::DragFailed { drag: 7 }),
+                Some(InjectMsg::DragFailed {
+                    drag: 7,
+                    crossing: 3,
+                }),
             ),
             (
                 MacDndEv::Released {
@@ -1429,8 +1547,11 @@ mod tests {
         src.released(9, (0.0, 0.0));
         assert!(rx.try_recv().is_err(), "no events");
         // No items: it can't start, and says it ended undropped.
-        assert!(!src.prepare(9, Vec::new(), (0.0, 0.0)));
-        assert_eq!(rx.try_recv().unwrap(), "Ended { drag: 9, dropped: false }");
+        assert_eq!(src.prepare(9, Vec::new(), (0.0, 0.0)), None);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            "Ended { drag: 9, crossing: 0, dropped: false }"
+        );
     }
 
     /// A drag registered without its panel: cancelling it before a session
@@ -1458,7 +1579,10 @@ mod tests {
         d.lock().began = false;
         src.cancel(7);
         src.cancel(7);
-        assert_eq!(rx.try_recv().unwrap(), "Ended { drag: 7, dropped: false }");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            "Ended { drag: 7, crossing: 1, dropped: false }"
+        );
         assert!(rx.try_recv().is_err(), "once");
         assert!(d.lock().cancelled);
     }
@@ -1487,10 +1611,59 @@ mod tests {
         let d = Arc::new(drag_in(&tmp.path().join("7"), 1));
         src.inner.live().insert(7, d.clone());
         src.released(7, (1.0, 2.0));
-        assert_eq!(rx.try_recv().unwrap(), "Ended { drag: 7, dropped: false }");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            "Ended { drag: 7, crossing: 1, dropped: false }"
+        );
         assert!(rx.try_recv().is_err(), "no Released");
         assert!(d.lock().cancelled);
+        assert!(!d.try_begin(), "no session can start after it");
         assert!(src.may_release(7, (1.0, 2.0)), "over: the up goes out");
+    }
+
+    /// A session that began first: the release is a release, and the
+    /// drag stays.
+    #[test]
+    fn released_with_a_session_is_a_release() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, rx) = source_in(tmp.path());
+        let d = Arc::new(drag_in(&tmp.path().join("7"), 1));
+        src.inner.live().insert(7, d.clone());
+        assert!(d.try_begin());
+        assert!(!d.try_begin(), "only the first down");
+        src.released(7, (1.0, 2.0));
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            "Released { drag: 7, at: (1.0, 2.0) }"
+        );
+        assert!(!d.lock().cancelled);
+    }
+
+    /// Cancelled while its session was starting: no Esc yet (it might come
+    /// before the session could take it); the session asks for one once
+    /// started, and until it has ended the up is never posted early.
+    #[test]
+    fn a_session_starting_as_it_is_cancelled_asks_for_its_esc() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, rx) = source_in(tmp.path());
+        let d = Arc::new(drag_in(&tmp.path().join("7"), 1));
+        src.inner.live().insert(7, d.clone());
+        assert!(d.try_begin());
+        assert!(!src.cancel(7), "not live yet: no Esc from cj-inject");
+        assert!(rx.try_recv().is_err(), "the session will end it");
+        assert!(
+            !src.may_release(7, (0.0, 0.0)),
+            "cancelled, its session on, incomplete: hold"
+        );
+        assert!(d.session_started(), "it needs an Esc");
+        src.inner.end(&d, false);
+        assert!(src.may_release(7, (0.0, 0.0)), "ended: the up may go");
+        // A session that started before the cancel is live: cj-inject's Esc.
+        let d = Arc::new(drag_in(&tmp.path().join("8"), 1));
+        src.inner.live().insert(7, d.clone());
+        assert!(d.try_begin());
+        assert!(!d.session_started());
+        assert!(src.cancel(7));
     }
 
     /// Without a main thread serving its queue (as in libtest), the panel
@@ -1501,7 +1674,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (src, rx) = source_in(tmp.path());
         let t0 = Instant::now();
-        assert!(!src.prepare(7, vec![item("a.txt", ItemKind::File)], (5.0, 5.0)));
+        assert_eq!(
+            src.prepare(7, vec![item("a.txt", ItemKind::File)], (5.0, 5.0)),
+            None
+        );
         let took = t0.elapsed();
         assert!(
             took < PREPARE_TIMEOUT + Duration::from_millis(50),
@@ -1509,7 +1685,12 @@ mod tests {
         );
         std::thread::sleep(Duration::from_millis(50));
         let evs: Vec<String> = rx.try_iter().collect();
-        assert_eq!(evs, ["Ended { drag: 7, dropped: false }"]);
+        assert_eq!(evs.len(), 1, "{evs:?}");
+        assert!(
+            evs[0].starts_with("Ended { drag: 7, crossing: ")
+                && evs[0].ends_with("dropped: false }"),
+            "{evs:?}"
+        );
         assert!(src.inner.get(7).is_none());
         assert!(
             tmp.path().join("7").join("a.txt").exists(),
@@ -1532,10 +1713,17 @@ mod tests {
         let p = fetched(&first, 0, b"done");
         first.resolve(0, Ok(p));
         // Going home.
-        src.cancel(7);
-        assert_eq!(rx.try_recv().unwrap(), "Ended { drag: 7, dropped: false }");
+        assert!(!src.cancel(7), "no session");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            format!(
+                "Ended {{ drag: 7, crossing: {}, dropped: false }}",
+                first.crossing
+            )
+        );
         // Coming back.
         let second = src.stage(7, &items).unwrap();
+        assert_ne!(second.crossing, first.crossing, "a token per crossing");
         assert_eq!(
             second.lock().items,
             [Item::Complete, Item::Fetching],
@@ -1550,7 +1738,10 @@ mod tests {
         // Its own fetch lands.
         let p = fetched(&second, 1, b"late");
         let evs = second.resolve(1, Ok(p));
-        assert!(matches!(evs[..], [MacDndEv::Ready { drag: 7 }]), "{evs:?}");
+        assert!(
+            matches!(evs[..], [MacDndEv::Ready { drag: 7, .. }]),
+            "{evs:?}"
+        );
         // With no crossing to take over from, a stale placeholder moves aside.
         let (fresh, _rx) = source_in(tmp.path());
         let third = fresh.stage(7, &items).unwrap();

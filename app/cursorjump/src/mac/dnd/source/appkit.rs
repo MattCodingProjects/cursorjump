@@ -31,8 +31,8 @@ use objc2_uniform_type_identifiers::UTType;
 use tracing::{info, warn};
 
 use super::{
-    Drag, FOLDER_UTT, ICON_CASCADE, ICON_SIZE, Inner, KEEP_AFTER_CLOSE, MAX_CASCADE, PANEL_ALPHA,
-    PANEL_SIZE, Slot, utt_for_name, write_promise,
+    Drag, FOLDER_UTT, ICON_CASCADE, ICON_SIZE, Inner, KEEP_AFTER_CLOSE, MAX_CASCADE, MacDndEv,
+    PANEL_ALPHA, PANEL_SIZE, Slot, utt_for_name, write_promise,
 };
 
 /// A drag's panel and the objects its session uses, kept on the main
@@ -225,7 +225,12 @@ define_class!(
             _session: &NSDraggingSession,
             _context: NSDraggingContext,
         ) -> NSDragOperation {
-            NSDragOperation::Copy
+            // A cancelled drag drops nowhere, even if an up beats its Esc.
+            if self.ivars().drag.lock().cancelled {
+                NSDragOperation::None
+            } else {
+                NSDragOperation::Copy
+            }
         }
 
         #[unsafe(method(draggingSession:endedAtPoint:operation:))]
@@ -251,14 +256,10 @@ impl DragView {
     /// type's icon, fanned out a little.
     fn start(&self, event: &NSEvent) {
         let iv = self.ivars();
-        {
-            // Starting and cancelling exclude each other: once `began` is
-            // set, `cancel` and `released` know a session is (being) made.
-            let mut st = iv.drag.lock();
-            if st.began || st.cancelled {
-                return; // Only the first down counts.
-            }
-            st.began = true;
+        // Starting and cancelling exclude each other: once `began` is set,
+        // `cancel` and `released` know a session is (being) made.
+        if !iv.drag.try_begin() {
+            return; // Cancelled, or not the first down.
         }
         let at = self.convertPoint_fromView(event.locationInWindow(), None);
         let items: Vec<Retained<NSDraggingItem>> = iv
@@ -299,6 +300,11 @@ impl DragView {
             ProtocolObject::from_ref(self),
         );
         session.setAnimatesToStartingPositionsOnCancelOrFail(false);
+        if iv.drag.session_started() {
+            // Cancelled while it started: cj-inject's Esc may have come
+            // before the session could take it.
+            iv.inner.emit(MacDndEv::NeedsEscape { drag: iv.drag.id });
+        }
         info!(drag = iv.drag.id, "the drag session from the PC began");
     }
 }

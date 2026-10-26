@@ -19,8 +19,12 @@
 //!   jiggles 1 pt every [`JIGGLE_EVERY`], and the up goes out when the
 //!   source reports every item complete (`InjectMsg::DragReady`).
 //! - Cancelling (`CancelDrag` from the machine, `InjectMsg::CancelDrag`, a
-//!   failed item) posts Esc, which ends the session without a drop, then
-//!   lets go of the button unless the PC still holds it.
+//!   failed item) cancels the source first, so no session can start after
+//!   it; then, only if a session is live, posts Esc, which ends it without
+//!   a drop; then lets go of the button unless the PC still holds it.
+//! - Each crossing of a drag has its own token: news from an earlier
+//!   crossing of the same drag (it went home and came back) never touches
+//!   the ride of a later one.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
@@ -67,32 +71,46 @@ pub trait Inject {
     fn jiggle(&mut self, nudge: bool);
 }
 
+/// One crossing of a drag onto this Mac: a drag that went home and came
+/// back has a new one.
+pub type Crossing = u64;
+
 /// What the thread needs from the Mac's drag source
 /// (`dnd::source::DragSource`); a trait so the routing can be tested
 /// without AppKit.
 pub trait DragPort {
-    /// Arms drag `drag` under `at` (global points); false if it can't start.
-    fn prepare(&mut self, drag: DragId, items: Vec<DragItem>, at: (f64, f64)) -> bool;
+    /// Arms drag `drag` under `at` (global points): this crossing's token,
+    /// or None if it can't start.
+    fn prepare(&mut self, drag: DragId, items: Vec<DragItem>, at: (f64, f64)) -> Option<Crossing>;
     /// The user let go while the drag rode here, at `at`.
     fn released(&mut self, drag: DragId, at: (f64, f64));
     /// Whether the up may be posted now, over `at`.
     fn may_release(&mut self, drag: DragId, at: (f64, f64)) -> bool;
-    /// The drag is over here without a drop: stop its fetches.
-    fn cancel(&mut self, drag: DragId);
+    /// The drag is over here without a drop: stop its fetches. True if its
+    /// session is live, so that Esc must end it; a session that is still
+    /// starting asks for its Esc itself (`InjectMsg::EscapeSession`).
+    fn cancel(&mut self, drag: DragId) -> bool;
 }
 
 /// For a Mac without a drag source: no PC drag starts here.
 pub struct NoDrags;
 
 impl DragPort for NoDrags {
-    fn prepare(&mut self, _drag: DragId, _items: Vec<DragItem>, _at: (f64, f64)) -> bool {
-        false
+    fn prepare(
+        &mut self,
+        _drag: DragId,
+        _items: Vec<DragItem>,
+        _at: (f64, f64),
+    ) -> Option<Crossing> {
+        None
     }
     fn released(&mut self, _drag: DragId, _at: (f64, f64)) {}
     fn may_release(&mut self, _drag: DragId, _at: (f64, f64)) -> bool {
         true
     }
-    fn cancel(&mut self, _drag: DragId) {}
+    fn cancel(&mut self, _drag: DragId) -> bool {
+        false
+    }
 }
 
 impl Inject for Injector {
@@ -192,18 +210,27 @@ pub enum InjectMsg {
     /// The Accessibility permission was revoked: if the PC is controlling
     /// this Mac, send its cursor back.
     AccessLost,
-    /// From the drag source (`MacDndEv::inject_msg`): every item of `drag`
-    /// is complete, so a held drop may go ahead.
+    /// From the drag source (`MacDndEv::inject_msg`): every item of
+    /// `drag`'s `crossing` is complete, so a held drop may go ahead.
     DragReady {
         drag: DragId,
+        crossing: Crossing,
     },
-    /// From the drag source: an item of `drag` failed; the drag is
-    /// cancelled.
+    /// From the drag source: an item of `drag`'s `crossing` failed; the
+    /// drag is cancelled.
     DragFailed {
         drag: DragId,
+        crossing: Crossing,
     },
-    /// From the drag source: `drag`'s session ended, dropped or not.
+    /// From the drag source: the session of `drag`'s `crossing` ended,
+    /// dropped or not.
     DragEnded {
+        drag: DragId,
+        crossing: Crossing,
+    },
+    /// From the drag source: a session that started as its drag was being
+    /// cancelled: post Esc so that it ends undropped.
+    EscapeSession {
         drag: DragId,
     },
     /// Cancel `drag` (the pill's ✕, the PC's `DragCancel`): Esc, then the
@@ -283,8 +310,15 @@ pub enum InjectEv {
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Ride {
     drag: DragId,
+    crossing: Crossing,
     /// The user let go and the up is held until the items are complete.
     hold: Option<Hold>,
+}
+
+impl Ride {
+    fn is(&self, drag: DragId, crossing: Crossing) -> bool {
+        self.drag == drag && self.crossing == crossing
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -309,6 +343,8 @@ pub struct Router<I: Inject, D: DragPort> {
     /// The latest `DragOffer` from the PC, until its crossing.
     offer: Option<(DragId, Vec<DragItem>)>,
     ride: Option<Ride>,
+    /// How often a held drop jiggles.
+    jiggle_every: Duration,
 }
 
 impl<I: Inject, D: DragPort> Router<I, D> {
@@ -322,15 +358,29 @@ impl<I: Inject, D: DragPort> Router<I, D> {
             no_access_log: LogLimit::new(NO_ACCESS_LOG_EVERY),
             offer: None,
             ride: None,
+            jiggle_every: JIGGLE_EVERY,
         }
     }
 
+    #[cfg(test)]
+    fn with_jiggle_every(mut self, every: Duration) -> Self {
+        self.jiggle_every = every;
+        self
+    }
+
     /// After a panic: cancels a drag still riding (Esc ends its session
-    /// undropped), then lets go of every key and button the Injector holds.
+    /// undropped), then always lets go of every key and button the
+    /// Injector holds, even if the cancel panics too.
     pub fn let_go_after_panic(&mut self) {
         if let Some(r) = self.ride.take() {
-            self.escape();
-            self.drags.cancel(r.drag);
+            let cancelled = catch_unwind(AssertUnwindSafe(|| {
+                if self.drags.cancel(r.drag) {
+                    self.escape();
+                }
+            }));
+            if cancelled.is_err() {
+                error!(drag = r.drag, "cancelling the drag after the panic failed");
+            }
         }
         self.inj.release_all();
     }
@@ -352,7 +402,7 @@ impl<I: Inject, D: DragPort> Router<I, D> {
             return;
         }
         hold.nudged = !hold.nudged;
-        hold.next_jiggle = now + JIGGLE_EVERY;
+        hold.next_jiggle = now + self.jiggle_every;
         let nudge = hold.nudged;
         self.inj.jiggle(nudge);
     }
@@ -376,19 +426,34 @@ impl<I: Inject, D: DragPort> Router<I, D> {
                 }
                 _ => Vec::new(),
             },
-            InjectMsg::DragReady { drag } => {
-                if self.holding(drag) {
+            InjectMsg::DragReady { drag, crossing } => {
+                if self
+                    .ride
+                    .is_some_and(|r| r.is(drag, crossing) && r.hold.is_some())
+                {
                     info!(drag, "every item is here: posting the held up");
                     self.drop_now(drag);
                 }
                 Vec::new()
             }
-            InjectMsg::DragFailed { drag } | InjectMsg::CancelDrag { drag } => {
+            InjectMsg::DragFailed { drag, crossing } => {
+                // An earlier crossing's failure is no news for this one.
+                if self.ride.is_some_and(|r| r.is(drag, crossing)) {
+                    self.abort_drag(drag);
+                }
+                Vec::new()
+            }
+            InjectMsg::CancelDrag { drag } => {
                 self.abort_drag(drag);
                 Vec::new()
             }
-            InjectMsg::DragEnded { drag } => {
-                self.session_ended(drag);
+            InjectMsg::DragEnded { drag, crossing } => {
+                self.session_ended(drag, crossing);
+                Vec::new()
+            }
+            InjectMsg::EscapeSession { drag } => {
+                info!(drag, "ending a cancelled drag's late session");
+                self.escape();
                 Vec::new()
             }
             InjectMsg::Quit => {
@@ -461,10 +526,10 @@ impl<I: Inject, D: DragPort> Router<I, D> {
                 down,
             } if self.ride.is_some() => {
                 // The left button is the drag's: only its first up counts.
-                if let Some(Ride { drag, hold: None }) = self.ride
+                if let Some(r @ Ride { hold: None, .. }) = self.ride
                     && !down
                 {
-                    self.let_go(drag);
+                    self.let_go(r);
                 }
                 Vec::new()
             }
@@ -489,11 +554,6 @@ impl<I: Inject, D: DragPort> Router<I, D> {
         }
     }
 
-    fn holding(&self, drag: DragId) -> bool {
-        self.ride
-            .is_some_and(|r| r.drag == drag && r.hold.is_some())
-    }
-
     /// `BeginDrag`: arm the drag under the cursor, then press for it.
     fn begin_drag(&mut self, drag: DragId) {
         if self.ride.is_some_and(|r| r.drag == drag) {
@@ -512,9 +572,13 @@ impl<I: Inject, D: DragPort> Router<I, D> {
             self.inj.button(MouseButton::Left, false);
         }
         let at = self.inj.cursor();
-        if self.drags.prepare(drag, items, at) {
+        if let Some(crossing) = self.drags.prepare(drag, items, at) {
             self.inj.button(MouseButton::Left, true);
-            self.ride = Some(Ride { drag, hold: None });
+            self.ride = Some(Ride {
+                drag,
+                crossing,
+                hold: None,
+            });
         } else {
             // Nothing is pressed, so nothing stays held or stranded.
             warn!(
@@ -526,8 +590,8 @@ impl<I: Inject, D: DragPort> Router<I, D> {
     }
 
     /// The PC's left-up while the drag rides: drop now, or hold the up.
-    fn let_go(&mut self, drag: DragId) {
-        let at = self.inj.cursor();
+    fn let_go(&mut self, ride: Ride) {
+        let (drag, at) = (ride.drag, self.inj.cursor());
         self.drags.released(drag, at);
         if self.drags.may_release(drag, at) {
             self.drop_now(drag);
@@ -535,11 +599,11 @@ impl<I: Inject, D: DragPort> Router<I, D> {
         }
         info!(drag, "holding the drop until every item is here");
         self.ride = Some(Ride {
-            drag,
             hold: Some(Hold {
-                next_jiggle: Instant::now() + JIGGLE_EVERY,
+                next_jiggle: Instant::now() + self.jiggle_every,
                 nudged: false,
             }),
+            ..ride
         });
     }
 
@@ -563,40 +627,41 @@ impl<I: Inject, D: DragPort> Router<I, D> {
         self.inj.button(MouseButton::Left, false);
     }
 
-    /// Cancels `drag` from this side: Esc ends its session undropped. A
-    /// held up goes out too; while the drag still rides, the PC holds the
-    /// button and sends the up itself.
+    /// Cancels `drag` from this side. The source first, so no session can
+    /// start after it; then Esc, only if a session is live (a stray Esc
+    /// would reach the user's front-most app). A held up goes out too;
+    /// while the drag still rides, the PC holds the button and sends the
+    /// up itself (or `carry_out` lets go when the PC moved on).
     fn abort_drag(&mut self, drag: DragId) {
-        match self.ride {
-            Some(r) if r.drag == drag => {
-                info!(drag, "cancelling the drag from the PC");
-                self.escape();
-                self.drags.cancel(drag);
-                if r.hold.is_some() {
-                    self.let_go_of_left();
-                } else {
-                    self.ride = None;
-                }
-                self.machine.on(MacEvent::DragEnded { drag });
-            }
-            // Dropped already, or never here: stop its fetches.
-            _ => self.drags.cancel(drag),
+        let live = self.drags.cancel(drag);
+        let Some(r) = self.ride.filter(|r| r.drag == drag) else {
+            return; // Dropped already, or never here: its fetches stop.
+        };
+        info!(drag, live, "cancelling the drag from the PC");
+        if live {
+            self.escape();
         }
+        if r.hold.is_some() {
+            self.let_go_of_left();
+        } else {
+            self.ride = None;
+        }
+        self.machine.on(MacEvent::DragEnded { drag });
     }
 
-    /// `drag`'s session ended (dropped, or Esc from the PC's keyboard).
-    fn session_ended(&mut self, drag: DragId) {
-        if let Some(r) = self.ride
-            && r.drag == drag
-        {
-            if r.hold.is_some() {
-                // Never leave a hold with the button still down.
-                self.let_go_of_left();
-            } else {
-                // The PC still holds the button: it counts as held until
-                // the PC's up (Task 17 note b), so pushing out is a wall.
-                self.ride = None;
-            }
+    /// The session of `drag`'s `crossing` ended (dropped, or Esc from the
+    /// PC's keyboard). An earlier crossing's end leaves a later ride be.
+    fn session_ended(&mut self, drag: DragId, crossing: Crossing) {
+        let Some(r) = self.ride.filter(|r| r.is(drag, crossing)) else {
+            return;
+        };
+        if r.hold.is_some() {
+            // Never leave a hold with the button still down.
+            self.let_go_of_left();
+        } else {
+            // The PC still holds the button: it counts as held until the
+            // PC's up (Task 17 note b), so pushing out is a wall.
+            self.ride = None;
         }
         self.machine.on(MacEvent::DragEnded { drag });
     }
@@ -631,7 +696,19 @@ impl<I: Inject, D: DragPort> Router<I, D> {
 
     fn carry_out(&mut self, sid: u64, ev: MacEvent, move_cursor: bool) -> Vec<InjectEv> {
         let mut out = Vec::new();
-        for action in self.machine.on(ev) {
+        let actions = self.machine.on(ev);
+        // A cancelled ride must not leave the left button posted down:
+        // ReleaseAllInjected, or BeginDrag (which lets go before pressing),
+        // takes care of it when one follows; otherwise (an Enter without a
+        // drag) it is done after the actions.
+        let lets_go = actions.iter().any(|a| {
+            matches!(
+                a,
+                MacAction::ReleaseAllInjected | MacAction::BeginDrag { .. }
+            )
+        });
+        let mut cancelled = false;
+        for action in actions {
             match action {
                 MacAction::WakeDisplay | MacAction::WarpTo { .. } if !move_cursor => {}
                 MacAction::WakeDisplay => self.inj.wake_display(),
@@ -641,12 +718,15 @@ impl<I: Inject, D: DragPort> Router<I, D> {
                 MacAction::StartControl => out.push(InjectEv::Controlled { sid, on: true }),
                 MacAction::StopControl => out.push(InjectEv::Controlled { sid, on: false }),
                 MacAction::BeginDrag { drag } => self.begin_drag(drag),
-                // Always before ReleaseAllInjected, which posts the up.
-                // Esc, and a held up goes out; the rest of the buttons go
-                // with ReleaseAllInjected, which follows unless this is an
-                // Enter (then BeginDrag lets go of a left still down).
-                MacAction::CancelDrag { drag } => self.abort_drag(drag),
+                // Before any ReleaseAllInjected or BeginDrag of the list.
+                MacAction::CancelDrag { drag } => {
+                    self.abort_drag(drag);
+                    cancelled = true;
+                }
             }
+        }
+        if cancelled && !lets_go && self.ride.is_none() && self.inj.button_held(MouseButton::Left) {
+            self.inj.button(MouseButton::Left, false);
         }
         out
     }
@@ -661,12 +741,18 @@ pub fn spawn_inject_thread<I: Inject + Send + 'static, D: DragPort + Send + 'sta
     access: Arc<AtomicBool>,
     report: impl Fn(InjectEv) + Send + 'static,
 ) -> Result<crossbeam_channel::Sender<InjectMsg>> {
+    spawn_router(Router::new(inj, drags, access), report)
+}
+
+fn spawn_router<I: Inject + Send + 'static, D: DragPort + Send + 'static>(
+    mut router: Router<I, D>,
+    report: impl Fn(InjectEv) + Send + 'static,
+) -> Result<crossbeam_channel::Sender<InjectMsg>> {
     let (tx, rx) = crossbeam_channel::unbounded::<InjectMsg>();
     std::thread::Builder::new()
         .name("cj-inject".into())
         .spawn(move || {
             set_user_interactive_qos();
-            let mut router = Router::new(inj, drags, access);
             let run = catch_unwind(AssertUnwindSafe(|| {
                 loop {
                     let msg = match router.next_tick() {
@@ -838,6 +924,10 @@ pub(super) mod tests {
         calls: Arc<Mutex<Vec<Call>>>,
         prepare_ok: bool,
         may_release: bool,
+        /// What `cancel` says: whether a session is live.
+        session: bool,
+        /// The last crossing token handed out.
+        crossings: Crossing,
     }
 
     impl FakeDrags {
@@ -846,6 +936,8 @@ pub(super) mod tests {
                 calls: calls.clone(),
                 prepare_ok: true,
                 may_release: false,
+                session: true,
+                crossings: 0,
             }
         }
 
@@ -855,10 +947,16 @@ pub(super) mod tests {
     }
 
     impl DragPort for FakeDrags {
-        fn prepare(&mut self, drag: DragId, items: Vec<DragItem>, at: (f64, f64)) -> bool {
+        fn prepare(
+            &mut self,
+            drag: DragId,
+            items: Vec<DragItem>,
+            at: (f64, f64),
+        ) -> Option<Crossing> {
             assert_eq!(at, (300.0, 200.0), "under the cursor");
             self.log(Call::Prepare(drag, items.len()));
-            self.prepare_ok
+            self.crossings += 1;
+            self.prepare_ok.then_some(self.crossings)
         }
         fn released(&mut self, drag: DragId, at: (f64, f64)) {
             assert_eq!(at, (300.0, 200.0));
@@ -868,8 +966,9 @@ pub(super) mod tests {
             self.log(Call::MayRelease(drag));
             self.may_release
         }
-        fn cancel(&mut self, drag: DragId) {
+        fn cancel(&mut self, drag: DragId) -> bool {
             self.log(Call::CancelSource(drag));
+            self.session
         }
     }
 
@@ -1430,7 +1529,7 @@ pub(super) mod tests {
         );
         assert_eq!(
             take(&calls),
-            vec![ESC_DOWN, ESC_UP, Call::CancelSource(7), Call::ReleaseAll]
+            vec![Call::CancelSource(7), ESC_DOWN, ESC_UP, Call::ReleaseAll]
         );
     }
 
@@ -1494,15 +1593,30 @@ pub(super) mod tests {
         let (mut r, calls) = holding();
         let due = r.next_tick().unwrap();
         r.tick(due);
-        assert_eq!(r.handle(InjectMsg::DragReady { drag: 8 }), vec![]);
+        assert_eq!(
+            r.handle(InjectMsg::DragReady {
+                drag: 8,
+                crossing: 1
+            }),
+            vec![]
+        );
         assert_eq!(take(&calls), vec![Call::Jiggle(true)], "another drag");
-        assert_eq!(r.handle(InjectMsg::DragReady { drag: 7 }), vec![]);
+        assert_eq!(
+            r.handle(InjectMsg::DragReady {
+                drag: 7,
+                crossing: 1
+            }),
+            vec![]
+        );
         // Back on the drop spot, then the up.
         assert_eq!(take(&calls), vec![Call::Jiggle(false), LEFT_UP]);
         assert_eq!(r.next_tick(), None);
         // Motion flows again, and the session's end changes nothing: the
         // next push out is a plain leave, with no Esc.
-        r.handle(InjectMsg::DragEnded { drag: 7 });
+        r.handle(InjectMsg::DragEnded {
+            drag: 7,
+            crossing: 1,
+        });
         r.handle(input(1, Input::Motion { dx: 2, dy: 2 }));
         assert_eq!(take(&calls), vec![Call::Motion(2, 2), Call::ReleaseAll]);
     }
@@ -1511,13 +1625,16 @@ pub(super) mod tests {
     fn cancel_during_hold_posts_escape_then_up() {
         for msg in [
             InjectMsg::CancelDrag { drag: 7 },
-            InjectMsg::DragFailed { drag: 7 },
+            InjectMsg::DragFailed {
+                drag: 7,
+                crossing: 1,
+            },
         ] {
             let (mut r, calls) = holding();
             assert_eq!(r.handle(msg.clone()), vec![]);
             assert_eq!(
                 take(&calls),
-                vec![ESC_DOWN, ESC_UP, Call::CancelSource(7), LEFT_UP],
+                vec![Call::CancelSource(7), ESC_DOWN, ESC_UP, LEFT_UP],
                 "{msg:?}"
             );
             assert_eq!(r.next_tick(), None);
@@ -1528,7 +1645,10 @@ pub(super) mod tests {
         // A session that ends by itself during a hold (Esc typed on the PC)
         // lets go too.
         let (mut r, calls) = holding();
-        r.handle(InjectMsg::DragEnded { drag: 7 });
+        r.handle(InjectMsg::DragEnded {
+            drag: 7,
+            crossing: 1,
+        });
         assert_eq!(take(&calls), vec![LEFT_UP]);
         assert_eq!(r.next_tick(), None);
     }
@@ -1536,8 +1656,11 @@ pub(super) mod tests {
     #[test]
     fn cancel_while_riding_leaves_the_button_to_the_pc() {
         let (mut r, calls) = riding(false);
-        r.handle(InjectMsg::DragFailed { drag: 7 });
-        assert_eq!(take(&calls), vec![ESC_DOWN, ESC_UP, Call::CancelSource(7)]);
+        r.handle(InjectMsg::DragFailed {
+            drag: 7,
+            crossing: 1,
+        });
+        assert_eq!(take(&calls), vec![Call::CancelSource(7), ESC_DOWN, ESC_UP]);
         // The PC's up is its own.
         r.handle(input(1, button(false)));
         assert_eq!(take(&calls), vec![LEFT_UP]);
@@ -1556,9 +1679,9 @@ pub(super) mod tests {
         assert_eq!(
             take(&calls),
             vec![
+                Call::CancelSource(7),
                 ESC_DOWN,
                 ESC_UP,
-                Call::CancelSource(7),
                 LEFT_UP,
                 Call::ReleaseAll
             ]
@@ -1577,9 +1700,9 @@ pub(super) mod tests {
         assert_eq!(
             take(&calls),
             vec![
+                Call::CancelSource(7),
                 ESC_DOWN,
                 ESC_UP,
-                Call::CancelSource(7),
                 LEFT_UP,
                 Call::ReleaseAll
             ]
@@ -1595,7 +1718,7 @@ pub(super) mod tests {
         );
         assert_eq!(
             take(&calls),
-            vec![ESC_DOWN, ESC_UP, Call::CancelSource(7), Call::ReleaseAll]
+            vec![Call::CancelSource(7), ESC_DOWN, ESC_UP, Call::ReleaseAll]
         );
         assert_eq!(r.next_tick(), None);
     }
@@ -1605,7 +1728,10 @@ pub(super) mod tests {
         let (mut r, calls) = riding(false);
         // Esc on the Mac's side ended the session; the PC still holds the
         // button, so pushing out is a wall.
-        r.handle(InjectMsg::DragEnded { drag: 7 });
+        r.handle(InjectMsg::DragEnded {
+            drag: 7,
+            crossing: 1,
+        });
         assert_eq!(r.handle(input(1, Input::Motion { dx: -9, dy: 0 })), vec![]);
         assert_eq!(take(&calls), vec![Call::Motion(-9, 0)]);
         // Once the PC lets go, the cursor may leave.
@@ -1637,9 +1763,9 @@ pub(super) mod tests {
             take(&calls),
             vec![
                 Call::Motion(-9, 0),
+                Call::CancelSource(7),
                 ESC_DOWN,
                 ESC_UP,
-                Call::CancelSource(7),
                 Call::ReleaseAll
             ]
         );
@@ -1676,9 +1802,9 @@ pub(super) mod tests {
         assert_eq!(
             got,
             vec![
+                Call::CancelSource(7),
                 ESC_DOWN,
                 ESC_UP,
-                Call::CancelSource(7),
                 Call::Wake,
                 Call::Warp(Side::Left, 0.5),
                 LEFT_UP,
@@ -1707,9 +1833,9 @@ pub(super) mod tests {
             got,
             vec![
                 Call::Jiggle(true),
+                Call::CancelSource(7),
                 ESC_DOWN,
                 ESC_UP,
-                Call::CancelSource(7),
                 Call::Jiggle(false),
                 LEFT_UP,
                 Call::Wake,
@@ -1751,7 +1877,7 @@ pub(super) mod tests {
         let calls = take(&calls);
         assert_eq!(
             calls[calls.len() - 4..],
-            [ESC_DOWN, ESC_UP, Call::CancelSource(7), Call::ReleaseAll],
+            [Call::CancelSource(7), ESC_DOWN, ESC_UP, Call::ReleaseAll],
             "{calls:?}"
         );
     }
@@ -1762,7 +1888,9 @@ pub(super) mod tests {
         fake.push_out = None;
         let drags = FakeDrags::new(&calls);
         let (ev_tx, ev_rx) = crossbeam_channel::unbounded();
-        let tx = spawn_inject_thread(fake, drags, granted(), move |ev| {
+        let every = Duration::from_millis(5);
+        let router = Router::new(fake, drags, granted()).with_jiggle_every(every);
+        let tx = spawn_router(router, move |ev| {
             let _ = ev_tx.send(ev);
         })
         .unwrap();
@@ -1780,8 +1908,12 @@ pub(super) mod tests {
         ] {
             tx.send(msg).unwrap();
         }
-        std::thread::sleep(JIGGLE_EVERY * 2 + Duration::from_millis(200));
-        tx.send(InjectMsg::DragReady { drag: 7 }).unwrap();
+        std::thread::sleep(every * 2 + Duration::from_millis(40));
+        tx.send(InjectMsg::DragReady {
+            drag: 7,
+            crossing: 1,
+        })
+        .unwrap();
         tx.send(InjectMsg::Quit).unwrap();
         let t = Duration::from_secs(2);
         while ev_rx.recv_timeout(t).unwrap() != InjectEv::Stopped {}
@@ -1794,5 +1926,116 @@ pub(super) mod tests {
         let up = calls.iter().position(|c| *c == LEFT_UP).unwrap();
         assert!(calls[..up].contains(&Call::Jiggle(true)));
         assert_eq!(calls[up - 1], Call::Jiggle(false), "{calls:?}");
+    }
+
+    #[test]
+    fn a_cancel_posts_no_escape_without_a_live_session() {
+        let (mut r, calls) = riding(false);
+        r.drags.session = false;
+        r.handle(InjectMsg::CancelDrag { drag: 7 });
+        assert_eq!(take(&calls), vec![Call::CancelSource(7)], "no stray Esc");
+        let (mut r, calls) = holding();
+        r.drags.session = false;
+        r.handle(InjectMsg::CancelDrag { drag: 7 });
+        assert_eq!(take(&calls), vec![Call::CancelSource(7), LEFT_UP]);
+        // A session that started late asks for its Esc.
+        r.handle(InjectMsg::EscapeSession { drag: 7 });
+        assert_eq!(take(&calls), vec![ESC_DOWN, ESC_UP]);
+    }
+
+    #[test]
+    fn an_earlier_crossing_never_touches_a_later_ride() {
+        let (mut r, calls) = riding(false);
+        // Home (crossing 1 cancelled), then back: crossing 2.
+        r.handle(input(1, Input::Motion { dx: -9, dy: 0 }));
+        r.handle(input(
+            1,
+            Input::DragOffer {
+                drag: 7,
+                items: items(2),
+            },
+        ));
+        r.handle(input(1, enter_with(7)));
+        take(&calls);
+        // Crossing 1's late news.
+        r.handle(InjectMsg::DragEnded {
+            drag: 7,
+            crossing: 1,
+        });
+        r.handle(InjectMsg::DragFailed {
+            drag: 7,
+            crossing: 1,
+        });
+        assert_eq!(take(&calls), vec![], "ignored");
+        // Crossing 2 still rides: the PC's up is its release.
+        r.handle(input(1, button(false)));
+        assert_eq!(take(&calls), vec![Call::Released(7), Call::MayRelease(7)]);
+        r.handle(InjectMsg::DragReady {
+            drag: 7,
+            crossing: 1,
+        });
+        assert_eq!(take(&calls), vec![], "an earlier crossing's Ready");
+        r.handle(InjectMsg::DragReady {
+            drag: 7,
+            crossing: 2,
+        });
+        assert_eq!(take(&calls), vec![LEFT_UP]);
+    }
+
+    #[test]
+    fn enter_without_a_drag_over_a_ride_lets_go() {
+        let (mut r, calls) = riding(false);
+        r.handle(input(1, enter(0.5)));
+        let got = take(&calls);
+        assert_eq!(
+            got,
+            vec![
+                Call::CancelSource(7),
+                ESC_DOWN,
+                ESC_UP,
+                Call::Wake,
+                Call::Warp(Side::Left, 0.5),
+                LEFT_UP
+            ]
+        );
+        assert_downs_and_ups_alternate(&got);
+        // Nothing stays held: pushing out is a plain leave.
+        r.handle(input(1, Input::Motion { dx: -9, dy: 0 }));
+        assert_eq!(take(&calls), vec![Call::Motion(-9, 0), Call::ReleaseAll]);
+    }
+
+    #[test]
+    fn a_panic_while_cancelling_still_releases_everything() {
+        let (mut fake, calls) = Fake::new();
+        fake.key_panics = true;
+        let drags = FakeDrags::new(&calls);
+        let (ev_tx, ev_rx) = crossbeam_channel::unbounded();
+        let tx = spawn_inject_thread(fake, drags, granted(), move |ev| {
+            let _ = ev_tx.send(ev);
+        })
+        .unwrap();
+        for msg in [
+            InjectMsg::Begin { sid: 4 },
+            input(
+                4,
+                Input::DragOffer {
+                    drag: 7,
+                    items: items(1),
+                },
+            ),
+            input(4, enter_with(7)),
+            // Panics; so does the Esc of the cancel after it.
+            input(4, key(0x00, true)),
+        ] {
+            tx.send(msg).unwrap();
+        }
+        let t = Duration::from_secs(2);
+        while ev_rx.recv_timeout(t).unwrap() != InjectEv::Stopped {}
+        let calls = take(&calls);
+        assert_eq!(
+            calls[calls.len() - 2..],
+            [Call::CancelSource(7), Call::ReleaseAll],
+            "{calls:?}"
+        );
     }
 }
