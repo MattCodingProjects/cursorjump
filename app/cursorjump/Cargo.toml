@@ -33,13 +33,15 @@ windows-core = "0.62.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 image = { version = "0.25", default-features = false, features = ["png", "tiff"] }
+block2 = "0.6.2"
 libc = "0.2.191"
 objc2 = "0.6.5"
-objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSEvent", "NSPasteboard"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "block2", "objc2-uniform-type-identifiers", "NSApplication", "NSColor", "NSDragging", "NSDraggingItem", "NSDraggingSession", "NSEvent", "NSFilePromiseProvider", "NSFilePromiseReceiver", "NSGraphics", "NSImage", "NSPanel", "NSPasteboard", "NSPasteboardItem", "NSResponder", "NSRunningApplication", "NSScreen", "NSView", "NSWindow", "NSWorkspace"] }
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFCGTypes", "CFString"] }
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "CGDirectDisplay", "CGDisplayConfiguration", "CGEvent", "CGEventSource", "CGEventTypes", "CGRemoteOperation", "CGError", "libc"] }
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSData", "NSProcessInfo", "NSString"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "block2", "NSArray", "NSData", "NSDictionary", "NSError", "NSGeometry", "NSObjCRuntime", "NSOperation", "NSProcessInfo", "NSString", "NSThread", "NSURL", "NSValue"] }
 objc2-io-kit = { version = "0.3.2", default-features = false, features = ["std", "pwr_mgt"] }
+objc2-uniform-type-identifiers = { version = "0.3.2", default-features = false, features = ["std", "UTType"] }
 # SIGTERM (launchctl bootout, logout) runs the normal quit.
 tokio = { version = "1.53.3", features = ["signal"] }
 
