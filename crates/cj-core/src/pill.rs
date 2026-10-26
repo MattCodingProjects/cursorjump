@@ -4,14 +4,15 @@
 //! Readings of the rules:
 //! - Only a drag that finishes or is cancelled within `SHOW_AFTER` is never
 //!   shown. A failure is shown at once, however soon it comes.
-//! - While held, nothing expires. On release, every finished pill replays its
-//!   ✓, hold and fade from the first `views` or `next_frame` call, since the
-//!   user never saw them; a running pill just carries on.
+//! - While held, nothing expires. On release, every finished pill still on
+//!   the board replays its ✓, hold and fade from the release, since the user
+//!   never saw them; a running pill just carries on.
 //! - The rate behind the ETA is the change between the oldest and newest
 //!   progress samples of the last 5 s, so there is no ETA once nothing has been
 //!   heard for 5 s or nothing moved. ETAs round up, so they err long.
+//! - A `done` past the total raises the total, so the text never reads
+//!   "12 of 10 MB". A total of 0 has no bar or percentage.
 use crate::dnd::{DragId, DragItem, FailReason, ItemKind};
-use std::cell::Cell;
 use std::collections::VecDeque;
 use std::fmt;
 use std::time::{Duration, Instant};
@@ -33,6 +34,9 @@ pub const ETA_AFTER: Duration = Duration::from_secs(2);
 const FRAME: Duration = Duration::from_millis(16);
 /// Progress samples older than this don't count toward the rate.
 const RATE_WINDOW: Duration = Duration::from_secs(5);
+/// Closest two kept progress samples may be, but for the newest one, which
+/// is replaced until it is this far past the one before it.
+const SAMPLE_GAP: Duration = Duration::from_millis(100);
 /// The ✓'s scale when it first appears.
 const CHECK_FROM: f32 = 0.6;
 
@@ -85,10 +89,11 @@ pub fn icon_for(items: &[DragItem]) -> PillIcon {
     }
 }
 
-/// The pill's name line: the item's name ("file" if not known yet), or
-/// "n files", or "n items" if any of them is a folder.
+/// The pill's name line: the item's name ("file" if not known yet, or for no
+/// items), or "n files", or "n items" if any of them is a folder.
 pub fn title_for(items: &[DragItem]) -> String {
     match items {
+        [] => "file".to_string(),
         [item] if item.name.is_empty() => "file".to_string(),
         [item] => item.name.clone(),
         _ if items.iter().any(|i| i.kind == ItemKind::Dir) => format!("{} items", items.len()),
@@ -106,8 +111,8 @@ pub struct PillView {
     /// from `check_scale`.
     pub right: String,
     pub sub: String,
-    /// How full the bar is. `None` hides the bar: an unknown total, a
-    /// cancel or a failure.
+    /// How full the bar is. `None` hides the bar: an unknown or zero total,
+    /// a cancel or a failure.
     pub fraction: Option<f32>,
     /// Where the sheen is along the bar, in [0, 1). Only meaningful while
     /// running (a bar is shown and `check_scale` is 0); 0 otherwise.
@@ -122,12 +127,11 @@ pub struct PillView {
 #[derive(Debug, Clone)]
 enum Stage {
     Running,
-    /// Done, or cancelled. Hold and fade are timed from `at`, which is `None`
-    /// until the first look after a hold (see the module docs). It is a `Cell`
-    /// so `views` and `next_frame` can set it from `&self`.
+    /// Done, or cancelled. Hold and fade are timed from `at`: the finish, or
+    /// the release if it finished or was still showing while held.
     Finished {
         cancelled: bool,
-        at: Cell<Option<Instant>>,
+        at: Instant,
     },
     Failed(FailReason),
 }
@@ -140,24 +144,27 @@ struct Pill {
     started: Instant,
     done: u64,
     total: Option<u64>,
-    /// `(when, done)` from `progress`, from the last 5 s.
+    /// `(when, done)` from `progress`, from the last 5 s, at least
+    /// `SAMPLE_GAP` apart but for the newest.
     samples: VecDeque<(Instant, u64)>,
     stage: Stage,
 }
 
 impl Pill {
+    /// The total the bar and percentage are drawn against: a known one above 0.
+    fn bar_total(&self) -> Option<u64> {
+        self.total.filter(|&t| t > 0)
+    }
+
     /// Time left at the rate of the last 5 s, once `ETA_AFTER` has passed.
     fn eta(&self, now: Instant) -> Option<Duration> {
         let total = self.total?;
         if now.saturating_duration_since(self.started) < ETA_AFTER {
             return None;
         }
-        let mut recent = self
-            .samples
-            .iter()
-            .skip_while(|&&(t, _)| now.saturating_duration_since(t) > RATE_WINDOW);
-        let &(t0, d0) = recent.next()?;
-        let &(t1, d1) = recent.last()?;
+        let recent = |&&(t, _): &&(Instant, u64)| now.saturating_duration_since(t) <= RATE_WINDOW;
+        let &(t1, d1) = self.samples.back().filter(recent)?;
+        let &(t0, d0) = self.samples.iter().find(recent)?;
         let moved = d1.checked_sub(d0).filter(|&m| m > 0)?;
         let span = t1.saturating_duration_since(t0);
         if span.is_zero() {
@@ -173,20 +180,10 @@ impl Pill {
     /// Whether a finished pill has faded out completely.
     fn expired(&self, now: Instant) -> bool {
         match &self.stage {
-            Stage::Finished { at, .. } => at
-                .get()
-                .is_some_and(|at| now.saturating_duration_since(at) >= DONE_HOLD + FADE),
+            Stage::Finished { at, .. } => now.saturating_duration_since(*at) >= DONE_HOLD + FADE,
             _ => false,
         }
     }
-}
-
-/// When a finished pill's timeline starts, fixing it at `now` if not set yet.
-fn anchor(at: &Cell<Option<Instant>>, now: Instant) -> Instant {
-    at.get().unwrap_or_else(|| {
-        at.set(Some(now));
-        now
-    })
 }
 
 /// `part` of `whole`, clamped to [0, 1].
@@ -238,15 +235,26 @@ impl PillBoard {
         });
     }
 
-    /// Bytes received so far. A `None` total keeps the one already known.
-    /// Ignored unless the drag is running.
+    /// Bytes received so far. A `None` total keeps the one already known,
+    /// and a total below `done` is raised to it. Ignored unless the drag is
+    /// running.
     pub fn progress(&mut self, drag: DragId, done: u64, total: Option<u64>, now: Instant) {
         self.prune(now);
         let Some(p) = self.running(drag) else {
             return;
         };
         p.done = done;
-        p.total = total.or(p.total);
+        p.total = total.or(p.total).map(|t| t.max(done));
+        // The newest sample slides until it is SAMPLE_GAP past the one before.
+        let n = p.samples.len();
+        let young = n >= 2
+            && p.samples[n - 1]
+                .0
+                .saturating_duration_since(p.samples[n - 2].0)
+                < SAMPLE_GAP;
+        if young {
+            p.samples.pop_back();
+        }
         p.samples.push_back((now, done));
         while let Some(&(t, _)) = p.samples.front() {
             if now.saturating_duration_since(t) > RATE_WINDOW {
@@ -263,7 +271,6 @@ impl PillBoard {
     /// Ignored unless the drag is running.
     pub fn finish(&mut self, drag: DragId, result: Result<(), FailReason>, now: Instant) {
         self.prune(now);
-        let held = self.held;
         let Some(p) = self.running(drag) else {
             return;
         };
@@ -279,10 +286,8 @@ impl PillBoard {
             self.pills.retain(|p| p.drag != drag);
             return;
         }
-        p.stage = Stage::Finished {
-            cancelled,
-            at: Cell::new((!held).then_some(now)),
-        };
+        // While held, `set_held(false, ..)` moves `at` to the release.
+        p.stage = Stage::Finished { cancelled, at: now };
     }
 
     /// Remove a failed pill (its ✕). Other pills are left alone; to stop a
@@ -293,13 +298,17 @@ impl PillBoard {
     }
 
     /// The PC game lock: while held, `views` is empty, `next_frame` is `None`
-    /// and nothing expires. On release, finished pills replay from the start
-    /// of their ✓; the host should call `views` and `next_frame` again then.
-    pub fn set_held(&mut self, held: bool) {
-        if self.held && !held {
-            for p in &self.pills {
-                if let Stage::Finished { at, .. } = &p.stage {
-                    at.set(None);
+    /// and nothing expires. Holding first drops the pills already faded out.
+    /// On release, the finished pills left replay their ✓, hold and fade from
+    /// `now`; the host should call `views` and `next_frame` again then.
+    pub fn set_held(&mut self, held: bool, now: Instant) {
+        if held && !self.held {
+            self.prune(now);
+        }
+        if !held && self.held {
+            for p in &mut self.pills {
+                if let Stage::Finished { at, .. } = &mut p.stage {
+                    *at = now;
                 }
             }
         }
@@ -333,11 +342,10 @@ impl PillBoard {
                     if now < shown {
                         Some(shown)
                     } else {
-                        p.total.map(|_| now + FRAME)
+                        p.bar_total().map(|_| now + FRAME)
                     }
                 }
-                Stage::Finished { cancelled, at } => {
-                    let at = anchor(at, now);
+                &Stage::Finished { cancelled, at } => {
                     let (popped, faded) = (at + CHECK_POP, at + DONE_HOLD + FADE);
                     if !cancelled && now < popped {
                         Some((now + FRAME).min(popped))
@@ -374,27 +382,23 @@ impl PillBoard {
                     return None;
                 }
                 v.sub = format_sub(self.from, p.done, p.total, p.eta(now));
-                if let Some(total) = p.total {
+                if let Some(total) = p.bar_total() {
                     let done = p.done.min(total);
                     // Floored, and never 100 % until done.
-                    let percent = (u128::from(done) * 100 / u128::from(total.max(1))).min(99);
+                    let percent = (u128::from(done) * 100 / u128::from(total)).min(99);
                     v.right = format!("{percent}%");
-                    v.fraction = Some(if total == 0 {
-                        0.0
-                    } else {
-                        (done as f64 / total as f64) as f32
-                    });
+                    v.fraction = Some((done as f64 / total as f64) as f32);
                     let period = SHEEN_PERIOD.as_nanos();
                     v.sheen_phase = ((since.as_nanos() % period) as f64 / period as f64) as f32;
                 }
             }
-            Stage::Finished { cancelled, at } => {
-                let since = now.saturating_duration_since(anchor(at, now));
+            &Stage::Finished { cancelled, at } => {
+                let since = now.saturating_duration_since(at);
                 if since >= DONE_HOLD + FADE {
                     return None;
                 }
                 v.opacity = 1.0 - ratio(since.saturating_sub(DONE_HOLD), FADE);
-                if *cancelled {
+                if cancelled {
                     v.sub = "Cancelled".to_string();
                 } else {
                     v.sub = format_sub(self.from, p.total.unwrap_or(p.done), None, None);
@@ -833,7 +837,7 @@ mod tests {
         board.finish(3, Ok(()), t0 + ms(1_000));
         assert_eq!(board.views(t0 + ms(1_500)).len(), 3);
 
-        board.set_held(true);
+        board.set_held(true, t0 + ms(1_500));
         assert!(board.views(t0 + ms(1_500)).is_empty());
         assert_eq!(board.next_frame(t0 + ms(1_500)), None);
         board.progress(1, 5_000_000, Some(10_000_000), t0 + ms(2_000));
@@ -847,9 +851,9 @@ mod tests {
         assert_eq!(board.next_frame(long), None);
 
         // On release, every finished pill replays its ✓, hold and fade from
-        // the first moment it is looked at; the failure is still there.
-        board.set_held(false);
+        // the release; the failure is still there.
         let back = long + ms(20);
+        board.set_held(false, back);
         let views = board.views(back);
         assert_eq!(names(&views), ["a.mov", "b.mov", "c.mov"]);
         assert_eq!(views[0].check_scale, 0.6);
@@ -862,17 +866,40 @@ mod tests {
     }
 
     #[test]
-    fn next_frame_anchors_a_released_pill_too() {
+    fn a_cancel_while_held_replays_from_the_release() {
         let t0 = Instant::now();
         let mut board = PillBoard::new(Peer::Pc, Peer::Mac);
         board.start(1, &[file("a.mov", 10_000_000)], t0);
-        board.set_held(true);
+        board.set_held(true, t0 + ms(600));
         board.finish(1, Err(FailReason::Cancelled), t0 + ms(1_000));
-        board.set_held(false);
         let back = t0 + ms(5_000);
-        assert_eq!(board.next_frame(back), Some(back + DONE_HOLD));
+        board.set_held(false, back);
+        // Looking later doesn't move the timeline: it runs from the release.
+        assert_eq!(board.next_frame(back + ms(500)), Some(back + DONE_HOLD));
         assert_eq!(board.views(back + ms(1_000))[0].sub, "Cancelled");
         assert!(board.views(back + ms(1_300)).is_empty());
+    }
+
+    #[test]
+    fn board_is_send_and_sync() {
+        fn check<T: Send + Sync>() {}
+        check::<PillBoard>();
+    }
+
+    #[test]
+    fn a_faded_pill_never_replays_after_a_hold() {
+        let t0 = Instant::now();
+        let mut board = PillBoard::new(Peer::Pc, Peer::Mac);
+        board.start(1, &[file("a.mov", 10_000_000)], t0);
+        let at = t0 + ms(1_000);
+        board.finish(1, Ok(()), at);
+        // Faded out, with no mutating call since to prune it.
+        assert!(board.views(at + ms(1_300)).is_empty());
+        board.set_held(true, at + ms(2_000));
+        board.set_held(false, at + ms(3_000));
+        assert!(board.views(at + ms(3_000)).is_empty());
+        assert_eq!(board.next_frame(at + ms(3_000)), None);
+        assert!(board.views(at + ms(3_500)).is_empty());
     }
 
     #[test]
@@ -929,9 +956,58 @@ mod tests {
     }
 
     #[test]
+    fn done_past_the_total_raises_it() {
+        let t0 = Instant::now();
+        let mut board = PillBoard::new(Peer::Pc, Peer::Mac);
+        board.start(1, &[file("grew.log", 10_000_000)], t0);
+        board.progress(1, 12_000_000, Some(10_000_000), t0 + ms(600));
+        let v = &board.views(t0 + ms(600))[0];
+        assert_eq!(v.sub, "From PC · 12 of 12 MB");
+        assert_eq!((v.right.as_str(), v.fraction), ("99%", Some(1.0)));
+        board.progress(1, 13_000_000, None, t0 + ms(700));
+        assert_eq!(board.views(t0 + ms(700))[0].sub, "From PC · 13 of 13 MB");
+        board.finish(1, Ok(()), t0 + ms(800));
+        assert_eq!(board.views(t0 + ms(800))[0].sub, "From PC · 13 MB");
+    }
+
+    #[test]
+    fn zero_total_has_no_bar_or_percent() {
+        let t0 = Instant::now();
+        let mut board = PillBoard::new(Peer::Pc, Peer::Mac);
+        board.start(1, &[file("empty.txt", 0)], t0);
+        let v = &board.views(t0 + ms(600))[0];
+        assert_eq!(v.sub, "From PC · 0 of 0 KB");
+        assert_eq!((v.right.as_str(), v.fraction), ("", None));
+        assert_eq!(board.next_frame(t0 + ms(600)), None);
+    }
+
+    #[test]
+    fn progress_samples_coalesce() {
+        let t0 = Instant::now();
+        let mut board = PillBoard::new(Peer::Pc, Peer::Mac);
+        board.start(1, &[file("disk.img", 5_000_000_000)], t0);
+        // Every 10 ms for 6 s at 100 MB/s.
+        for i in 1..=600u64 {
+            board.progress(1, i * 1_000_000, None, t0 + ms(i * 10));
+        }
+        let n = board.pills[0].samples.len();
+        assert!((50..=52).contains(&n), "{n} samples");
+        assert_eq!(
+            board.pills[0].samples.back(),
+            Some(&(t0 + ms(6_000), 600_000_000))
+        );
+        // 4.4 GB at 100 MB/s: 44 s.
+        assert_eq!(
+            board.views(t0 + ms(6_000))[0].sub,
+            "From PC · 0.6 of 5.0 GB · 45 s left"
+        );
+    }
+
+    #[test]
     fn title_and_icon_rules() {
         assert_eq!(title_for(&[file("Report.pdf", 1)]), "Report.pdf");
         assert_eq!(title_for(&[file("", 1)]), "file");
+        assert_eq!(title_for(&[]), "file");
         assert_eq!(title_for(&[dir("Photos")]), "Photos");
         assert_eq!(title_for(&[file("a", 1), file("b", 1)]), "2 files");
         assert_eq!(
