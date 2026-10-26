@@ -189,13 +189,45 @@ pub(super) fn on_command(cmd: DndCmd) {
         return;
     };
     let drag = run.drag;
-    let shared = run.shared.clone();
     // The relay refuses another StartIncoming while this one runs: this
     // thread may be held in a target's `Drop` for the whole fetch.
-    shared.incoming.store(drag, Ordering::Release);
+    let running = Running::new(drag, run.shared.clone(), run.events.clone());
     source::run_incoming(run);
-    shared.incoming.store(0, Ordering::Release);
+    drop(running);
     with_in(|s| s.incoming_ended(drag));
+}
+
+/// `DndShared::incoming` while a drag from the Mac runs on this thread.
+/// Cleared when it ends, unwind included. If this thread unwinds out of
+/// the drag (and so out of its loop: it dies), the drag's `IncomingEnded`
+/// is sent here, as `run_incoming` never got to.
+pub(super) struct Running {
+    drag: DragId,
+    shared: Arc<DndShared>,
+    events: Emit,
+}
+
+impl Running {
+    pub(super) fn new(drag: DragId, shared: Arc<DndShared>, events: Emit) -> Running {
+        shared.incoming.store(drag, Ordering::Release);
+        Running {
+            drag,
+            shared,
+            events,
+        }
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        self.shared.incoming.store(0, Ordering::Release);
+        if std::thread::panicking() {
+            let drag = self.drag;
+            warn!(drag, "cj-dnd-in: unwinding out of a drag from the Mac");
+            let dropped = false;
+            self.events.send(WinDndEv::IncomingEnded { drag, dropped });
+        }
+    }
 }
 
 /// The drop source of `drag` said its first `QueryContinueDrag` (called on

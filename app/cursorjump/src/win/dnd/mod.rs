@@ -295,11 +295,20 @@ pub struct DndShared {
     catcher: AtomicIsize,
     /// cj-dnd-in's window.
     shield: AtomicIsize,
-    /// The drag from the Mac whose `DoDragDrop` runs on cj-dnd-in; 0 = none.
+    /// The drag from the Mac whose `DoDragDrop` runs on cj-dnd-in (or is
+    /// about to: from its `StartIncoming` until `run_incoming` returns or
+    /// unwinds); 0 = none.
     incoming: AtomicU64,
 }
 
 impl DndShared {
+    /// The drag from the Mac that cj-dnd-in is running, if any: its
+    /// `IncomingEnded` is still to come. The app's watchdog ends only a
+    /// drag no thread runs.
+    pub fn running_incoming(&self) -> Option<DragId> {
+        Some(self.incoming.load(Ordering::Acquire)).filter(|&d| d != 0)
+    }
+
     fn is_ours(&self, hwnd: HWND) -> bool {
         let h = hwnd.0 as isize;
         h != 0
@@ -592,6 +601,12 @@ fn edge_of(side: Side) -> Option<Rect> {
 }
 
 /// Whether Windows sees the left button down (a read-only query).
+///
+/// `GetAsyncKeyState` reads the physical button, so with the buttons
+/// swapped (`SM_SWAPBUTTON`) this is the secondary one. Not mapped here on
+/// purpose: the hook's pass-through, the input thread's `is_down` and Raw
+/// Input all use the physical left button too, and mapping only this one
+/// would make them disagree. Parked: swapped buttons for drags as a whole.
 pub(super) fn left_button_down() -> bool {
     // SAFETY: GetAsyncKeyState has no preconditions.
     (unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } as u16) & 0x8000 != 0
@@ -1367,6 +1382,39 @@ mod tests {
             assert_eq!(route(&c), Route::In, "{c:?}");
         }
         assert_eq!(route(&DndCmd::ApplyConfig(Config::default())), Route::Both);
+    }
+
+    /// What a `Running` guard leaves behind, run or unwound: the drag it
+    /// showed while running, `DndShared::incoming` after, and the ends it
+    /// sent.
+    fn run_guarded(panic: bool) -> (Option<DragId>, Option<DragId>, Vec<(DragId, bool)>) {
+        let shared = Arc::new(DndShared::default());
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let sink = got.clone();
+        let events = Emit::new(Box::new(move |ev| {
+            if let WinDndEv::IncomingEnded { drag, dropped } = ev {
+                sink.lock().unwrap().push((drag, dropped));
+            }
+        }));
+        let mut during = None;
+        let ran = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _running = inbound::Running::new(5, shared.clone(), events);
+            during = shared.running_incoming();
+            assert!(!panic, "the drag panicked");
+        }));
+        assert_eq!(ran.is_err(), panic);
+        let ended = got.lock().unwrap().clone();
+        (during, shared.running_incoming(), ended)
+    }
+
+    #[test]
+    fn running_is_cleared_and_an_unwind_ends_the_drag() {
+        assert_eq!(
+            run_guarded(false),
+            (Some(5), None, vec![]),
+            "run_incoming sends its own end"
+        );
+        assert_eq!(run_guarded(true), (Some(5), None, vec![(5, false)]));
     }
 
     #[test]

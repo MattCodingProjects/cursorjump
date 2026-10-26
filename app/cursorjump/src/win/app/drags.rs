@@ -61,9 +61,13 @@ const FETCH_WAIT: Duration = Duration::from_secs(10);
 /// catcher lets go 500 ms after a release it never got, and the Mac's
 /// drop may still be on its way.
 const GONE_GRACE: Duration = Duration::from_secs(3);
-/// A drag from the Mac that hasn't ended, waits on nothing, and has had
-/// the left button up this long is ended here: cj-dnd will never say so.
-const STRANDED_AFTER: Duration = Duration::from_secs(3);
+/// A drag from the Mac that no cj-dnd thread runs, hasn't ended, waits
+/// on nothing, and has had the left button up this long is ended here:
+/// cj-dnd will never say so. With `DndShared::running_incoming` as the
+/// liveness signal it only fires once the thread is gone, so it can be
+/// generous: the cost of waiting is the edge walled a little longer after
+/// a crash, against ending a drag whose start is merely slow.
+const STRANDED_AFTER: Duration = Duration::from_secs(10);
 /// Spooled and downloaded items, read only while their drag goes on.
 const OUTGOING_MAX_AGE: Duration = Duration::from_secs(60 * 60);
 /// Received items: targets (WhatsApp, Gmail, Discord) may read them well
@@ -459,11 +463,14 @@ impl InDrag {
     }
 
     /// One sample of the safety net for an `IncomingEnded` that never
-    /// comes (cj-dnd gone): true once the drag hasn't ended, waits on no
-    /// reply, and the left button has been up for `STRANDED_AFTER`. A
-    /// drag still held, or being fetched, starts the count again.
-    fn stranded(&mut self, left_down: bool, now: Instant) -> bool {
-        if self.ended.is_some() || !self.replies.is_empty() || left_down {
+    /// comes (cj-dnd gone): true once no cj-dnd thread `running` it, it
+    /// hasn't ended, waits on no reply, and the left button has been up,
+    /// all for `STRANDED_AFTER`. A drag running, still held, or being
+    /// fetched starts the count again. (A target that asks late, or
+    /// Explorer still copying after the last reply, keeps `DoDragDrop`
+    /// running.)
+    fn stranded(&mut self, running: bool, left_down: bool, now: Instant) -> bool {
+        if running || self.ended.is_some() || !self.replies.is_empty() || left_down {
             self.left_up_since = None;
             return false;
         }
@@ -477,7 +484,8 @@ impl InDrag {
     /// it was cancelled, or the target has asked for nothing more for
     /// `FETCH_WAIT` (Explorer asks before `IncomingEnded`, Chromium may
     /// ask after it). A cancelled drag with nothing failed fails with the
-    /// cancel's reason.
+    /// cancel's reason, unless every item had already arrived: a late
+    /// cancel can't undo a landed drop.
     fn outcome(&self, now: Instant) -> Option<DragOutcome> {
         if self.finishing {
             return None;
@@ -493,7 +501,9 @@ impl InDrag {
         }
         let results: Vec<_> = self.fetched.values().cloned().collect();
         match (incoming_outcome(true, &results)?, &self.cancelled) {
-            (DragOutcome::Done, Some(why)) => Some(DragOutcome::Failed(why.clone())),
+            (DragOutcome::Done, Some(why)) if self.fetched.len() < self.items.len() => {
+                Some(DragOutcome::Failed(why.clone()))
+            }
             (outcome, _) => Some(outcome),
         }
     }
@@ -944,11 +954,16 @@ impl App {
         let drags: Vec<DragId> = self.drags.incoming.keys().copied().collect();
         if !drags.is_empty() {
             let left_down = left_button_down();
+            let running = self
+                .drags
+                .port
+                .as_ref()
+                .and_then(|p| p.shared.running_incoming());
             for &drag in &drags {
                 let Some(inc) = self.drags.incoming.get_mut(&drag) else {
                     continue;
                 };
-                if inc.stranded(left_down, now) {
+                if inc.stranded(running == Some(drag), left_down, now) {
                     let dropped = !inc.fetched.is_empty();
                     warn!(
                         drag,
@@ -1161,6 +1176,21 @@ mod tests {
             }))
         );
 
+        // Cancelled by the Mac once every item had arrived: still done.
+        let mut inc = two();
+        for item in [0, 1] {
+            let (r, _rr) = oneshot::channel();
+            inc.fetch(item, r, t0);
+            inc.received(item, Ok("x".into()));
+        }
+        inc.ended(true, t0);
+        inc.cancel(FailReason::Cancelled);
+        assert_eq!(
+            inc.outcome(t0),
+            Some(DragOutcome::Done),
+            "a late cancel undid a landed drop"
+        );
+
         // A fetch still in flight is waited for.
         let mut inc = two();
         let (a, _ra) = oneshot::channel();
@@ -1182,19 +1212,33 @@ mod tests {
     }
 
     #[test]
-    fn a_stranded_drag_is_caught_once_the_button_has_been_up() {
+    fn a_drag_no_thread_runs_is_caught_once_the_button_has_been_up() {
         let (t0, mut inc) = (Instant::now(), two());
-        assert!(!inc.stranded(true, t0), "still held: DoDragDrop runs");
-        assert!(!inc.stranded(false, t0 + ms(100)));
-        assert!(!inc.stranded(false, t0 + ms(100) + STRANDED_AFTER - ms(1)));
-        assert!(inc.stranded(false, t0 + ms(100) + STRANDED_AFTER));
+        assert!(!inc.stranded(false, true, t0), "still held");
+        assert!(!inc.stranded(false, false, t0 + ms(100)));
+        assert!(!inc.stranded(false, false, t0 + ms(100) + STRANDED_AFTER - ms(1)));
+        assert!(inc.stranded(false, false, t0 + ms(100) + STRANDED_AFTER));
 
         // Pressed again in between: the count starts over.
         let mut inc = two();
-        assert!(!inc.stranded(false, t0));
-        assert!(!inc.stranded(true, t0 + ms(2000)));
-        assert!(!inc.stranded(false, t0 + STRANDED_AFTER));
-        assert!(inc.stranded(false, t0 + STRANDED_AFTER * 2));
+        assert!(!inc.stranded(false, false, t0));
+        assert!(!inc.stranded(false, true, t0 + ms(2000)));
+        assert!(!inc.stranded(false, false, t0 + STRANDED_AFTER));
+        assert!(inc.stranded(false, false, t0 + STRANDED_AFTER * 2));
+    }
+
+    #[test]
+    fn a_running_drag_is_never_stranded() {
+        let (t0, mut inc) = (Instant::now(), two());
+        let late = t0 + STRANDED_AFTER * 10;
+        // Replies empty and the button up: a target slow to ask, or
+        // Explorer still copying after the last reply.
+        assert!(!inc.stranded(true, false, t0));
+        assert!(!inc.stranded(true, false, late));
+        // The thread is gone: counted from when it stopped running.
+        assert!(!inc.stranded(false, false, late));
+        assert!(!inc.stranded(false, false, late + STRANDED_AFTER - ms(1)));
+        assert!(inc.stranded(false, false, late + STRANDED_AFTER));
     }
 
     #[test]
@@ -1203,18 +1247,21 @@ mod tests {
         let (a, _ra) = oneshot::channel();
         inc.fetch(0, a, t0);
         let late = t0 + STRANDED_AFTER * 10;
-        assert!(!inc.stranded(false, t0));
-        assert!(!inc.stranded(false, late), "Explorer's copy holds the drag");
+        assert!(!inc.stranded(false, false, t0));
+        assert!(
+            !inc.stranded(false, false, late),
+            "Explorer's copy holds the drag"
+        );
 
         let mut ended = two();
         ended.ended(true, t0);
-        assert!(!ended.stranded(false, t0));
-        assert!(!ended.stranded(false, late));
+        assert!(!ended.stranded(false, false, t0));
+        assert!(!ended.stranded(false, false, late));
 
         // Taken as ended, a late real `IncomingEnded` changes nothing.
         let mut inc = two();
-        inc.stranded(false, t0);
-        assert!(inc.stranded(false, late));
+        inc.stranded(false, false, t0);
+        assert!(inc.stranded(false, false, late));
         inc.ended(false, late);
         inc.finishing = true;
         inc.ended(true, late + ms(5));
