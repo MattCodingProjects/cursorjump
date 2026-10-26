@@ -362,11 +362,18 @@ trait Targets: Send + Sync {
 }
 
 /// Whether the window server has our panel (`number`) as the frontmost
-/// window holding `at`: only then does a posted press there reach it.
-/// Also where in the list it is, and which window is on top, for the log.
+/// window holding `at` among those on its layer or below: only then does a
+/// posted press there reach it. Windows on a higher layer are passed over:
+/// those are overlays (screen tints, cursor and drag-image windows) that
+/// let clicks through — a full-screen one at layer 2147483628 sat over the
+/// panel in the first hands-on run while the spike's presses still landed.
 fn panel_on_top(windows: &[WinInfo], at: (f64, f64), number: i64) -> bool {
+    let Some(ours) = windows.iter().find(|w| w.number == number) else {
+        return false;
+    };
     windows
         .iter()
+        .filter(|w| w.layer <= ours.layer)
         .find(|w| contains(w.bounds, at))
         .is_some_and(|w| w.number == number)
 }
@@ -380,8 +387,14 @@ fn contains((x, y, wd, ht): (f64, f64, f64, f64), at: (f64, f64)) -> bool {
 fn window_at(windows: &[WinInfo], at: (f64, f64), own_pid: i32) -> Option<&WinInfo> {
     windows
         .iter()
-        .find(|w| w.pid != own_pid && contains(w.bounds, at))
+        .find(|w| w.pid != own_pid && w.layer < OVERLAY_LAYER && contains(w.bounds, at))
 }
+
+/// Windows from the dragging level (kCGDraggingWindowLevel) up are passed
+/// over when looking for the drop target: drag images, the cursor and
+/// full-screen overlays (a screen tint app's sat at 2147483628 over every
+/// drop in the first hands-on run) never take the drop.
+const OVERLAY_LAYER: i64 = 500;
 
 /// Whether the drop under `at` goes to an app that takes file promises
 /// (R50): a normal window (layer 0) of a listed app, or the desktop
@@ -1396,10 +1409,37 @@ mod tests {
             "another window on top would eat the press"
         );
         assert!(
-            !panel_on_top(&[panel, finder], (100.0, 500.0), 42),
+            !panel_on_top(&[panel, finder.clone()], (100.0, 500.0), 42),
             "listed, but not under the point"
         );
         assert!(!panel_on_top(&[], at, 42));
+        let overlay = WinInfo {
+            number: 9,
+            layer: 2_147_483_628,
+            pid: 3,
+            bounds: (0.0, 0.0, 1800.0, 1169.0),
+        };
+        assert!(
+            panel_on_top(&[overlay, panel_at_25(), finder.clone()], at, 42),
+            "a higher-layer overlay lets the press through"
+        );
+        let same_layer = WinInfo {
+            layer: 25,
+            ..other(10, (0.0, 490.0, 50.0, 50.0))
+        };
+        assert!(
+            !panel_on_top(&[same_layer, panel_at_25(), finder], at, 42),
+            "a window on our layer in front eats the press"
+        );
+    }
+
+    fn panel_at_25() -> WinInfo {
+        WinInfo {
+            number: 42,
+            layer: 25,
+            pid: 1,
+            bounds: (-2.0, 496.0, 8.0, 8.0),
+        }
     }
 
     #[test]
@@ -1415,6 +1455,14 @@ mod tests {
         assert_eq!(pid(300.0, 150.0), Some(20), "right edge is out");
         assert_eq!(pid(99.0, 150.0), Some(20));
         assert_eq!(pid(1500.0, 10.0), None, "the desktop");
+        let overlaid = [
+            win(2_147_483_628, 30, (0.0, 0.0, 2000.0, 2000.0)), // a screen-tint overlay
+            win(500, 31, (100.0, 100.0, 64.0, 64.0)),           // a drag image
+            win(0, 20, (0.0, 0.0, 1000.0, 1000.0)),
+        ];
+        let under = |x, y| window_at(&overlaid, (x, y), OURS).map(|w| w.pid);
+        assert_eq!(under(120.0, 120.0), Some(20), "overlays are passed over");
+        assert_eq!(under(1500.0, 10.0), None, "the desktop under an overlay");
     }
 
     #[test]

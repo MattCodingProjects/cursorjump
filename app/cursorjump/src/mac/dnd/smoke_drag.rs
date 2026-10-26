@@ -43,7 +43,6 @@ use crate::common::transfer::Dest;
 use crate::mac::control::{Crossing, DragPort, InjectMsg, Input, spawn_inject_thread};
 use crate::mac::inject::Injector;
 
-const DRAG: DragId = 0x5EED;
 /// The fake fetch takes this many steps of half a second.
 const FETCH_STEPS: u32 = 20;
 
@@ -331,15 +330,21 @@ fn script(
         ?ending,
         "smoke: the PC's cursor and drag cross at the left edge"
     );
+    // A fresh id per run, as the PC's are random: a fixed one would meet
+    // the last run's leftovers in incoming/<drag>.
+    let drag: DragId = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0x5EED, |d| d.as_nanos() as u64)
+        | 1;
     let _ = tx.send(InjectMsg::Begin { sid: 1 });
     send(Input::DragOffer {
-        drag: DRAG,
+        drag,
         items: vec![item],
     });
     send(Input::Enter {
         edge: Side::Left,
         frac,
-        drag: Some(DRAG),
+        drag: Some(drag),
     });
     sleep(300);
     // Three small steps cross the drag threshold.
