@@ -11,4 +11,5 @@ pub mod mac_state;
 pub mod modifiers;
 pub mod pacer;
 pub mod pc_state;
+pub mod pill;
 pub mod proto;
