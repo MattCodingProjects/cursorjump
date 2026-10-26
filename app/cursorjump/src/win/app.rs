@@ -176,6 +176,8 @@ pub(super) enum Ev {
     Dnd(WinDndEv),
     /// A running pill's close button.
     PillCancel(DragId),
+    /// A failed pill's close button took it away.
+    PillDismissed(DragId),
 }
 
 /// The tray's status line.
@@ -321,7 +323,9 @@ impl App {
         let mut latency_refresh = interval(LATENCY_REFRESH);
         let mut latency_log = interval(LATENCY_LOG);
         let mut drag_tick = interval(DRAG_TICK);
+        drag_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut sweep = interval_at(Instant::now() + SWEEP_EVERY, SWEEP_EVERY);
+        sweep.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let Some(mut drag_events) = self.drag_events.take() else {
             return;
         };
@@ -401,13 +405,14 @@ impl App {
                 frac,
                 drag,
             } => {
-                // The offer goes first, on the same control stream. The
-                // input thread covers the screen with the catcher itself.
+                // The input thread covers the screen with the catcher and
+                // parks the cursor at once, whatever becomes of the offer,
+                // which goes before `Enter` on the same control stream.
+                self.send_input(InputCmd::EnterMac { drag });
                 let drag = match drag {
                     Some(drag) => self.offer_ride(drag).await,
                     None => None,
                 };
-                self.send_input(InputCmd::EnterMac { drag });
                 self.control(Control::Enter {
                     edge: mac_edge,
                     frac,
@@ -468,6 +473,7 @@ impl App {
             }
             Ev::Dnd(ev) => self.on_dnd(ev).await,
             Ev::PillCancel(drag) => self.on_pill_cancel(drag).await,
+            Ev::PillDismissed(drag) => self.on_pill_dismissed(drag),
         }
     }
 

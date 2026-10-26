@@ -96,11 +96,13 @@ pub enum PillCmd {
 /// closes its windows.
 ///
 /// `on_cancel` runs on the pill thread, inside its window procedure, when a
-/// running pill's ✕ is clicked. It must not block (the pills freeze until it
-/// returns) and must not hold a clone of the returned `Sender` (the thread
-/// would then never stop). A panic in it is caught and logged.
+/// running pill's ✕ is clicked, and `on_dismiss` when a failed pill's ✕
+/// takes it off the board. Neither may block (the pills freeze until it
+/// returns) nor hold a clone of the returned `Sender` (the thread would
+/// then never stop). A panic in either is caught and logged.
 pub fn spawn_pill_thread(
     on_cancel: impl Fn(DragId) + Send + 'static,
+    on_dismiss: impl Fn(DragId) + Send + 'static,
 ) -> Result<mpsc::Sender<PillCmd>> {
     let (cmd_tx, cmd_rx) = mpsc::channel::<PillCmd>();
     let (relay_tx, relay_rx) = mpsc::channel::<PillCmd>();
@@ -111,7 +113,13 @@ pub fn spawn_pill_thread(
     let thread_pending = pending.clone();
     std::thread::Builder::new()
         .name("cj-pill".into())
-        .spawn(move || run(Box::new(on_cancel), relay_rx, &thread_pending, ready_tx))
+        .spawn(move || {
+            let on = Callbacks {
+                cancel: Box::new(on_cancel),
+                dismiss: Box::new(on_dismiss),
+            };
+            run(on, relay_rx, &thread_pending, ready_tx)
+        })
         .context("spawn pill thread")?;
     // The thread reports its id once its message queue exists.
     let tid = ready_rx.recv().context("pill thread exited at start")??;
@@ -498,10 +506,16 @@ fn place_at(at: (i32, i32)) -> Place {
     }
 }
 
+/// The app's handlers for a pill's ✕.
+struct Callbacks {
+    cancel: Box<dyn Fn(DragId) + Send>,
+    dismiss: Box<dyn Fn(DragId) + Send>,
+}
+
 struct State {
     hinst: HINSTANCE,
     board: PillBoard,
-    on_cancel: Box<dyn Fn(DragId) + Send>,
+    on: Callbacks,
     anchors: Vec<Anchor>,
     /// In no particular order; matched to the views by drag.
     wins: Vec<PillWin>,
@@ -551,7 +565,7 @@ fn with_state<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> {
 }
 
 fn run(
-    on_cancel: Box<dyn Fn(DragId) + Send>,
+    on: Callbacks,
     cmds: mpsc::Receiver<PillCmd>,
     pending: &AtomicBool,
     ready: mpsc::SyncSender<Result<u32>>,
@@ -571,7 +585,7 @@ fn run(
         *cell.borrow_mut() = Some(State {
             hinst,
             board: PillBoard::new(Peer::Mac, Peer::Pc),
-            on_cancel,
+            on,
             anchors: Vec::new(),
             wins: Vec::new(),
             held: false,
@@ -797,13 +811,17 @@ impl State {
         let (drag, running, failed) = (view.drag, view.running, view.failed);
         if hit && running {
             // Never unwind out of the window procedure.
-            let cancel = &self.on_cancel;
+            let cancel = &self.on.cancel;
             if std::panic::catch_unwind(AssertUnwindSafe(|| cancel(drag))).is_err() {
                 warn!("pill: on_cancel panicked for drag {drag}");
             }
         } else if hit && failed {
             self.board.dismiss(drag);
             self.schedule.dirty = true;
+            let dismiss = &self.on.dismiss;
+            if std::panic::catch_unwind(AssertUnwindSafe(|| dismiss(drag))).is_err() {
+                warn!("pill: on_dismiss panicked for drag {drag}");
+            }
         }
         self.on_hover(input, true);
     }
@@ -1099,11 +1117,14 @@ mod tests {
 
     #[test]
     fn thread_stops_when_the_sender_is_dropped() {
-        // The thread owns `on_cancel`; its channel closes once the thread ends.
+        // The thread owns its callbacks; their channel closes once it ends.
         let (tx, rx) = mpsc::channel::<DragId>();
-        let pills = spawn_pill_thread(move |d| {
-            let _ = tx.send(d);
-        })
+        let pills = spawn_pill_thread(
+            move |d| {
+                let _ = tx.send(d);
+            },
+            |_| {},
+        )
         .expect("spawn");
         // Not shown within SHOW_AFTER, so no window is made.
         pills
@@ -1140,9 +1161,12 @@ mod tests {
         let _ = unsafe { GetCursorPos(&mut cursor) };
         let at = (cursor.x, cursor.y);
         let (cancel_tx, cancel_rx) = mpsc::channel::<DragId>();
-        let pills = spawn_pill_thread(move |d| {
-            let _ = cancel_tx.send(d);
-        })
+        let pills = spawn_pill_thread(
+            move |d| {
+                let _ = cancel_tx.send(d);
+            },
+            |d| info!(drag = d, "smoke: dismissed"),
+        )
         .expect("spawn");
         let send = |cmd: PillCmd| pills.send(cmd).expect("pill thread alive");
         let file = |name: &str, size: Option<u64>| DragItem {

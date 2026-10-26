@@ -322,10 +322,13 @@ pub struct DndPort {
 }
 
 impl DndPort {
-    pub fn send(&self, cmd: DndCmd) {
-        if self.cmds.send(cmd).is_err() {
+    /// False if cj-dnd is gone and `cmd` was dropped.
+    pub fn send(&self, cmd: DndCmd) -> bool {
+        let sent = self.cmds.send(cmd).is_ok();
+        if !sent {
             debug!("dnd threads gone; command dropped");
         }
+        sent
     }
 }
 
@@ -505,6 +508,7 @@ fn relay(
             }
             _ => {}
         }
+        let start = started_drag(&cmd);
         let sent = match route(&cmd) {
             Route::Out => out.send(cmd),
             Route::In => inc.send(cmd),
@@ -512,11 +516,28 @@ fn relay(
         };
         if !sent {
             debug!("dnd relay: a thread is gone; command dropped");
+            if let Some(drag) = start {
+                // As promised: `IncomingEnded` follows every `StartIncoming`.
+                error!(drag, "dnd relay: cj-dnd-in is gone; StartIncoming refused");
+                events.send(WinDndEv::IncomingEnded {
+                    drag,
+                    dropped: false,
+                });
+            }
         }
     }
     source::cancel_live(&live, None);
     out.stop();
     inc.stop();
+}
+
+/// The drag a `StartIncoming` starts: if the command never reaches its
+/// thread, the relay ends it itself.
+fn started_drag(cmd: &DndCmd) -> Option<DragId> {
+    match cmd {
+        DndCmd::StartIncoming { drag, .. } => Some(*drag),
+        _ => None,
+    }
 }
 
 fn wake(hwnd: isize) -> windows::core::Result<()> {
@@ -570,7 +591,8 @@ fn edge_of(side: Side) -> Option<Rect> {
     edge_monitor(&monitors(), side)
 }
 
-fn left_button_down() -> bool {
+/// Whether Windows sees the left button down (a read-only query).
+pub(super) fn left_button_down() -> bool {
     // SAFETY: GetAsyncKeyState has no preconditions.
     (unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } as u16) & 0x8000 != 0
 }
@@ -610,6 +632,10 @@ struct OutModes {
     /// While parked: refuse the drop (after `Cancel`).
     reject: bool,
     offer: Option<DragId>,
+    /// A `Cancel` for the offer that came before its `Park(true)`: the
+    /// park refuses it at once. (The app cancels a crossing whose offer it
+    /// couldn't send, and the input thread parks for it: two senders.)
+    refuse: Option<DragId>,
 }
 
 impl OutModes {
@@ -634,7 +660,15 @@ impl OutModes {
     }
 
     fn release(&mut self, tell: bool) -> Option<Released> {
+        self.refuse = None;
         self.offer.take().map(|drag| Released { drag, tell })
+    }
+
+    /// Refuse the drop of the drag ridden now, until the real release.
+    fn refuse_drop(&mut self, drag: DragId) -> Option<Released> {
+        info!(drag, "catcher: cancelled while riding; refusing the drop");
+        self.reject = true;
+        self.release(false)
     }
 
     /// The catcher's commands, as routed here; anything else is cj-dnd-in's.
@@ -647,15 +681,20 @@ impl OutModes {
             DndCmd::Park(true) => {
                 self.parked = true;
                 self.reject = false;
+                if let Some(drag) = self.refuse.take().filter(|&d| self.offer == Some(d)) {
+                    return self.refuse_drop(drag);
+                }
             }
             DndCmd::Park(false) => self.unpark(),
             DndCmd::Cancel { drag } => {
-                if self.parked && self.offer == Some(drag) {
-                    info!(drag, "catcher: cancelled while riding; refusing the drop");
-                    self.reject = true;
-                    return self.release(false);
+                if self.offer != Some(drag) {
+                    debug!(drag, "catcher: Cancel for a drag it doesn't hold");
+                } else if self.parked {
+                    return self.refuse_drop(drag);
+                } else {
+                    debug!(drag, "catcher: Cancel before the park; refused once parked");
+                    self.refuse = Some(drag);
                 }
-                debug!(drag, "catcher: Cancel for a drag it doesn't hold");
             }
             DndCmd::Home { drag } => {
                 if self.reject {
@@ -1331,6 +1370,17 @@ mod tests {
     }
 
     #[test]
+    fn only_a_start_is_ended_by_the_relay_when_unsent() {
+        let start = DndCmd::StartIncoming {
+            drag: 4,
+            items: vec![],
+        };
+        assert_eq!(started_drag(&start), Some(4));
+        assert_eq!(started_drag(&DndCmd::CancelIncoming { drag: 4 }), None);
+        assert_eq!(started_drag(&DndCmd::Shield(true)), None);
+    }
+
+    #[test]
     fn shield_rect_is_centred_on_the_park_point_and_scaled() {
         let r = |left, top, right, bottom| Rect {
             left,
@@ -1569,9 +1619,10 @@ mod tests {
     fn modes_cancel_refuses_until_the_release() {
         let mut m = Modes::default();
         m.enter(Some(7));
-        // Not riding: not its business.
-        assert_eq!(cmd(&mut m, DndCmd::Cancel { drag: 7 }), None);
+        // Another drag: not its business.
+        assert_eq!(cmd(&mut m, DndCmd::Cancel { drag: 9 }), None);
         cmd(&mut m, DndCmd::Park(true));
+        assert!(m.over(), "a Cancel for another drag refuses nothing");
         assert_eq!(cmd(&mut m, DndCmd::Cancel { drag: 9 }), None);
         assert_eq!(
             cmd(&mut m, DndCmd::Cancel { drag: 7 }),
@@ -1590,6 +1641,36 @@ mod tests {
         // The real release: no drop, back off the screen.
         assert_eq!(m.take_drop(), Err(None));
         assert!(!m.out.parked && !m.out.reject);
+    }
+
+    #[test]
+    fn modes_cancel_before_the_park_refuses_once_parked() {
+        let mut m = Modes::default();
+        m.enter(Some(7));
+        assert_eq!(cmd(&mut m, DndCmd::Cancel { drag: 7 }), None);
+        assert_eq!(m.out.offer, Some(7), "still held until the park");
+        assert_eq!(
+            cmd(&mut m, DndCmd::Park(true)),
+            Some(Released {
+                drag: 7,
+                tell: false
+            })
+        );
+        assert_eq!(m.placement().catcher, CatcherAt::Screen);
+        assert!(!m.over() && !m.takes_drop());
+        assert_eq!(m.take_drop(), Err(None), "the release drops nothing");
+
+        // Let go of before any park: a later offer's park is not refused,
+        // even one under the same id.
+        for later in [7, 8] {
+            let mut m = Modes::default();
+            m.enter(Some(7));
+            cmd(&mut m, DndCmd::Cancel { drag: 7 });
+            m.leave();
+            m.enter(Some(later));
+            assert_eq!(cmd(&mut m, DndCmd::Park(true)), None);
+            assert!(m.takes_drop());
+        }
     }
 
     #[test]
