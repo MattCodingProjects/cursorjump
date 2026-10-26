@@ -109,3 +109,46 @@ The minute ending 14:19:31 includes about 20 s from before the switch.
 - Hardening (Task 18 Step 4): deep sleep, reboots of both machines, unplugging the vertical monitor, 150 % scaling.
 - Review Focus 1 (held key or button while crossing) and 4 (clipboard extremes).
 - Step 4 (feel): a real work session.
+
+---
+
+# Phase 2 acceptance: file drag-and-drop (Task 18, in progress)
+
+Started 2026-10-26 with the user at both machines. Both run `phase2` (Mac installed from 875f8ee at 17:50Z, PC at 17:52Z; protocol v3, connected 17:51:44Z). Times are the Mac log's (UTC). Same marks as above: `[x]` passed, `[ ]` not yet checked, `[~]` partly, `[!]` failed or flaky.
+
+## Checklist (plan Task 18 Step 2, plus the hand checks from the reviews)
+
+### PC → Mac
+- [x] A single file onto the Mac desktop (17:53:52Z: a 213 KB PDF, every byte here 15 ms after the drag armed, dropped and done).
+- [x] A folder (17:57:49Z: `sangfroid-netlify-v2` onto the Desktop).
+- [x] Several files at once (18:03:41Z: 3 PDFs/docs in one drag, all three written).
+- [~] Drops into WhatsApp and Gmail (Chrome): the user reported "all three worked" for the round that asked for them, but the log shows only the Desktop drop in that round. Both passed in the Task 15 smoke (`--smoke-drag`), not yet seen in the installed app's log.
+- [ ] Downloads in a Finder window (the drops so far went to the Desktop).
+- [ ] Discord (skipped on the Mac by the user's choice; still to do on the PC side).
+- [x] Cancel with ✕ (18:06:45Z: a Roblox `.mp4` dropped on the Desktop, ✕ 5 s later → `Failed(Cancelled)`, nothing left on the Desktop, no `.cjpart`; the incoming cache kept only the 0-byte placeholder and empty `.fetch` dirs, which the 24 h sweep removes).
+- [x] Dragging back across the edge mid-drag (17:53:49Z, from the log: the drag went home to the PC, `NotDropped`; the user reported nothing stuck).
+- [ ] Esc mid-drag.
+- [ ] A 5 GB file with the cursor feeling unchanged (latency median during the copy within 2 ms of idle). The user was given the steps (`fsutil file createnew $HOME\Desktop\big5gb.bin 5368709120`); not run yet. Idle reference today: median 3.1–3.3 ms, p95 3.4–3.7 ms, 0 spikes.
+- [ ] Wi-Fi drop mid-copy (pill "Copy failed — … disconnected", no `.cjpart` left).
+- [ ] Mac sleep mid-copy ("went to sleep").
+- [ ] A Chromium target (Gmail) while the file is still arriving: the release is held until it has, ✕/Esc cancel.
+- [ ] Hand check: the ghost image follows a PC-mouse Chrome drag on the Mac.
+- [ ] Hand check (PC fix 39f70d9): no frozen file icon or "+ Copy" left at the PC screen's centre during a PC→Mac drag.
+
+### Mac → PC
+- [x] Single items (an image at 17:57:06Z and 17:57:16Z, then 17:58:24Z and 18:04:21Z) and 3 files at once (18:03:48Z): each caught by the strip's late path and sent; the user confirmed they landed on the PC.
+- [!] Two drags didn't go (17:54:01Z and 18:04:17Z, out of 8 tries). The first reached the strip 13 ms after the posted release but was never dropped on it, and left the strip when the wait ended. The second never reached the strip. Every drag so far, good or bad, was caught only after the release (the late path, R48a), never before it, even though the strip is 8 pt (R54). Likely cause: the strip only shows within 48 pt of the edge, and a quick PC-mouse sweep reaches the edge before it does. To investigate before merge.
+- [ ] Drags out of WhatsApp, Discord and a web page in the installed app (all three passed in the Task 16 smoke).
+- [ ] Hand check: a WhatsApp photo is cloned out of its app's tmp folder (R53).
+- [ ] Hand check: a Chrome image arrives under its fallback name, e.g. `image.jpg` (R52).
+- [ ] Hand check: the PC handles a `Leave` while its left button is still down.
+- [ ] A Mac-to-PC copy finishing during a game, the pill held back until Alt+Tab.
+
+### Both / gaming
+- [ ] The gaming wall during a drag, with Valorant or Roblox running in the background and no change in behaviour.
+- [x] Crossing still feels normal on the new build (the user moved across and back before the first drag).
+
+## Found during acceptance
+- **Mac → PC drags sometimes don't go** (see the `[!]` line). To investigate before merge.
+- **A Mac drag can't come back to the Mac** (user, 2026-10-26). Once a Mac drag has crossed to the PC, the PC's edge is a wall for it (by design: `pc_state` `incoming_drag_makes_the_edge_a_wall`), because handing it to the PC dropped it on the Mac's strip. Overshooting means dropping it on the PC and starting again. The user wants it carried back, to the polish backlog: the PC would hand it back and the Mac would start a new drag of the same files under the cursor.
+- **Roblox takes clicks made on the Mac** (user, reported by the PC session). Since phase 1; workaround: close or minimise Roblox first. Left for now at the user's request.

@@ -1,8 +1,8 @@
 # CursorJump — Handoff
 
-## Phase 2 (file drag-and-drop): all code done; acceptance (Task 18) next
+## Phase 2 (file drag-and-drop): all code done; acceptance (Task 18) in progress
 
-Last updated: 2026-10-26 (evening), on the PC. Branch **`phase2`** holds every task's code, reviewed. **Both machines now run the `phase2` build** (PC installed from 875f8ee and connected to the Mac). Task 18 acceptance is in progress, driven by the Mac session; check the ledger and `docs/ACCEPTANCE.md` for what has been ticked off. The repo is now **public** (the user's choice, for free CI minutes).
+Last updated: 2026-10-26 (end of day), on the Mac, on top of the PC session's evening update. Branch **`phase2`** holds every task's code, reviewed. **Both machines now run the `phase2` build** (PC installed from 875f8ee and connected to the Mac). Task 18 acceptance is in progress, driven by the Mac session; where it stands is below. The repo is now **public** (the user's choice, for free CI minutes).
 
 - **Spec:** `docs/superpowers/specs/2026-10-25-file-drag-and-drop-design.md`
 - **Plan:** `docs/superpowers/plans/2026-10-25-file-drag-and-drop.md` (Tasks 15–16 carry amendment blocks from the Mac spike)
@@ -15,22 +15,33 @@ Last updated: 2026-10-26 (evening), on the PC. Branch **`phase2`** holds every t
 - **How the Mac side works, in short:**
   - **PC → Mac:** one drag carries a file promise plus a file URL (R47). Finder, the Desktop and WhatsApp take the promise and drop at once. Chromium targets (Gmail) get the file URL, and the posted release is **held** until the file has fully arrived (approved by the user; ✕ or Esc cancels).
   - **Mac → PC:** an 8 pt invisible strip at the left edge catches the drag (R54). A late-starting drag is caught at the release instead (R48a). The edge stays a wall for window drags and text selections.
-- **Next: Task 18, with the user at both machines.**
-  1. **Install both together** (protocol v3; v2 and v3 won't connect):
-     - Mac: `./scripts/mac/install.sh`. Click "Always Allow" if codesign asks for the keychain.
-     - PC: `git pull`, then `powershell -ExecutionPolicy Bypass -File scripts\win\install.ps1`.
-  2. **Run the acceptance list** (plan Task 18 step 2) and record it in `docs/ACCEPTANCE.md`.
-  3. **Hand checks carried from the reviews:**
-     - a WhatsApp photo is "cloned out of its app's tmp folder";
-     - a Chrome image arrives under its fallback name (e.g. `image.jpg`);
-     - the PC handles a `Leave` while its left button is still down;
-     - Mac sleep mid-copy;
-     - the ghost image follows a PC-mouse Chrome drag on the Mac;
-     - the earlier PC open item (drag image at the park point) was fixed in 39f70d9, so confirm it.
-  4. Then the final whole-branch review (fable), delete the spike examples, update this file, and merge.
+- **Task 18 status (end of 2026-10-26, Mac session).** Both machines run the `phase2` build (Mac 875f8ee at 17:50Z, PC 875f8ee at 17:52Z), connected on protocol v3. Full results with log times: `docs/ACCEPTANCE.md`, "Phase 2 acceptance".
+  - **Passed:**
+    - PC → Mac: a file, a folder and 3 files at once onto the Desktop; ✕ cancel (nothing left behind); dragging back to the PC mid-drag.
+    - Mac → PC: single items and 3 files at once.
+    - The cursor still feels normal; latency median 3.1–3.3 ms all session.
+  - **Failed / flaky:** Mac → PC missed 2 of 8 drags (17:54:01Z, 18:04:17Z). Every Mac → PC drag was caught only through the late path (after the release), never by the strip beforehand. Likely cause: the strip only shows within 48 pt of the edge, and a quick PC-mouse sweep gets there first. **Investigate and fix before merge**; start from those two log windows in `~/Library/Application Support/CursorJump/cursorjump.log`.
+  - **Still to do with the user:**
+    - The 5 GB file with the latency check. On the PC: `fsutil file createnew $HOME\Desktop\big5gb.bin 5368709120`.
+    - PC → Mac: drops into WhatsApp and Gmail seen in the installed app's log (the user reported them working; the log didn't show them); a Downloads Finder window; Esc mid-drag; Wi-Fi drop mid-copy; Mac sleep mid-copy; a Gmail drop while the file is still arriving (held release).
+    - Mac → PC: drags out of WhatsApp, Discord and a web page.
+    - Discord on the PC.
+    - The gaming checks (Valorant/Roblox running; a Mac → PC copy finishing during a game, the pill held until Alt+Tab).
+    - Hand checks:
+      - the ghost image follows a PC-mouse Chrome drag on the Mac;
+      - a WhatsApp photo is cloned out of its app's tmp folder (R53);
+      - a Chrome image gets its fallback name (R52);
+      - the PC handles a `Leave` while its left button is down;
+      - no frozen icon or "+ Copy" at the PC's centre (39f70d9).
+  - **New user request (polish backlog):** let a Mac drag that crossed to the PC come back to the Mac. Today the PC's edge is a wall for it, by design.
+- **Next:**
+  1. Fix the Mac → PC misses (SDD as usual), reinstall the Mac, and re-check.
+  2. Finish the "still to do" list with the user, and record it in `ACCEPTANCE.md`.
+  3. Delete the spike examples (`app/cursorjump/examples/dnd_spike_*.rs`). Finish this file (plan Task 18 Step 3). Run `cargo test --workspace` on each machine.
+  4. The final whole-branch review (fable), then merge.
 - **Open issue (user-reported, not yet worked on):** with **Roblox** open on the PC (at any window size), clicks made on the Mac also land in Roblox, and Roblox draws its cursor at the PC's park point (the screen centre). Only Roblox does it, and it has been there since the phase 1 build. Workaround: close or minimise Roblox before moving to the Mac. The user asked to leave it for now.
 - **PC drag-image fix (39f70d9) still needs its eye check:** during a PC→Mac drag, confirm no frozen file icon or "+ Copy" stays at the centre of the PC screen. If it does, the smoke test compares three hiding modes: `CJ_SMOKE_MODE=ride`, `CJ_SMOKE_IMAGE=desc-noimage|nodesc|show`, then `cargo test -p cursorjump smoke_catcher_logs_offer -- --ignored --nocapture`.
-- **Polish backlog** (in the ledger): Mac→PC web-link drags (R55), swapped mouse buttons, uniquifying sanitized names, full Unicode case folding, and a few rare few-ms races.
+- **Polish backlog** (in the ledger): carrying a Mac drag back from the PC (user, Task 18), Mac→PC web-link drags (R55), swapped mouse buttons, uniquifying sanitized names, full Unicode case folding, and a few rare few-ms races.
 - **Quarantine:** files received on the Mac get no quarantine flag (R22). They are treated like a local copy.
 
 ---

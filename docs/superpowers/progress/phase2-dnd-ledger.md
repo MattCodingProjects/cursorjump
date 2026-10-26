@@ -292,3 +292,15 @@ Task 11c: DONE_WITH_CONCERNS 39f70d9 (249 pass; CI 40311638961 green) — DropDe
 Task 18 (from the Mac session): PC installed from phase2 875f8ee at 17:52Z.
 Open issue (user, 2026-10-26): with Roblox open on the PC (any size), clicks made on the Mac also register in Roblox; only Roblox does it; present since the phase 1 build. Not worked on in this session.
 Task 11c: its hands-on check is still to do with the user (smoke_catcher_logs_offer in ride mode with CJ_SMOKE_IMAGE=desc-noimage|nodesc|show, or the Task 18 PC→Mac drag: is a file icon or "+ Copy" left frozen at the PC's screen centre?).
+
+## Mac session additions (2026-10-26, end of day): Task 18 acceptance, part 1
+Task 18 Step 1: Mac installed from phase2 875f8ee at 17:50Z (startup sweep removed 1 old outgoing dir); PC at 17:52Z; connected on v3 at 17:51:44Z.
+Task 18 Step 2 (with the user; Mac log times UTC; details in docs/ACCEPTANCE.md "Phase 2 acceptance"):
+- PASS PC→Mac: single PDF to the Desktop (17:53:52Z, here in 15 ms); folder (17:57:49Z); 3 files in one drag (18:03:41Z); ✕ cancel of a Roblox .mp4 (18:06:45Z → Failed(Cancelled), nothing on the Desktop, no .cjpart; the incoming cache keeps a 0-byte placeholder + empty .fetch dirs until the 24 h sweep); go-home mid-drag (17:53:49Z, NotDropped).
+- PASS Mac→PC: single items (17:57:06Z, 17:57:16Z, 17:58:24Z, 18:04:21Z) and 3 files (18:03:48Z), all via the late path; user confirmed they landed.
+- FLAKY Mac→PC: 2 misses in 8 (17:54:01Z: the drag entered the strip 13 ms after the posted release, no perform, exited at +151 ms when the strip hid; 18:04:17Z: never reached the strip). No drag reached the strip before the release in any try, so R54's 8 pt pre-release catch never fired in real use. Hypothesis: the strip shows only within the 48 pt catch zone and is ordered front async; a fast PC-mouse sweep reaches the edge first. Fix before merge (candidates: show the strip whenever controlled with Left alone, or ahead of the push-out; check perform after a session that began after the up).
+- Latency all session: median 3.1–3.3 ms, 0 spikes >40 ms (5 GB copy check not run yet).
+- User reported WhatsApp/Gmail PC→Mac drops as working, but the installed app's log shows no PC→Mac drag in that round; re-check.
+- Not yet run: 5 GB + latency, Downloads window, Esc mid-drag, Wi-Fi drop, Mac sleep, Gmail held release, Discord (PC), drags out of WhatsApp/Discord/web page on the installed app, the gaming checks, and the hand checks (ghost image, R53 clone, R52 fallback name, PC Leave with Left down, 39f70d9 frozen icon).
+User request (polish backlog): a Mac drag that crossed to the PC can't come back to the Mac (PC edge is a wall while Riding::Incoming, by design). Wanted: the PC hands it back and the Mac starts a new drag of the same files under the cursor.
+Next: fix the Mac→PC misses (SDD), reinstall the Mac, re-check; finish the Task 18 list; delete the spike examples; HANDOFF Step 3; tests on both; final review (fable); merge.
