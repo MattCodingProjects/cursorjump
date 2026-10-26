@@ -1,5 +1,5 @@
 //! Drags arriving from the Mac: the user drags a file there, the cursor
-//! comes home with the button held, and cj-dnd runs a real `DoDragDrop`,
+//! comes home with the button held, and cj-dnd-in runs a real `DoDragDrop`,
 //! so the file drops into Explorer, WhatsApp, Gmail or Discord as a local one.
 //!
 //! - The press is already ours: the input hook let the real left-down
@@ -16,10 +16,12 @@
 //! - "After the drop" is from our `QueryContinueDrag` saying DROP. Our COM
 //!   objects are agile (windows-rs `#[implement]` aggregates the
 //!   free-threaded marshaler), so a target's cross-process `GetData`
-//!   arrives on a COM RPC thread, not on cj-dnd: the spike's logs show it,
-//!   and `smoke_incoming_drag_from_local_file` logs the thread of each ask.
-//!   The wait for the bytes happens there, while cj-dnd's loop, the
-//!   catcher and the shield go on. On cj-dnd itself it never waits.
+//!   arrives on a COM RPC thread, not on cj-dnd-in: the spike's logs show
+//!   it, and `smoke_incoming_drag_from_local_file` logs the thread of each
+//!   ask. The wait for the bytes happens there. On either of cj-dnd's
+//!   threads it never waits. A target's synchronous `Drop` (Explorer's)
+//!   still holds cj-dnd-in for the whole fetch, in an outgoing COM call
+//!   whose modal loop takes no posted messages: hence cj-dnd-out, apart.
 //! - `DoDragDrop` returns ~17 ms after the drop while the target's `GetData`
 //!   still waits (spike 5f): the data object lives as long as the target
 //!   holds it, and a target that asks only after `DoDragDrop` returned
@@ -27,8 +29,8 @@
 //!   placeholders with it, and later asks fail.
 //! - The wait can be escaped from this side: `CancelIncoming` and cj-dnd
 //!   stopping fail it (`E_FAIL`) within [`REPLY_POLL`]. Both are handled by
-//!   the command relay through [`Live`], not on cj-dnd, whose message loop
-//!   may be held in a target's synchronous `Drop` (Explorer's) all along.
+//!   the command relay through [`Live`], not on cj-dnd-in, whose message
+//!   loop may be held in a target's synchronous `Drop` all along.
 //! - Whatever is set on the data object (`IDragSourceHelper`'s image, a
 //!   target helper's flags) is kept and served back.
 //!
@@ -83,7 +85,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{BOOL, HRESULT, HSTRING, IUnknown, Interface, PWSTR, Ref, implement};
 
 use super::catcher::{Medium, formatetc, self_format};
-use super::{DndShared, Emit, WinDndEv, incoming_let_go, left_button_down};
+use super::inbound::incoming_let_go;
+use super::{DndShared, Emit, WinDndEv, left_button_down};
 use cj_core::dnd::FailReason;
 
 /// A placeholder that won't go (a scanner holding it open) is retried this
@@ -97,7 +100,8 @@ thread_local! {
     static DND_THREAD: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Marks the calling thread as cj-dnd: nothing here waits for bytes on it.
+/// Marks the calling thread as one of cj-dnd's: nothing here waits for
+/// bytes on it.
 pub(super) fn mark_dnd_thread() {
     DND_THREAD.with(|t| t.set(true));
 }
@@ -410,7 +414,7 @@ impl Incoming {
                 Phase::Dropped | Phase::Fetching if on_dnd => {
                     warn!(
                         drag = self.drag,
-                        "incoming: the bytes asked for on cj-dnd, which must not wait; refused"
+                        "incoming: the bytes asked for on a cj-dnd thread, which must not wait; refused"
                     );
                     return Err(E_FAIL);
                 }
@@ -466,7 +470,7 @@ impl Incoming {
         let mut paths = Vec::with_capacity(replies.len());
         let mut ok = true;
         for (item, rx) in replies.into_iter().enumerate() {
-            // A COM thread, never cj-dnd: waiting here is fine.
+            // A COM thread, never one of cj-dnd's: waiting here is fine.
             match self.await_reply(rx) {
                 Reply::Got(Ok(path)) => paths.push(path),
                 Reply::Got(Err(why)) => {
@@ -510,7 +514,7 @@ fn remove_placeholder(slot: &Slot, tries: u32) {
     }
 }
 
-/// The placeholders of `slots` and the folders made for them. On cj-dnd
+/// The placeholders of `slots` and the folders made for them. On cj-dnd-in
 /// (or with a create failing): one try each, no waiting.
 fn remove_all(base: &Path, slots: &[Slot]) {
     for s in slots {
@@ -876,7 +880,7 @@ impl IDataObject_Impl for DataObject_Impl {
 
 // ---------------------------------------------------------------- IDropSource
 
-/// Called on cj-dnd, from `DoDragDrop`'s modal loop.
+/// Called on cj-dnd-in, from `DoDragDrop`'s modal loop.
 #[implement(IDropSource)]
 struct DropSource {
     shared: Arc<DndShared>,
@@ -916,7 +920,7 @@ impl IDropSource_Impl for DropSource_Impl {
 
 // ---------------------------------------------------------------- the drag
 
-/// One `StartIncoming`, as cj-dnd runs it.
+/// One `StartIncoming`, as cj-dnd-in runs it.
 pub(super) struct Run {
     pub(super) drag: DragId,
     pub(super) items: Vec<DragItem>,
@@ -925,7 +929,7 @@ pub(super) struct Run {
     pub(super) events: Emit,
 }
 
-/// `DoDragDrop` for a drag from the Mac, on cj-dnd and outside its state
+/// `DoDragDrop` for a drag from the Mac, on cj-dnd-in and outside its state
 /// (the modal loop dispatches commands: `CancelIncoming`). `IncomingEnded`
 /// follows, whether it ran or not.
 pub(super) fn run_incoming(run: Run) {
@@ -964,7 +968,7 @@ pub(super) fn run_incoming(run: Run) {
     info!(drag, items = items.len(), "incoming: DoDragDrop");
     let started = Instant::now();
     let mut effect = DROPEFFECT_NONE;
-    // SAFETY: both objects are live; this is cj-dnd, an STA with OLE.
+    // SAFETY: both objects are live; this is cj-dnd-in, an STA with OLE.
     let hr = unsafe { DoDragDrop(&data, &source, DROPEFFECT_COPY, &mut effect) };
     let dropped = effect != DROPEFFECT_NONE;
     let took = started.elapsed();
@@ -1605,22 +1609,29 @@ mod tests {
         assert_eq!(cancel_live(&live, Some(20)), 0);
         assert_eq!(live_list(&live).len(), 2);
         let (cmd_tx, cmd_rx) = mpsc::channel();
-        let (relay_tx, relay_rx) = mpsc::channel();
+        let (out_tx, out_rx) = mpsc::channel();
+        let (in_tx, in_rx) = mpsc::channel();
+        // No windows: their wakes go nowhere.
+        let lane = |name, tx| super::super::Lane { name, tx, hwnd: 0 };
+        let (out, inc) = (lane("out", out_tx), lane("in", in_tx));
         let relay = {
             let live = live.clone();
-            // No window: its wakes just fail.
-            std::thread::spawn(move || super::super::relay(cmd_rx, relay_tx, 0, live))
+            let shared = Arc::new(DndShared::default());
+            std::thread::spawn(move || {
+                super::super::relay(cmd_rx, out, inc, shared, emitter().0, live)
+            })
         };
         cmd_tx
             .send(super::super::DndCmd::CancelIncoming { drag: 18 })
             .unwrap();
-        // Forwarded too, for cj-dnd to note.
+        // Forwarded too, to cj-dnd-in only, for it to note.
         assert!(matches!(
-            relay_rx.recv_timeout(WAIT),
+            in_rx.recv_timeout(WAIT),
             Ok(super::super::DndCmd::CancelIncoming { drag: 18 })
         ));
+        assert!(out_rx.try_recv().is_err());
         assert!(a.is_cancelled() && !b.is_cancelled());
-        // Every sender gone: cj-dnd stops, and every live drag is cancelled.
+        // Every sender gone: both threads stop, and every live drag is cancelled.
         drop(cmd_tx);
         relay.join().unwrap();
         assert!(b.is_cancelled());
@@ -1663,7 +1674,7 @@ mod tests {
     }
 
     /// A drop target in another STA whose `DragLeave` takes a while: a call
-    /// to it waits in COM's modal loop, as cj-dnd waits in Explorer's `Drop`.
+    /// to it waits in COM's modal loop, as cj-dnd-in waits in Explorer's `Drop`.
     #[implement(windows::Win32::System::Ole::IDropTarget, Agile = false)]
     struct SlowTarget;
 
@@ -1731,7 +1742,7 @@ mod tests {
     }
 
     /// Settles, without a person, what the hands-on smoke's PROBE checks for
-    /// real: while an STA thread (cj-dnd) waits in an outgoing COM call (a
+    /// real: while an STA thread (cj-dnd-in) waits in an outgoing COM call (a
     /// target's synchronous `Drop`), does COM's modal loop dispatch a
     /// `WM_APP` posted to one of its windows (our commands), or `WM_TIMER`
     /// (our stuck and keep checks)? The call here is cross-apartment in one
@@ -1778,7 +1789,7 @@ mod tests {
             CoUninitialize();
         });
         let (raw, callee_tid) = rx.recv().unwrap();
-        // The caller's STA, like cj-dnd: a window, a timer, a posted WM_APP.
+        // The caller's STA, like cj-dnd-in: a window, a timer, a posted WM_APP.
         let (during, call_ms, ticks_during, app_ms) = std::thread::spawn(move || unsafe {
             CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok().unwrap();
             let hinst = GetModuleHandleW(None).unwrap().into();
@@ -1910,12 +1921,12 @@ mod tests {
         path
     }
 
-    /// I2, for real: 2 s into a long fetch, a cheap command (`Shield(true)`)
-    /// goes through the real `WM_APP` path, and the shield showing says
-    /// cj-dnd took it. Decisive with Explorer, whose synchronous `Drop`
-    /// holds cj-dnd in an outgoing COM call (and `DoDragDrop` running)
-    /// for the whole fetch; with Chromium targets `DoDragDrop` has returned
-    /// by then.
+    /// R39, for real: 2 s into a long fetch, `CatcherZone(true)` (for
+    /// cj-dnd-out) and `Shield(true)` (for cj-dnd-in) go through the real
+    /// relay and `WM_APP` path; each window showing says its thread took
+    /// it. Decisive with Explorer, whose synchronous `Drop` holds cj-dnd-in
+    /// in an outgoing COM call (with `DoDragDrop` running) for the whole
+    /// fetch; with Chromium targets `DoDragDrop` has returned by then.
     fn probe_commands(
         drag: DragId,
         cmds: &mpsc::Sender<super::super::DndCmd>,
@@ -1923,41 +1934,49 @@ mod tests {
         ended: &Mutex<HashSet<DragId>>,
         fetch_for: Duration,
     ) {
+        use super::super::DndCmd;
         use windows::Win32::Foundation::HWND;
         use windows::Win32::UI::WindowsAndMessaging::IsWindowVisible;
+        let shown = |h: isize| {
+            // SAFETY: plain FFI call on a window handle.
+            unsafe { IsWindowVisible(HWND(h as *mut _)) }.as_bool()
+        };
+        let wait = |h: isize, within: Duration| {
+            let started = Instant::now();
+            while !shown(h) && started.elapsed() < within {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            shown(h).then(|| started.elapsed())
+        };
         std::thread::sleep(Duration::from_secs(2));
         let returned = || ended.lock().unwrap().contains(&drag);
-        let running_at_send = !returned();
-        let hwnd = HWND(shared.shield.load(Ordering::Acquire) as *mut _);
-        // SAFETY: plain FFI call on a window handle.
-        let shown = || unsafe { IsWindowVisible(hwnd) }.as_bool();
-        if shown() {
-            eprintln!("smoke: PROBE {drag}: the shield is already shown; no answer");
-            return;
-        }
-        let sent = Instant::now();
-        let _ = cmds.send(super::super::DndCmd::Shield(true));
-        while !shown() && sent.elapsed() < fetch_for + Duration::from_secs(10) {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        let (took, applied, running_at_apply) = (sent.elapsed(), shown(), !returned());
-        let verdict = match (running_at_send, applied, running_at_apply) {
-            (false, _, _) => "INCONCLUSIVE: DoDragDrop had already returned (a Chromium target?)",
-            (true, true, true) => "commands DO drain while the target's Drop holds cj-dnd",
-            (true, true, false) => {
-                "commands do NOT drain while the target's Drop holds cj-dnd:                  applied only once DoDragDrop returned"
+        let running = !returned();
+        let catcher = shared.catcher.load(Ordering::Acquire);
+        let shield = shared.shield.load(Ordering::Acquire);
+        let _ = cmds.send(DndCmd::CatcherZone(true));
+        let _ = cmds.send(DndCmd::Shield(true));
+        let out = wait(catcher, Duration::from_secs(2));
+        let out_while_running = out.is_some() && !returned();
+        let verdict = match (running, out_while_running) {
+            (false, _) => "INCONCLUSIVE: DoDragDrop had already returned (a Chromium target?)",
+            (true, true) => {
+                "R39 HOLDS: cj-dnd-out takes commands while the target's Drop holds cj-dnd-in"
             }
-            (true, false, _) => "commands do NOT drain: never applied",
+            (true, false) => "R39 BROKEN: cj-dnd-out did not take its command within 2 s",
         };
         eprintln!(
-            "smoke: PROBE {drag}: Shield(true) sent with DoDragDrop {}; applied {applied}              after {took:?} => {verdict}",
-            if running_at_send {
-                "RUNNING"
-            } else {
-                "returned"
-            }
+            "smoke: PROBE {drag}: with DoDragDrop {}, cj-dnd-out applied CatcherZone(true) \
+             after {out:?} => {verdict}",
+            if running { "RUNNING" } else { "returned" }
         );
-        let _ = cmds.send(super::super::DndCmd::Shield(false));
+        let inc = wait(shield, fetch_for + Duration::from_secs(10));
+        eprintln!(
+            "smoke: PROBE {drag}: cj-dnd-in applied Shield(true) after {inc:?}, DoDragDrop \
+             then {} (expected: only once it returned)",
+            if returned() { "returned" } else { "RUNNING" }
+        );
+        let _ = cmds.send(DndCmd::CatcherZone(false));
+        let _ = cmds.send(DndCmd::Shield(false));
     }
 
     /// cj-dnd alone (the app isn't running) with a session marked up: drags
@@ -1972,9 +1991,9 @@ mod tests {
     /// shield comes back for the next drag.
     ///
     /// - `CJ_SMOKE_FETCH_SECS` (default 5): how long each fetch takes; try
-    ///   60 to see targets survive a long wait. From 10 s up, a "PROBE" line
-    ///   says whether cj-dnd still takes commands while the target holds
-    ///   it: drop into an Explorer folder for the answer.
+    ///   60 to see targets survive a long wait. From 10 s up, "PROBE" lines
+    ///   say whether cj-dnd-out still takes commands while the target holds
+    ///   cj-dnd-in (R39): drop into an Explorer folder for the answer.
     /// - `CJ_SMOKE_MODE`: unset; `shield-first` (the shield's hide is sent
     ///   before `StartIncoming`, as the input thread may); `cancel`
     ///   (`CancelIncoming` 2 s in: the drag must end with no drop, even
@@ -1982,7 +2001,7 @@ mod tests {
     /// - `CJ_SMOKE_SECS` (default 180): how long it runs.
     ///
     /// Watch the log: each "GetData(CF_HDROP)" line names its thread; after
-    /// the drop it must not be cj-dnd (`on_dnd=false`).
+    /// the drop it must not be cj-dnd-in (`on_dnd=false`).
     #[test]
     #[ignore = "needs a person to drag files"]
     fn smoke_incoming_drag_from_local_file() {

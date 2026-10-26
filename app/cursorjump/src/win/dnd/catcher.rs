@@ -37,7 +37,7 @@ use windows::Win32::UI::Shell::{
 };
 use windows::core::{HSTRING, Ref, implement};
 
-use super::{State, WinDndEv, with_state};
+use super::{OutState, WinDndEv, with_out};
 use crate::common::dnd_link::Source;
 
 /// How near the Mac edge (physical px) a held left button shows the strip.
@@ -631,14 +631,17 @@ fn read_link(data: &IDataObject, lindex: u32) -> Option<String> {
 
 // ---------------------------------------------------------------- IDropTarget
 
-/// Every call arrives on the cj-dnd thread; the decisions are `State`'s.
+/// Every call arrives on cj-dnd-out; the decisions are `OutState`'s. A
+/// call on another thread (our own drag from the Mac, should OLE call this
+/// agile object on cj-dnd-in) finds no state there and is refused, as our
+/// own drags are anyway.
 #[implement(IDropTarget)]
 pub(super) struct Target {
     pub(super) hwnd: HWND,
 }
 
 fn helper() -> Option<IDropTargetHelper> {
-    with_state(|s| s.helper.clone()).flatten()
+    with_out(|s| s.helper.clone()).flatten()
 }
 
 impl IDropTarget_Impl for Target_Impl {
@@ -654,7 +657,7 @@ impl IDropTarget_Impl for Target_Impl {
         let data = pdataobj.ok().ok();
         // Read before taking the state: GetData may pump messages.
         let offered = data.and_then(read_offer);
-        let effect = with_state(|s| s.enter(offered, allowed)).unwrap_or(DROPEFFECT_NONE);
+        let effect = with_out(|s| s.enter(offered, allowed)).unwrap_or(DROPEFFECT_NONE);
         // SAFETY: as above.
         unsafe { *pdweffect = effect };
         if let (Some(h), Some(data)) = (helper(), data) {
@@ -672,7 +675,7 @@ impl IDropTarget_Impl for Target_Impl {
     ) -> windows::core::Result<()> {
         // SAFETY: OLE passes a valid in/out effect pointer.
         let allowed = unsafe { *pdweffect };
-        let effect = with_state(|s| s.over(allowed)).unwrap_or(DROPEFFECT_NONE);
+        let effect = with_out(|s| s.over(allowed)).unwrap_or(DROPEFFECT_NONE);
         // SAFETY: as above.
         unsafe { *pdweffect = effect };
         if let Some(h) = helper() {
@@ -687,7 +690,7 @@ impl IDropTarget_Impl for Target_Impl {
             // SAFETY: plain helper call.
             let _ = unsafe { h.DragLeave() };
         }
-        with_state(State::leave);
+        with_out(OutState::leave);
         Ok(())
     }
 
@@ -699,7 +702,7 @@ impl IDropTarget_Impl for Target_Impl {
         pdweffect: *mut DROPEFFECT,
     ) -> windows::core::Result<()> {
         let data = pdataobj.ok().ok();
-        let takes = with_state(|s| s.modes.takes_drop()).unwrap_or(false);
+        let takes = with_out(|s| s.modes.takes_drop()).unwrap_or(false);
         let effect = if takes {
             DROPEFFECT_COPY
         } else {
@@ -711,7 +714,7 @@ impl IDropTarget_Impl for Target_Impl {
             // SAFETY: plain helper call with the live data object.
             let _ = unsafe { h.Drop(data, &POINT { x: pt.x, y: pt.y }, effect) };
         }
-        let taken = with_state(State::take_drop).flatten();
+        let taken = with_out(OutState::take_drop).flatten();
         let effect = taken.as_ref().map_or(DROPEFFECT_NONE, |_| DROPEFFECT_COPY);
         if let Some((drag, pending)) = taken {
             // The catcher is already off the screen. Outside the state: the
@@ -723,7 +726,7 @@ impl IDropTarget_Impl for Target_Impl {
                     .into_iter()
                     .for_each(|p| p.resolve(Err(FailReason::Cancelled))),
             }
-            with_state(|s| s.emit(WinDndEv::Spooled { drag }));
+            with_out(|s| s.emit(WinDndEv::Spooled { drag }));
         }
         // Never MOVE: the source keeps its files.
         // SAFETY: OLE passes a valid in/out effect pointer.

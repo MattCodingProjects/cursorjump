@@ -2,29 +2,36 @@
 //! the shield that lets drags from the Mac start with the button down, and
 //! those drags themselves (`source`).
 //!
-//! One thread ("cj-dnd", OLE initialised: an STA) owns two of CursorJump's
-//! own windows, both of class `CursorJumpCatcher`: topmost, never activated,
-//! layered at alpha 1 (invisible but hit-testable). No hooks, nothing drawn
-//! into other processes, nothing injected.
-//! - The catcher, registered with `RegisterDragDrop`, is hidden, or a 2 px
-//!   strip along the Mac edge while the left button is held near it
-//!   (`CatcherZone`), or the whole virtual screen while the PC's drag rides
-//!   on the Mac (`Park`), so that the user's real release, which the input
-//!   hook then lets through, lands on it and ends the drag with `Drop`.
-//! - The shield is 64×64 logical px around the park point while the cursor
-//!   is on the Mac and nothing rides (a riding catcher already covers the
-//!   park point, and the shield above it would take the drag off it). The
-//!   input hook lets a real left press through only while one of these
-//!   windows lies under the park point ([`DndShared::under_park_is_ours`]),
-//!   so the press goes to a cj-dnd window while the button is physically
-//!   down: what `DoDragDrop` on this thread needs (it takes the capture
-//!   itself) for a drag from the Mac. The shield ignores the clicks it gets.
-//!   So `Shield(false)` keeps a shown shield while such a drag is starting
+//! Two STA threads (OLE initialised on each) own CursorJump's own windows,
+//! all of class `CursorJumpCatcher`: topmost, never activated, layered at
+//! alpha 1 (invisible but hit-testable). No hooks, nothing drawn into other
+//! processes, nothing injected.
+//! - "cj-dnd-out" owns the catcher. Registered with `RegisterDragDrop`, it
+//!   is hidden, or a 2 px strip along the Mac edge while the left button is
+//!   held near it (`CatcherZone`), or the whole virtual screen while the
+//!   PC's drag rides on the Mac (`Park`), so that the user's real release,
+//!   which the input hook then lets through, lands on it and ends the drag
+//!   with `Drop`, where it spools virtual files.
+//! - "cj-dnd-in" (`inbound`) owns the shield, 64×64 logical px around the
+//!   park point while the cursor is on the Mac and nothing rides (a riding
+//!   catcher already covers the park point, and the shield above it would
+//!   take the drag off it). The input hook lets a real left press through
+//!   only while one of these windows lies under the park point
+//!   ([`DndShared::under_park_is_ours`]), so the press goes to a window of
+//!   ours while the button is physically down: what `DoDragDrop` needs (it
+//!   takes the capture itself) for a drag from the Mac, and why it runs on
+//!   the shield's thread. The shield ignores the clicks it gets. So
+//!   `Shield(false)` keeps a shown shield while such a drag is starting
 //!   (until its first `QueryContinueDrag`: OLE holds its own capture from
 //!   then on), or (the button held) may yet start: the app's
 //!   `StartIncoming` and the input thread's hide come in either order.
-//! - A drag from the Mac (`StartIncoming`) runs `DoDragDrop` on this thread,
-//!   outside its state, from the command drain; see `source`.
+//!
+//! Why two threads (R39): while an STA thread waits in an outgoing COM call
+//! (a target's synchronous `Drop` reading the bytes, or the catcher reading
+//! FILECONTENTS in its own `Drop`), COM's modal loop dispatches none of its
+//! posted messages or timers (`probe_posted_messages_during_an_outgoing_com_call`).
+//! That can last minutes. Apart, a long Explorer drop from the Mac doesn't
+//! hold up the catcher, nor a spool the shield.
 //!
 //! Neither window shows while a game holds the mouse: the strip needs the
 //! input thread's game check, and the shield needs the cursor on the Mac,
@@ -32,14 +39,18 @@
 //! covering the edge monitor. Neither shows without a session
 //! ([`DndShared::session_up`]).
 //!
-//! Commands are relayed by "cj-dnd-cmd", which posts `WM_APP` to the
-//! catcher window. Modal loops (COM calls, `DoDragDrop`) dispatch window
-//! messages, so commands keep flowing inside them; they are also drained
-//! after every message the main loop dispatches.
+//! Commands go through one `Sender` to "cj-dnd-cmd", which routes each to
+//! its thread ([`route`]) and posts `WM_APP` to that thread's window.
+//! `DoDragDrop`'s own modal loop dispatches window messages, so commands
+//! keep flowing inside it; they are also drained after every message a
+//! thread's main loop dispatches. The relay itself acts on `CancelIncoming`
+//! and refuses a `StartIncoming` while a drag from the Mac runs, since
+//! cj-dnd-in may be held in a target's `Drop` and see neither for minutes.
 mod catcher;
+mod inbound;
 mod source;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
@@ -72,19 +83,18 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, HWND_TOPMOST,
     IDC_ARROW, KillTimer, LWA_ALPHA, LoadCursorW, MA_NOACTIVATE, MSG, PostMessageW,
     PostQuitMessage, RegisterClassExW, SW_HIDE, SWP_NOACTIVATE, SWP_SHOWWINDOW,
-    SetLayeredWindowAttributes, SetTimer, SetWindowPos, ShowWindow, WM_APP, WM_DISPLAYCHANGE,
-    WM_DPICHANGED, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK,
-    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_NULL, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN,
-    WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WM_XBUTTONDBLCLK, WM_XBUTTONDOWN, WM_XBUTTONUP,
-    WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
-    WindowFromPoint,
+    SetLayeredWindowAttributes, SetTimer, SetWindowPos, ShowWindow, ShowWindowAsync, WM_APP,
+    WM_DISPLAYCHANGE, WM_DPICHANGED, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_NULL, WM_RBUTTONDBLCLK,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WM_XBUTTONDBLCLK, WM_XBUTTONDOWN,
+    WM_XBUTTONUP, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_POPUP, WindowFromPoint,
 };
 use windows::core::{PCWSTR, w};
 
 pub use catcher::in_catch_zone;
 use catcher::{Offered, Pending, Target, into_offer, strip_rect};
 
-use super::input_thread::rect_center;
 use super::monitors::{edge_monitor, monitors};
 use super::probe::virtual_screen;
 use crate::common::dnd_link::Source;
@@ -100,12 +110,11 @@ const STUCK_POLL: Duration = Duration::from_millis(250);
 const STUCK_AFTER: Duration = Duration::from_millis(500);
 /// The catcher's timer id for the stuck check.
 const STUCK_TIMER: usize = 1;
-/// The catcher's timer id, and period, for a kept shield's check.
+/// The shield's timer id for a kept shield's check.
 const KEEP_TIMER: usize = 2;
-const KEEP_POLL: Duration = Duration::from_millis(50);
-/// Longest a kept shield waits for a `StartIncoming` with none running.
-const KEEP_LIMIT: Duration = Duration::from_secs(1);
-/// The relay's last wake (the one that stops the thread) is retried this
+/// Posted to the shield by cj-dnd-out: the catcher's park changed.
+const WM_PARKED: u32 = WM_APP + 1;
+/// The relay's last wake (the one that stops a thread) is retried this
 /// often, for up to `LAST_WAKE_LIMIT`.
 const LAST_WAKE_STEP: Duration = Duration::from_millis(10);
 const LAST_WAKE_LIMIT: Duration = Duration::from_secs(1);
@@ -138,17 +147,41 @@ pub enum DndCmd {
     /// The Mac edge may have moved.
     ApplyConfig(Config),
     /// A drag from the Mac came home with the button held: `DoDragDrop`
-    /// on cj-dnd for `items`, whose bytes are fetched only once a target
-    /// takes the drop. `IncomingEnded` follows, whether it ran or not.
+    /// on cj-dnd-in for `items`, whose bytes are fetched only once a target
+    /// takes the drop. `IncomingEnded` follows, whether it ran or not: at
+    /// once, from the relay, while another drag from the Mac runs (cj-dnd-in
+    /// may be held in its target's `Drop` for minutes).
     StartIncoming { drag: DragId, items: Vec<DragItem> },
     /// The drag from the Mac is cancelled: its `DoDragDrop` ends without a
     /// drop, and a target's wait for its bytes after the drop fails
     /// (`E_FAIL`) within `source::REPLY_POLL`, as it does when cj-dnd
     /// stops. Handled by the command relay, so it works even while a
-    /// target's `Drop` holds cj-dnd. The app should still fail its
+    /// target's `Drop` holds cj-dnd-in. The app should still fail its
     /// outstanding `Fetch` replies with `Err(Cancelled)`: that is the
     /// cancel's main path once the drop has happened.
     CancelIncoming { drag: DragId },
+}
+
+/// Which thread a command is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Route {
+    Out,
+    In,
+    Both,
+}
+
+/// cj-dnd-out takes the catcher's commands, cj-dnd-in the shield's and the
+/// drags from the Mac; both follow the config.
+fn route(cmd: &DndCmd) -> Route {
+    match cmd {
+        DndCmd::CatcherZone(_) | DndCmd::Park(_) | DndCmd::Cancel { .. } | DndCmd::Home { .. } => {
+            Route::Out
+        }
+        DndCmd::Shield(_) | DndCmd::StartIncoming { .. } | DndCmd::CancelIncoming { .. } => {
+            Route::In
+        }
+        DndCmd::ApplyConfig(_) => Route::Both,
+    }
 }
 
 /// One step of the input thread's crossing to the Mac, as far as cj-dnd
@@ -224,17 +257,17 @@ pub enum WinDndEv {
     IncomingEnded { drag: DragId, dropped: bool },
 }
 
-/// Shared between cj-dnd, the input thread and the app.
+/// Shared between cj-dnd's threads, the input thread and the app.
 #[derive(Debug, Default)]
 pub struct DndShared {
     /// The drag the catcher holds; 0 = none.
     pub offer: AtomicU64,
     /// The physical left button, from Raw Input.
     pub left_down: AtomicBool,
-    /// `WindowFromPoint(park point)` is the shield or the catcher, and no
-    /// foreground window covers the edge monitor. Kept by the input thread
-    /// while on the Mac (after parking, every 50 ms and on display
-    /// changes), so the hook never asks Windows itself.
+    /// `WindowFromPoint(park point)` is the shield or the catcher (either
+    /// thread's window), and no foreground window covers the edge monitor.
+    /// Kept by the input thread while on the Mac (after parking, every
+    /// 50 ms and on display changes), so the hook never asks Windows itself.
     pub under_park_is_ours: AtomicBool,
     /// The catcher covers the virtual screen.
     pub parked: AtomicBool,
@@ -242,8 +275,12 @@ pub struct DndShared {
     /// offer, no shield and no park. The app (Task 13) sets it on link up,
     /// before any crossing, and clears it on link down.
     pub session_up: AtomicBool,
+    /// cj-dnd-out's window.
     catcher: AtomicIsize,
+    /// cj-dnd-in's window.
     shield: AtomicIsize,
+    /// The drag from the Mac whose `DoDragDrop` runs on cj-dnd-in; 0 = none.
+    incoming: AtomicU64,
 }
 
 impl DndShared {
@@ -271,13 +308,13 @@ pub struct DndPort {
 impl DndPort {
     pub fn send(&self, cmd: DndCmd) {
         if self.cmds.send(cmd).is_err() {
-            debug!("dnd thread gone; command dropped");
+            debug!("dnd threads gone; command dropped");
         }
     }
 }
 
-/// The app's event handler. cj-dnd calls it, and so do the COM threads
-/// serving a drop target's `GetData` (`Fetch`).
+/// The app's event handler. cj-dnd's threads and its relay call it, and so
+/// do the COM threads serving a drop target's `GetData` (`Fetch`).
 #[derive(Clone)]
 struct Emit(Arc<Mutex<Handler>>);
 
@@ -296,93 +333,191 @@ impl Emit {
     }
 }
 
-/// Start cj-dnd. Dropping every `Sender` stops it and closes its windows.
+/// A thread of cj-dnd as the relay sees it.
+struct Lane {
+    name: &'static str,
+    tx: mpsc::Sender<DndCmd>,
+    /// The window its `WM_APP` goes to.
+    hwnd: isize,
+}
+
+impl Lane {
+    fn send(&self, cmd: DndCmd) -> bool {
+        if self.tx.send(cmd).is_err() {
+            return false; // The thread is gone.
+        }
+        if let Err(e) = wake(self.hwnd) {
+            // The next wake, or the next message, drains it.
+            warn!("{}: wake failed: {e}", self.name);
+        }
+        true
+    }
+
+    /// Drops its sender and wakes it, so the thread sees it and stops.
+    fn stop(self) {
+        drop(self.tx);
+        last_wake(self.name, self.hwnd);
+    }
+}
+
+/// Start cj-dnd: cj-dnd-out, cj-dnd-in and the relay between them. The one
+/// `Sender` takes every command; dropping every clone of it stops both
+/// threads (cancelling any drag from the Mac still served) and closes
+/// their windows.
 ///
-/// `events` runs on cj-dnd, inside OLE's calls, and (for `Fetch`) on the
-/// COM thread serving a drop target: it must not block (the drag source
-/// waits on it) and must not hold a clone of the returned `Sender` (the
-/// thread would then never stop). A panic in it is caught and logged.
+/// `events` runs on either thread inside OLE's calls, on the relay, and
+/// (for `Fetch`) on the COM thread serving a drop target: it must not block
+/// (a drag source or target waits on it) and must not hold a clone of the
+/// returned `Sender` (the threads would then never stop). A panic in it is
+/// caught and logged.
 pub fn spawn_dnd_thread(
     cfg: Config,
     shared: Arc<DndShared>,
     events: impl Fn(WinDndEv) + Send + 'static,
 ) -> Result<mpsc::Sender<DndCmd>> {
-    let (cmd_tx, cmd_rx) = mpsc::channel::<DndCmd>();
-    let (relay_tx, relay_rx) = mpsc::channel::<DndCmd>();
+    let events = Emit::new(Box::new(events));
     let live = source::Live::default();
-    let live_relay = live.clone();
-    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<isize>>(1);
-    std::thread::Builder::new()
-        .name("cj-dnd".into())
-        .spawn(move || {
-            let events = Emit::new(Box::new(events));
-            run(cfg, shared, events, live, relay_rx, ready_tx)
+    let out = {
+        let (cfg, shared, events) = (cfg.clone(), shared.clone(), events.clone());
+        spawn_lane("cj-dnd-out", Role::Out, move || {
+            let state = OutState::new(cfg, shared, events)?;
+            let hwnd = state.catcher.hwnd.0 as isize;
+            OUT.with(|cell| *cell.borrow_mut() = Some(state));
+            Ok(hwnd)
+        })?
+    };
+    let inc = {
+        let (shared, events, live) = (shared.clone(), events.clone(), live.clone());
+        spawn_lane("cj-dnd-in", Role::In, move || {
+            inbound::start(cfg, shared, events, live)
         })
-        .context("spawn dnd thread")?;
-    // The thread reports its catcher window once it exists.
-    let catcher = ready_rx.recv().context("dnd thread exited at start")??;
-    std::thread::Builder::new()
-        .name("cj-dnd-cmd".into())
-        .spawn(move || relay(cmd_rx, relay_tx, catcher, live_relay))
-        .inspect_err(|_| {
-            // The relay's sender is gone: let the thread see it and stop.
-            last_wake(catcher);
-        })
-        .context("spawn dnd command relay")?;
+    };
+    let inc = match inc {
+        Ok(inc) => inc,
+        Err(e) => {
+            out.stop();
+            return Err(e);
+        }
+    };
+    let (cmd_tx, cmd_rx) = mpsc::channel::<DndCmd>();
+    let lanes = Arc::new(Mutex::new(Some((out, inc))));
+    let spawned = {
+        let lanes = lanes.clone();
+        std::thread::Builder::new()
+            .name("cj-dnd-cmd".into())
+            .spawn(move || {
+                if let Some((out, inc)) =
+                    lanes.lock().unwrap_or_else(PoisonError::into_inner).take()
+                {
+                    relay(cmd_rx, out, inc, shared, events, live);
+                }
+            })
+    };
+    if let Err(e) = spawned {
+        // Not started: its lanes are still here to stop.
+        if let Some((out, inc)) = lanes.lock().unwrap_or_else(PoisonError::into_inner).take() {
+            out.stop();
+            inc.stop();
+        }
+        return Err(anyhow!(e).context("spawn dnd command relay"));
+    }
     Ok(cmd_tx)
 }
 
-/// Forwards commands and wakes cj-dnd; once every sender is gone, drops its
-/// own so the thread stops. A `CancelIncoming` (and the end, for every live
-/// drag from the Mac) is acted on here as well: cj-dnd may be held in a
-/// target's `Drop`, where its loop takes no `WM_APP`.
+/// Spawns one of cj-dnd's threads and waits for its window.
+fn spawn_lane(
+    name: &'static str,
+    role: Role,
+    start: impl FnOnce() -> Result<isize> + Send + 'static,
+) -> Result<Lane> {
+    let (tx, rx) = mpsc::channel::<DndCmd>();
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<isize>>(1);
+    std::thread::Builder::new()
+        .name(name.into())
+        .spawn(move || run(name, role, rx, ready_tx, start))
+        .with_context(|| format!("spawn {name}"))?;
+    let hwnd = ready_rx
+        .recv()
+        .with_context(|| format!("{name} exited at start"))??;
+    Ok(Lane { name, tx, hwnd })
+}
+
+/// Routes commands to their threads and wakes them; once every sender is
+/// gone, stops both. It acts on two commands itself, since cj-dnd-in may be
+/// held in a target's `Drop`, where its loop takes no `WM_APP`:
+/// `CancelIncoming` (and the end, for every live drag from the Mac), and a
+/// `StartIncoming` while another drag from the Mac runs, refused at once.
 fn relay(
     from: mpsc::Receiver<DndCmd>,
-    to: mpsc::Sender<DndCmd>,
-    catcher: isize,
+    out: Lane,
+    inc: Lane,
+    shared: Arc<DndShared>,
+    events: Emit,
     live: source::Live,
 ) {
     for cmd in from {
-        if let DndCmd::CancelIncoming { drag } = cmd {
-            let reached = source::cancel_live(&live, Some(drag));
-            debug!(drag, reached, "dnd relay: CancelIncoming");
-            // OLE asks QueryContinueDrag after each message its loop takes:
-            // one more, now the flag is set, so a still mouse can't hold
-            // the drag off.
-            // SAFETY: plain FFI call; a window that is gone just makes it fail.
-            let _ = unsafe {
-                PostMessageW(Some(HWND(catcher as *mut _)), WM_NULL, WPARAM(0), LPARAM(0))
-            };
+        match &cmd {
+            DndCmd::CancelIncoming { drag } => {
+                let reached = source::cancel_live(&live, Some(*drag));
+                debug!(drag, reached, "dnd relay: CancelIncoming");
+                // OLE asks QueryContinueDrag after each message its loop
+                // takes: one more, now the flag is set, so a still mouse
+                // can't hold the drag off.
+                // SAFETY: plain FFI call; a window that is gone just makes it fail.
+                let _ = unsafe {
+                    PostMessageW(
+                        Some(HWND(inc.hwnd as *mut _)),
+                        WM_NULL,
+                        WPARAM(0),
+                        LPARAM(0),
+                    )
+                };
+            }
+            DndCmd::StartIncoming { drag, .. } => {
+                let running = shared.incoming.load(Ordering::Acquire);
+                if running != 0 {
+                    warn!(
+                        drag,
+                        running, "dnd relay: a drag from the Mac runs; StartIncoming refused"
+                    );
+                    events.send(WinDndEv::IncomingEnded {
+                        drag: *drag,
+                        dropped: false,
+                    });
+                    continue;
+                }
+            }
+            _ => {}
         }
-        if to.send(cmd).is_err() {
-            return; // The dnd thread is gone.
-        }
-        if let Err(e) = wake(catcher) {
-            // The next wake, or the next message, drains it.
-            warn!("dnd thread wake failed: {e}");
+        let sent = match route(&cmd) {
+            Route::Out => out.send(cmd),
+            Route::In => inc.send(cmd),
+            Route::Both => out.send(cmd.clone()) & inc.send(cmd),
+        };
+        if !sent {
+            debug!("dnd relay: a thread is gone; command dropped");
         }
     }
     source::cancel_live(&live, None);
-    drop(to);
-    last_wake(catcher);
+    out.stop();
+    inc.stop();
 }
 
-fn wake(catcher: isize) -> windows::core::Result<()> {
-    let hwnd = HWND(catcher as *mut _);
+fn wake(hwnd: isize) -> windows::core::Result<()> {
     // SAFETY: plain FFI call; a window that is gone just makes it fail.
-    unsafe { PostMessageW(Some(hwnd), WM_APP, WPARAM(0), LPARAM(0)) }
+    unsafe { PostMessageW(Some(HWND(hwnd as *mut _)), WM_APP, WPARAM(0), LPARAM(0)) }
 }
 
-/// The wake that lets the thread see the relay is gone: retried, so the
+/// The wake that lets a thread see the relay is gone: retried, so the
 /// thread never waits for a message that isn't coming.
-fn last_wake(catcher: isize) {
+fn last_wake(name: &str, hwnd: isize) {
     let started = Instant::now();
-    while let Err(e) = wake(catcher) {
+    while let Err(e) = wake(hwnd) {
         if e.code() == ERROR_INVALID_WINDOW_HANDLE.to_hresult() {
             return; // The thread has already gone.
         }
         if started.elapsed() >= LAST_WAKE_LIMIT {
-            error!("dnd thread: last wake failed for {LAST_WAKE_LIMIT:?}: {e}");
+            error!("{name}: last wake failed for {LAST_WAKE_LIMIT:?}: {e}");
             return;
         }
         std::thread::sleep(LAST_WAKE_STEP);
@@ -414,10 +549,9 @@ fn scale_at((x, y): (i32, i32)) -> f32 {
     }
 }
 
-/// The drop source of `drag` said DROP or CANCEL (called on cj-dnd from
-/// `DoDragDrop`'s loop, outside the state).
-fn incoming_let_go(drag: DragId) {
-    with_state(|s| s.incoming_let_go(drag));
+/// The monitor on the Mac's side.
+fn edge_of(side: Side) -> Option<Rect> {
+    edge_monitor(&monitors(), side)
 }
 
 fn left_button_down() -> bool {
@@ -443,12 +577,6 @@ enum CatcherAt {
     Screen,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Placement {
-    catcher: CatcherAt,
-    shield: bool,
-}
-
 /// An offer the modes let go of.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Released {
@@ -457,43 +585,25 @@ struct Released {
     tell: bool,
 }
 
-/// The catcher's modes and the drag it holds, apart from the windows and
-/// the data (pure, so it can be tested).
+/// The catcher's modes and the drag it holds, apart from the window and the
+/// data (pure, so it can be tested).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-struct Modes {
+struct OutModes {
     zone: bool,
     parked: bool,
     /// While parked: refuse the drop (after `Cancel`).
     reject: bool,
-    shield_on: bool,
     offer: Option<DragId>,
-    /// The drag from the Mac that `DoDragDrop` is starting or running.
-    incoming: Option<DragId>,
-    /// ... and its `DoDragDrop` has not called `QueryContinueDrag` yet.
-    starting: bool,
-    /// A `Shield(false)` not applied yet: the press the shield got is what
-    /// `DoDragDrop` needs, so the shield stays until the incoming drag has
-    /// started (or, with none started, until Windows sees the button up).
-    shield_kept: bool,
-    /// Windows sees the left button down (`GetAsyncKeyState`), as of the
-    /// last command or poll.
-    held: bool,
 }
 
-impl Modes {
-    fn placement(&self) -> Placement {
-        let catcher = if self.parked {
+impl OutModes {
+    fn catcher_at(&self) -> CatcherAt {
+        if self.parked {
             CatcherAt::Screen
         } else if self.zone {
             CatcherAt::Strip
         } else {
             CatcherAt::Hidden
-        };
-        Placement {
-            catcher,
-            // A riding catcher covers the park point: the shield above it
-            // would take the drag off the drop target.
-            shield: (self.shield_on || self.shield_kept) && !self.parked,
         }
     }
 
@@ -511,10 +621,11 @@ impl Modes {
         self.offer.take().map(|drag| Released { drag, tell })
     }
 
+    /// The catcher's commands, as routed here; anything else is cj-dnd-in's.
     fn command(&mut self, cmd: &DndCmd, session_up: bool) -> Option<Released> {
         match *cmd {
             DndCmd::CatcherZone(on) => self.zone = on,
-            DndCmd::Park(true) | DndCmd::Shield(true) if !session_up => {
+            DndCmd::Park(true) if !session_up => {
                 debug!(?cmd, "dnd: refused without a session");
             }
             DndCmd::Park(true) => {
@@ -522,23 +633,6 @@ impl Modes {
                 self.reject = false;
             }
             DndCmd::Park(false) => self.unpark(),
-            DndCmd::Shield(true) => {
-                self.shield_on = true;
-                // Back on the Mac: a hide still waiting is moot.
-                self.shield_kept = false;
-            }
-            DndCmd::Shield(false) => {
-                // The app's StartIncoming and the input thread's hide come
-                // in either order: keep a shown shield while a drag from
-                // the Mac is starting, or may yet start.
-                let may_start = self.incoming.is_none() && self.held;
-                self.shield_kept |= self.placement().shield && (self.starting || may_start);
-                self.shield_on = false;
-                if self.shield_kept {
-                    debug!(incoming = ?self.incoming, "dnd: shield kept for the press");
-                }
-            }
-            DndCmd::StartIncoming { .. } | DndCmd::CancelIncoming { .. } => {}
             DndCmd::Cancel { drag } => {
                 if self.parked && self.offer == Some(drag) {
                     info!(drag, "catcher: cancelled while riding; refusing the drop");
@@ -557,7 +651,10 @@ impl Modes {
                     return self.release(false);
                 }
             }
-            DndCmd::ApplyConfig(_) => {}
+            DndCmd::Shield(_)
+            | DndCmd::ApplyConfig(_)
+            | DndCmd::StartIncoming { .. }
+            | DndCmd::CancelIncoming { .. } => {}
         }
         None
     }
@@ -576,45 +673,6 @@ impl Modes {
 
     fn over(&self) -> bool {
         self.offer.is_some() && !self.reject
-    }
-
-    /// A drag from the Mac is to start: false while another one runs.
-    fn begin_incoming(&mut self, drag: DragId) -> bool {
-        if self.incoming.is_some() {
-            return false;
-        }
-        self.incoming = Some(drag);
-        self.starting = true;
-        true
-    }
-
-    /// Its `DoDragDrop` called `QueryContinueDrag` for the first time: OLE
-    /// holds its own capture, and the press has done its work (R38b). Not
-    /// when `DoDragDrop` returns (R38a): a target may hold it much longer
-    /// (Explorer's `Drop` waits for the whole fetch), and the shield would
-    /// sit on the PC all that time, a dead square under the drag.
-    fn let_go_incoming(&mut self, drag: DragId) {
-        if self.incoming == Some(drag) {
-            self.starting = false;
-            self.shield_kept = false;
-        }
-    }
-
-    /// Its `DoDragDrop` returned (or never ran): a kept hide applies now.
-    fn end_incoming(&mut self, drag: DragId) {
-        if self.incoming == Some(drag) {
-            self.incoming = None;
-            self.starting = false;
-            self.shield_kept = false;
-        }
-    }
-
-    /// The button Windows saw is up (or the wait is over) with no drag from
-    /// the Mac started: none will start on that press.
-    fn release_kept(&mut self) {
-        if !self.starting {
-            self.shield_kept = false;
-        }
     }
 
     /// The drag left, or ended without a drop.
@@ -700,15 +758,15 @@ impl Win {
     }
 }
 
-struct State {
+/// cj-dnd-out's state.
+struct OutState {
     shared: Arc<DndShared>,
     events: Emit,
     side: Side,
     edge: Option<Rect>,
     catcher: Win,
-    shield: Win,
     helper: Option<IDropTargetHelper>,
-    modes: Modes,
+    modes: OutModes,
     /// The offer's virtual items, written out in `Drop`.
     pending: Vec<Pending>,
     /// Whether `IDropTargetHelper::Show(false)` is in force.
@@ -716,53 +774,47 @@ struct State {
     stuck_timer: bool,
     /// Since when the left button has been up with the catcher over the screen.
     up_since: Option<Instant>,
-    /// A drag from the Mac to run once the state is let go of.
-    start: Option<source::Run>,
-    /// Drags from the Mac still served; cancelled when the thread stops.
-    live: source::Live,
-    keep_timer: bool,
-    /// Since when the shield has been kept with no drag from the Mac running.
-    kept_since: Option<Instant>,
+}
+
+/// Which of cj-dnd's threads this is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Role {
+    Out,
+    In,
 }
 
 thread_local! {
-    static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
+    static ROLE: Cell<Option<Role>> = const { Cell::new(None) };
+    static OUT: RefCell<Option<OutState>> = const { RefCell::new(None) };
     static CMDS: RefCell<Option<mpsc::Receiver<DndCmd>>> = const { RefCell::new(None) };
 }
 
-/// Run `f` on the thread state. `None` if it is absent or already borrowed:
-/// a call made while the state is busy gets default handling.
-fn with_state<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> {
-    STATE.with(|cell| {
+/// Run `f` on cj-dnd-out's state. `None` on another thread, or if the state
+/// is already borrowed: a call made while it is busy gets default handling.
+fn with_out<R>(f: impl FnOnce(&mut OutState) -> R) -> Option<R> {
+    OUT.with(|cell| {
         let mut guard = cell.try_borrow_mut().ok()?;
         guard.as_mut().map(f)
     })
 }
 
-/// Run the queued commands. While the state is busy (a modal loop inside
-/// one of its calls) they wait for the next drain. Once every sender is
-/// gone, the message loop is told to quit.
+/// Run this thread's queued commands. While its state is busy (a modal
+/// loop inside one of its calls) they wait for the next drain. Once every
+/// sender is gone, the message loop is told to quit.
 fn drain_commands() {
     loop {
-        if STATE.with(|cell| cell.try_borrow_mut().is_err()) {
+        if OUT.with(|cell| cell.try_borrow_mut().is_err()) || inbound::busy() {
             return;
         }
         let next = CMDS.with(|cell| cell.borrow().as_ref().map(mpsc::Receiver::try_recv));
         match next {
-            Some(Ok(cmd)) => {
-                let start = with_state(|s| {
-                    s.on_command(cmd);
-                    s.start.take()
-                })
-                .flatten();
-                if let Some(run) = start {
-                    let drag = run.drag;
-                    // Outside the state: DoDragDrop's modal loop dispatches
-                    // this thread's messages, and so its commands.
-                    source::run_incoming(run);
-                    with_state(|s| s.incoming_ended(drag));
+            Some(Ok(cmd)) => match ROLE.get() {
+                Some(Role::Out) => {
+                    with_out(|s| s.on_command(cmd));
                 }
-            }
+                Some(Role::In) => inbound::on_command(cmd),
+                None => {}
+            },
             Some(Err(mpsc::TryRecvError::Empty)) | None => return,
             Some(Err(mpsc::TryRecvError::Disconnected)) => {
                 CMDS.with(|cell| cell.borrow_mut().take());
@@ -774,31 +826,32 @@ fn drain_commands() {
     }
 }
 
+/// One of cj-dnd's threads: OLE, its state (`start`, which reports its
+/// window), its message loop, then the state's end.
 fn run(
-    cfg: Config,
-    shared: Arc<DndShared>,
-    events: Emit,
-    live: source::Live,
+    name: &'static str,
+    role: Role,
     cmds: mpsc::Receiver<DndCmd>,
     ready: mpsc::SyncSender<Result<isize>>,
+    start: impl FnOnce() -> Result<isize>,
 ) {
     source::mark_dnd_thread();
+    ROLE.set(Some(role));
     // SAFETY: OLE (an STA) on this thread for its whole life; paired below.
     if let Err(e) = unsafe { OleInitialize(None) } {
         let _ = ready.send(Err(anyhow!(e).context("OleInitialize")));
         return;
     }
-    match State::new(cfg, shared, events, live) {
-        Ok(state) => {
-            let catcher = state.catcher.hwnd.0 as isize;
-            STATE.with(|cell| *cell.borrow_mut() = Some(state));
+    match start() {
+        Ok(hwnd) => {
             CMDS.with(|cell| *cell.borrow_mut() = Some(cmds));
-            if ready.send(Ok(catcher)).is_ok() {
+            if ready.send(Ok(hwnd)).is_ok() {
                 message_loop();
             }
             CMDS.with(|cell| cell.borrow_mut().take());
-            // Dropping the state revokes the target and destroys the windows.
-            STATE.with(|cell| cell.borrow_mut().take());
+            // Dropping a state revokes its target and destroys its window.
+            OUT.with(|cell| cell.borrow_mut().take());
+            inbound::stop();
         }
         Err(e) => {
             let _ = ready.send(Err(e));
@@ -806,7 +859,7 @@ fn run(
     }
     // SAFETY: pairs the OleInitialize above, after every COM object is gone.
     unsafe { OleUninitialize() };
-    info!("dnd thread: stopped");
+    info!("{name}: stopped");
 }
 
 fn message_loop() {
@@ -873,36 +926,23 @@ fn create_window(hinst: HINSTANCE, title: PCWSTR) -> windows::core::Result<HWND>
     Ok(hwnd)
 }
 
-impl State {
-    fn new(cfg: Config, shared: Arc<DndShared>, events: Emit, live: source::Live) -> Result<State> {
+impl OutState {
+    fn new(cfg: Config, shared: Arc<DndShared>, events: Emit) -> Result<OutState> {
         let hinst = register_class().context("register catcher window class")?;
         let catcher = create_window(hinst, w!("CursorJump catcher")).context("create catcher")?;
-        let shield = match create_window(hinst, w!("CursorJump shield")) {
-            Ok(h) => h,
-            Err(e) => {
-                // SAFETY: our own window, destroyed once.
-                let _ = unsafe { DestroyWindow(catcher) };
-                return Err(anyhow!(e).context("create shield"));
-            }
-        };
         // Built now, so `Drop` cleans up whatever fails below.
-        let mut state = State {
+        let mut state = OutState {
             shared,
             events,
             side: cfg.mac_side,
-            edge: edge_monitor(&monitors(), cfg.mac_side),
+            edge: edge_of(cfg.mac_side),
             catcher: Win::new(catcher),
-            shield: Win::new(shield),
             helper: None,
-            modes: Modes::default(),
+            modes: OutModes::default(),
             pending: Vec::new(),
             image_hidden: false,
             stuck_timer: false,
             up_since: None,
-            start: None,
-            live,
-            keep_timer: false,
-            kept_since: None,
         };
         let target: IDropTarget = Target { hwnd: catcher }.into();
         // SAFETY: OLE is initialised on this thread; the window is ours.
@@ -912,10 +952,11 @@ impl State {
             unsafe { CoCreateInstance(&CLSID_DragDropHelper, None, CLSCTX_INPROC_SERVER) }
                 .inspect_err(|e| warn!("dnd: no IDropTargetHelper: {e}"))
                 .ok();
-        let shared = &state.shared;
-        shared.catcher.store(catcher.0 as isize, Ordering::Release);
-        shared.shield.store(shield.0 as isize, Ordering::Release);
-        info!(edge = ?state.edge, side = ?state.side, "dnd thread: ready");
+        state
+            .shared
+            .catcher
+            .store(catcher.0 as isize, Ordering::Release);
+        info!(edge = ?state.edge, side = ?state.side, "cj-dnd-out: ready");
         Ok(state)
     }
 
@@ -928,55 +969,13 @@ impl State {
     }
 
     fn on_command(&mut self, cmd: DndCmd) {
-        debug!(?cmd, "dnd: command");
-        self.modes.held = left_button_down();
-        let cmd = match cmd {
-            DndCmd::StartIncoming { drag, items } => return self.start_incoming(drag, items),
-            DndCmd::CancelIncoming { drag } => return self.cancel_incoming(drag),
-            cmd => cmd,
-        };
+        debug!(?cmd, "cj-dnd-out: command");
         let released = self.modes.command(&cmd, self.session_up());
         self.settle(released);
         if let DndCmd::ApplyConfig(cfg) = cmd {
             self.side = cfg.mac_side;
             self.refresh_edge();
         }
-        self.apply();
-    }
-
-    /// Queued for `drain_commands` to run once the state is let go of.
-    fn start_incoming(&mut self, drag: DragId, items: Vec<DragItem>) {
-        if !self.modes.begin_incoming(drag) {
-            warn!(drag, running = ?self.modes.incoming, "incoming: another drag from the Mac runs; refused");
-            self.emit(WinDndEv::IncomingEnded {
-                drag,
-                dropped: false,
-            });
-            return;
-        }
-        self.start = Some(source::Run {
-            drag,
-            items,
-            live: self.live.clone(),
-            shared: self.shared.clone(),
-            events: self.events.clone(),
-        });
-        self.apply();
-    }
-
-    /// The relay has already cancelled it (see `relay`); this only notes it.
-    fn cancel_incoming(&mut self, drag: DragId) {
-        let running = self.modes.incoming == Some(drag);
-        debug!(drag, running, "incoming: CancelIncoming");
-    }
-
-    fn incoming_let_go(&mut self, drag: DragId) {
-        self.modes.let_go_incoming(drag);
-        self.apply();
-    }
-
-    fn incoming_ended(&mut self, drag: DragId) {
-        self.modes.end_incoming(drag);
         self.apply();
     }
 
@@ -995,73 +994,49 @@ impl State {
     }
 
     fn refresh_edge(&mut self) {
-        let edge = edge_monitor(&monitors(), self.side);
+        let edge = edge_of(self.side);
         if edge != self.edge {
             info!(?edge, side = ?self.side, "dnd: edge monitor changed");
         }
         self.edge = edge;
         self.catcher.stale = true;
-        self.shield.stale = true;
     }
 
-    /// Put both windows where the modes say, and keep the drag image and
-    /// the stuck check in step.
+    /// Put the catcher where the modes say, and keep the drag image, the
+    /// stuck check and cj-dnd-in's shield in step.
     fn apply(&mut self) {
-        let placement = self.modes.placement();
-        let catcher = match placement.catcher {
+        let catcher = match self.modes.catcher_at() {
             CatcherAt::Hidden => None,
             CatcherAt::Strip => self.edge.map(|e| strip_rect(e, self.side)),
             CatcherAt::Screen => Some(virtual_screen()),
         };
-        let shield = self
-            .edge
-            .filter(|_| placement.shield)
-            .map(|e| rect_center(&e))
-            .map(|park| shield_rect(park, scale_at(park)));
         self.catcher.place(catcher);
-        self.shield.place(shield);
-        self.shared
-            .parked
-            .store(self.modes.parked, Ordering::Release);
+        let parked = self.modes.parked;
+        if self.shared.parked.swap(parked, Ordering::AcqRel) != parked {
+            self.tell_shield(parked);
+        }
         self.set_image_hidden(self.modes.image_hidden());
-        self.set_stuck_timer(self.modes.parked);
-        self.set_keep_timer(self.modes.shield_kept && !self.modes.starting);
+        self.set_stuck_timer(parked);
     }
 
-    fn set_keep_timer(&mut self, on: bool) {
-        if on == self.keep_timer {
+    /// The shield (cj-dnd-in) goes while the catcher covers the screen, and
+    /// may come back after. Posted, never sent: cj-dnd-in may be held in a
+    /// target's `Drop`. On parking it is hidden at once, without waiting
+    /// for that thread, so a shield kept for a press never sits above the
+    /// riding catcher when the input thread parks the cursor.
+    fn tell_shield(&self, parked: bool) {
+        let shield = HWND(self.shared.shield.load(Ordering::Acquire) as *mut _);
+        if shield.0.is_null() {
             return;
         }
-        self.keep_timer = on;
-        self.kept_since = None;
-        let hwnd = self.catcher.hwnd;
-        if on {
-            // SAFETY: our own window's timer; WM_TIMER arrives in `catcher_proc`.
-            if unsafe { SetTimer(Some(hwnd), KEEP_TIMER, KEEP_POLL.as_millis() as u32, None) } == 0
-            {
-                // The next command or the incoming drag's end lets it go.
-                warn!(
-                    "dnd: SetTimer failed: {}",
-                    windows::core::Error::from_thread()
-                );
+        // SAFETY: plain FFI calls on a window handle; a window that is gone
+        // just makes them fail.
+        unsafe {
+            if parked {
+                let _ = ShowWindowAsync(shield, SW_HIDE);
             }
-        } else {
-            // SAFETY: kills our own timer; failure means it was not running.
-            let _ = unsafe { KillTimer(Some(hwnd), KEEP_TIMER) };
+            let _ = PostMessageW(Some(shield), WM_PARKED, WPARAM(0), LPARAM(0));
         }
-    }
-
-    /// A shield kept with no drag from the Mac running goes once Windows
-    /// sees the button up, or after `KEEP_LIMIT`.
-    fn check_kept(&mut self) {
-        let since = *self.kept_since.get_or_insert_with(Instant::now);
-        self.modes.held = left_button_down();
-        if self.modes.held && since.elapsed() < KEEP_LIMIT {
-            return;
-        }
-        debug!(held = self.modes.held, "dnd: kept shield let go");
-        self.modes.release_kept();
-        self.apply();
     }
 
     fn set_image_hidden(&mut self, hide: bool) {
@@ -1178,26 +1153,26 @@ impl State {
     }
 }
 
-impl Drop for State {
+impl Drop for OutState {
     fn drop(&mut self) {
         let released = self.modes.release(false);
         self.settle(released);
-        // A target still waiting for bytes gets E_FAIL, not a hang.
-        source::cancel_live(&self.live, None);
         self.shared.catcher.store(0, Ordering::Release);
-        self.shared.shield.store(0, Ordering::Release);
         self.shared.parked.store(false, Ordering::Release);
         // SAFETY: undoes RegisterDragDrop on the same thread (harmless if it
-        // never happened), then destroys our own windows once.
+        // never happened), then destroys our own window once.
         unsafe {
             let _ = RevokeDragDrop(self.catcher.hwnd);
             let _ = KillTimer(Some(self.catcher.hwnd), STUCK_TIMER);
-            let _ = KillTimer(Some(self.catcher.hwnd), KEEP_TIMER);
             let _ = DestroyWindow(self.catcher.hwnd);
-            let _ = DestroyWindow(self.shield.hwnd);
         }
     }
 }
+
+/// Test only: a message that holds its thread for `wparam` ms, as a
+/// target's `Drop` holds cj-dnd-in.
+#[cfg(test)]
+const WM_TEST_HOLD: u32 = WM_APP + 9;
 
 unsafe extern "system" fn catcher_proc(
     hwnd: HWND,
@@ -1210,23 +1185,32 @@ unsafe extern "system" fn catcher_proc(
             drain_commands();
             return LRESULT(0);
         }
+        WM_PARKED => {
+            inbound::parked_changed();
+            return LRESULT(0);
+        }
+        #[cfg(test)]
+        WM_TEST_HOLD => {
+            std::thread::sleep(Duration::from_millis(wparam.0 as u64));
+            return LRESULT(0);
+        }
         WM_MOUSEACTIVATE => return LRESULT(MA_NOACTIVATE as isize),
         // Presses passed through by the input hook land here: nothing to do.
         WM_LBUTTONDOWN | WM_LBUTTONUP | WM_LBUTTONDBLCLK | WM_RBUTTONDOWN | WM_RBUTTONUP
         | WM_RBUTTONDBLCLK | WM_MBUTTONDOWN | WM_MBUTTONUP | WM_MBUTTONDBLCLK | WM_XBUTTONDOWN
         | WM_XBUTTONUP | WM_XBUTTONDBLCLK => return LRESULT(0),
         WM_DISPLAYCHANGE | WM_SETTINGCHANGE | WM_DPICHANGED => {
-            with_state(|s| {
+            // Each thread's window: whichever state this thread has.
+            with_out(|s| {
                 s.refresh_edge();
                 s.apply();
             });
+            inbound::display_changed();
         }
         WM_TIMER if wparam.0 == STUCK_TIMER => {
-            with_state(State::check_stuck);
+            with_out(OutState::check_stuck);
         }
-        WM_TIMER if wparam.0 == KEEP_TIMER => {
-            with_state(State::check_kept);
-        }
+        WM_TIMER if wparam.0 == KEEP_TIMER => inbound::keep_tick(),
         _ => {}
     }
     // SAFETY: default handling for our own window.
@@ -1236,7 +1220,99 @@ unsafe extern "system" fn catcher_proc(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use inbound::InModes;
     use windows::Win32::UI::WindowsAndMessaging::IsWindowVisible;
+
+    /// Both threads' modes, each command routed as the relay routes it.
+    #[derive(Debug, Default, Clone)]
+    struct Modes {
+        out: OutModes,
+        inc: InModes,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct Placement {
+        catcher: CatcherAt,
+        shield: bool,
+    }
+
+    impl Modes {
+        fn command(&mut self, cmd: &DndCmd, session_up: bool) -> Option<Released> {
+            let route = route(cmd);
+            let released = (route != Route::In)
+                .then(|| self.out.command(cmd, session_up))
+                .flatten();
+            if route != Route::Out {
+                // cj-dnd-in reads the park from `DndShared::parked`.
+                self.inc.command(cmd, session_up, self.out.parked);
+            }
+            released
+        }
+
+        fn placement(&self) -> Placement {
+            Placement {
+                catcher: self.out.catcher_at(),
+                shield: self.inc.shield(self.out.parked),
+            }
+        }
+
+        fn image_hidden(&self) -> bool {
+            self.out.image_hidden()
+        }
+        fn enter(&mut self, fresh: Option<DragId>) -> (bool, Option<Released>) {
+            self.out.enter(fresh)
+        }
+        fn over(&self) -> bool {
+            self.out.over()
+        }
+        fn leave(&mut self) -> Option<Released> {
+            self.out.leave()
+        }
+        fn takes_drop(&self) -> bool {
+            self.out.takes_drop()
+        }
+        fn take_drop(&mut self) -> Result<DragId, Option<Released>> {
+            self.out.take_drop()
+        }
+        fn stuck(&mut self) -> Option<Released> {
+            self.out.stuck()
+        }
+        fn begin_incoming(&mut self, drag: DragId) -> bool {
+            self.inc.begin_incoming(drag)
+        }
+        fn let_go_incoming(&mut self, drag: DragId) {
+            self.inc.let_go_incoming(drag)
+        }
+        fn end_incoming(&mut self, drag: DragId) {
+            self.inc.end_incoming(drag)
+        }
+        fn release_kept(&mut self) {
+            self.inc.release_kept()
+        }
+    }
+
+    #[test]
+    fn each_command_goes_to_its_thread() {
+        for c in [
+            DndCmd::CatcherZone(true),
+            DndCmd::Park(true),
+            DndCmd::Cancel { drag: 1 },
+            DndCmd::Home { drag: 1 },
+        ] {
+            assert_eq!(route(&c), Route::Out, "{c:?}");
+        }
+        for c in [
+            DndCmd::Shield(true),
+            DndCmd::StartIncoming {
+                drag: 1,
+                items: vec![],
+            },
+            DndCmd::CancelIncoming { drag: 1 },
+        ] {
+            assert_eq!(route(&c), Route::In, "{c:?}");
+        }
+        assert_eq!(route(&DndCmd::ApplyConfig(Config::default())), Route::Both);
+    }
 
     #[test]
     fn shield_rect_is_centred_on_the_park_point_and_scaled() {
@@ -1313,7 +1389,7 @@ mod tests {
         // Still one drag at a time, and no keeping on its behalf.
         assert!(!m.begin_incoming(7));
         cmd(&mut m, DndCmd::Shield(true));
-        m.held = true;
+        m.inc.held = true;
         cmd(&mut m, DndCmd::Shield(false));
         assert!(!shield_shown(&m));
         m.end_incoming(5);
@@ -1324,11 +1400,11 @@ mod tests {
     fn shield_hide_before_the_start_is_kept_while_windows_sees_the_press() {
         let mut m = Modes::default();
         cmd(&mut m, DndCmd::Shield(true));
-        m.held = true;
+        m.inc.held = true;
         cmd(&mut m, DndCmd::Shield(false));
         assert!(shield_shown(&m), "a StartIncoming may be on its way");
         assert!(m.begin_incoming(5));
-        m.held = false;
+        m.inc.held = false;
         m.release_kept();
         assert!(shield_shown(&m));
         m.end_incoming(5);
@@ -1339,10 +1415,10 @@ mod tests {
     fn kept_shield_goes_once_the_button_is_up() {
         let mut m = Modes::default();
         cmd(&mut m, DndCmd::Shield(true));
-        m.held = true;
+        m.inc.held = true;
         cmd(&mut m, DndCmd::Shield(false));
         assert!(shield_shown(&m));
-        m.held = false;
+        m.inc.held = false;
         m.release_kept();
         assert!(!shield_shown(&m));
     }
@@ -1354,7 +1430,7 @@ mod tests {
         cmd(&mut m, DndCmd::Shield(false));
         assert!(!shield_shown(&m));
         // A shield that wasn't shown is never kept.
-        m.held = true;
+        m.inc.held = true;
         cmd(&mut m, DndCmd::Shield(false));
         assert!(!shield_shown(&m));
         assert!(m.begin_incoming(5));
@@ -1381,9 +1457,9 @@ mod tests {
         assert!(!m.begin_incoming(6));
         // Another drag's end changes nothing.
         m.end_incoming(6);
-        assert_eq!(m.incoming, Some(5));
+        assert_eq!(m.inc.incoming, Some(5));
         m.end_incoming(5);
-        assert_eq!(m.incoming, None);
+        assert_eq!(m.inc.incoming, None);
         assert!(m.begin_incoming(6));
     }
 
@@ -1394,7 +1470,7 @@ mod tests {
         m.command(&DndCmd::Shield(true), false);
         m.command(&DndCmd::CatcherZone(true), false);
         assert_eq!(m.placement(), place(CatcherAt::Strip, false));
-        assert!(!m.parked);
+        assert!(!m.out.parked);
     }
 
     #[test]
@@ -1455,7 +1531,7 @@ mod tests {
         assert_eq!(m.take_drop(), Ok(7));
         assert_eq!(m.placement(), place(CatcherAt::Hidden, true));
         assert!(!m.image_hidden());
-        assert_eq!(m.offer, None);
+        assert_eq!(m.out.offer, None);
     }
 
     #[test]
@@ -1470,7 +1546,7 @@ mod tests {
                 tell: true
             })
         );
-        assert!(!m.parked);
+        assert!(!m.out.parked);
     }
 
     #[test]
@@ -1494,10 +1570,10 @@ mod tests {
         // Nothing new is offered while refusing, and Home doesn't unpark.
         assert_eq!(m.enter(Some(8)), (false, None));
         assert_eq!(cmd(&mut m, DndCmd::Home { drag: 7 }), None);
-        assert!(m.parked);
+        assert!(m.out.parked);
         // The real release: no drop, back off the screen.
         assert_eq!(m.take_drop(), Err(None));
-        assert!(!m.parked && !m.reject);
+        assert!(!m.out.parked && !m.out.reject);
     }
 
     #[test]
@@ -1512,14 +1588,14 @@ mod tests {
                 tell: false
             })
         );
-        assert!(!m.parked);
-        assert_eq!(m.offer, None);
+        assert!(!m.out.parked);
+        assert_eq!(m.out.offer, None);
         // Home for another drag still unparks, and keeps the offer.
         m.enter(Some(8));
         cmd(&mut m, DndCmd::Park(true));
         assert_eq!(cmd(&mut m, DndCmd::Home { drag: 7 }), None);
-        assert!(!m.parked);
-        assert_eq!(m.offer, Some(8));
+        assert!(!m.out.parked);
+        assert_eq!(m.out.offer, Some(8));
     }
 
     #[test]
@@ -1550,7 +1626,7 @@ mod tests {
                     assert_eq!(cmd(&mut m, c.clone()), None, "{c:?} let the offer go");
                     seen.push(m.placement());
                 }
-                EntryStep::AwaitParked => assert!(m.parked, "awaited before Park(true)"),
+                EntryStep::AwaitParked => assert!(m.out.parked, "awaited before Park(true)"),
                 EntryStep::ParkCursor => return seen,
             }
         }
@@ -1662,6 +1738,102 @@ mod tests {
             Err(mpsc::RecvTimeoutError::Disconnected)
         );
         assert_eq!(shared.catcher.load(Ordering::Acquire), 0);
+        assert_eq!(shared.shield.load(Ordering::Acquire), 0);
+    }
+
+    fn visible(h: isize) -> bool {
+        // SAFETY: plain FFI call on a window handle.
+        unsafe { IsWindowVisible(HWND(h as *mut _)) }.as_bool()
+    }
+
+    fn until(what: &str, within: Duration, done: impl Fn() -> bool) -> Duration {
+        let started = Instant::now();
+        while !done() {
+            assert!(started.elapsed() < within, "{what} not within {within:?}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        started.elapsed()
+    }
+
+    #[test]
+    fn cj_dnd_out_takes_commands_while_cj_dnd_in_is_held() {
+        // R39: cj-dnd-in held as a target's synchronous Drop holds it (its
+        // loop takes nothing), cj-dnd-out goes on.
+        let shared = Arc::new(DndShared::default());
+        shared.session_up.store(true, Ordering::Release);
+        let cmds = spawn_dnd_thread(Config::default(), shared.clone(), |_| {}).expect("spawn");
+        let (catcher, shield) = (
+            shared.catcher.load(Ordering::Acquire),
+            shared.shield.load(Ordering::Acquire),
+        );
+        assert!(catcher != 0 && shield != 0 && catcher != shield);
+        if edge_monitor(&monitors(), Config::default().mac_side).is_none() {
+            return; // Nowhere to show either window.
+        }
+        const HOLD: Duration = Duration::from_secs(2);
+        // SAFETY: plain FFI call on cj-dnd-in's own window.
+        unsafe {
+            PostMessageW(
+                Some(HWND(shield as *mut _)),
+                WM_TEST_HOLD,
+                WPARAM(HOLD.as_millis() as usize),
+                LPARAM(0),
+            )
+        }
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        let held = Instant::now();
+        cmds.send(DndCmd::Shield(true)).unwrap();
+        cmds.send(DndCmd::CatcherZone(true)).unwrap();
+        let took = until("the strip", Duration::from_secs(1), || visible(catcher));
+        assert!(took < HOLD / 2, "{took:?}");
+        assert!(!visible(shield), "cj-dnd-in is really held");
+        // Once let go, cj-dnd-in catches up.
+        until("the shield", HOLD * 2, || visible(shield));
+        assert!(held.elapsed() >= HOLD - Duration::from_millis(100));
+        cmds.send(DndCmd::CatcherZone(false)).unwrap();
+        cmds.send(DndCmd::Shield(false)).unwrap();
+        until("both hidden", Duration::from_secs(2), || {
+            !visible(catcher) && !visible(shield)
+        });
+    }
+
+    #[test]
+    fn a_drag_from_the_mac_while_one_runs_is_refused_at_once() {
+        let (tx, rx) = mpsc::channel::<WinDndEv>();
+        let shared = Arc::new(DndShared::default());
+        let cmds = spawn_dnd_thread(Config::default(), shared.clone(), move |ev| {
+            let _ = tx.send(ev);
+        })
+        .expect("spawn");
+        // As if a target's Drop held cj-dnd-in in a drag from the Mac.
+        shared.incoming.store(30, Ordering::Release);
+        let shield = shared.shield.load(Ordering::Acquire);
+        // SAFETY: plain FFI call on cj-dnd-in's own window.
+        unsafe {
+            PostMessageW(
+                Some(HWND(shield as *mut _)),
+                WM_TEST_HOLD,
+                WPARAM(3000),
+                LPARAM(0),
+            )
+        }
+        .unwrap();
+        let sent = Instant::now();
+        cmds.send(DndCmd::StartIncoming {
+            drag: 31,
+            items: vec![],
+        })
+        .unwrap();
+        match rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(WinDndEv::IncomingEnded { drag, dropped }) => {
+                assert_eq!((drag, dropped), (31, false));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(sent.elapsed() < Duration::from_secs(1));
+        shared.incoming.store(0, Ordering::Release);
+        drop(cmds);
     }
 
     #[test]
