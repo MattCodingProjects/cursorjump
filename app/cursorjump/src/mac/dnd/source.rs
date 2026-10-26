@@ -49,7 +49,7 @@ use objc2_app_kit::NSRunningApplication;
 use objc2_core_foundation::{CFRetained, CFString};
 use objc2_core_graphics::{
     CGWindowLevelForKey, CGWindowLevelKey, CGWindowListCopyWindowInfo, CGWindowListOption,
-    kCGNullWindowID, kCGWindowBounds, kCGWindowLayer, kCGWindowOwnerPID,
+    kCGNullWindowID, kCGWindowBounds, kCGWindowLayer, kCGWindowNumber, kCGWindowOwnerPID,
 };
 use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSString, ns_string};
 use objc2_uniform_type_identifiers::UTType;
@@ -88,6 +88,8 @@ const KEEP_AFTER_CLOSE: Duration = Duration::from_secs(600);
 /// The longest file name APFS takes, in UTF-8 bytes.
 const MAX_NAME_BYTES: usize = 255;
 
+/// How often `prepare` looks for its panel in the window list.
+const ON_TOP_POLL: Duration = Duration::from_millis(5);
 /// Earlier crossings remembered for a drag that comes back.
 const PAST_MAX: usize = 8;
 
@@ -343,6 +345,8 @@ pub(super) fn copy_tree(src: &Path, dest: &Path) -> io::Result<()> {
 /// An on-screen window, as the window list describes it.
 #[derive(Debug, Clone, PartialEq)]
 struct WinInfo {
+    /// Its window number.
+    number: i64,
     layer: i64,
     pid: i32,
     /// x, y, width, height in global points (origin top left).
@@ -357,13 +361,26 @@ trait Targets: Send + Sync {
     fn bundle_id(&self, pid: i32) -> Option<String>;
 }
 
+/// Whether the window server has our panel (`number`) as the frontmost
+/// window holding `at`: only then does a posted press there reach it.
+/// Also where in the list it is, and which window is on top, for the log.
+fn panel_on_top(windows: &[WinInfo], at: (f64, f64), number: i64) -> bool {
+    windows
+        .iter()
+        .find(|w| contains(w.bounds, at))
+        .is_some_and(|w| w.number == number)
+}
+
+fn contains((x, y, wd, ht): (f64, f64, f64, f64), at: (f64, f64)) -> bool {
+    at.0 >= x && at.0 < x + wd && at.1 >= y && at.1 < y + ht
+}
+
 /// The frontmost window holding `at` that isn't ours, whatever its layer;
 /// None over the desktop.
 fn window_at(windows: &[WinInfo], at: (f64, f64), own_pid: i32) -> Option<&WinInfo> {
-    windows.iter().find(|w| {
-        let (x, y, wd, ht) = w.bounds;
-        w.pid != own_pid && at.0 >= x && at.0 < x + wd && at.1 >= y && at.1 < y + ht
-    })
+    windows
+        .iter()
+        .find(|w| w.pid != own_pid && contains(w.bounds, at))
 }
 
 /// Whether the drop under `at` goes to an app that takes file promises
@@ -431,8 +448,9 @@ impl SystemTargets {
             unsafe { &*(k as *const CFString).cast::<NSString>() }
         };
         // SAFETY: reading extern statics the framework defines.
-        let (layer_key, pid_key, bounds_key) = unsafe {
+        let (number_key, layer_key, pid_key, bounds_key) = unsafe {
             (
+                key(kCGWindowNumber),
                 key(kCGWindowLayer),
                 key(kCGWindowOwnerPID),
                 key(kCGWindowBounds),
@@ -454,6 +472,7 @@ impl SystemTargets {
                     unsafe { &*Retained::as_ptr(&bounds).cast() };
                 let f = |k: &NSString| number(bounds, k).map(|n| n.doubleValue());
                 Some(WinInfo {
+                    number: number(&w, number_key)?.integerValue() as i64,
                     layer: number(&w, layer_key)?.integerValue() as i64,
                     pid: number(&w, pid_key)?.intValue(),
                     bounds: (
@@ -869,14 +888,15 @@ impl DragSource {
         let shown = if left.is_zero() {
             None
         } else {
-            on_main_sync(left, move |mtm| appkit::arm(mtm, &inner, &armed, at))
+            on_main_sync(left, move |mtm| appkit::arm(mtm, &inner, &armed, at)).flatten()
         };
-        if shown != Some(true) {
+        let on_top = shown.is_some_and(|n| self.wait_on_top(drag, n as i64, at, started));
+        if !on_top {
             warn!(
                 drag,
                 ?shown,
                 ms = started.elapsed().as_millis() as u64,
-                "the drag panel did not come up in time"
+                "the drag panel did not come up under the cursor in time"
             );
             self.cancel(drag);
             return None;
@@ -894,6 +914,40 @@ impl DragSource {
             "the drag from the PC is armed"
         );
         Some(d.crossing)
+    }
+
+    /// Polls the window list until our panel `number` is the frontmost
+    /// window under `at`, for what is left of the budget: a press posted
+    /// before that falls through to the window behind.
+    fn wait_on_top(&self, drag: DragId, number: i64, at: (f64, f64), started: Instant) -> bool {
+        let deadline = started + PREPARE_TIMEOUT;
+        loop {
+            let windows = self.inner.targets.windows();
+            if windows
+                .as_ref()
+                .is_some_and(|w| panel_on_top(w, at, number))
+            {
+                debug!(
+                    drag,
+                    ms = started.elapsed().as_millis() as u64,
+                    "the drag panel is on top"
+                );
+                return true;
+            }
+            if Instant::now() >= deadline {
+                let list = windows.unwrap_or_default();
+                let ours = list.iter().position(|w| w.number == number);
+                let top = list.iter().find(|w| contains(w.bounds, at));
+                warn!(
+                    drag,
+                    ?ours,
+                    top = ?top,
+                    "the window server never showed the drag panel on top under the cursor"
+                );
+                return false;
+            }
+            std::thread::sleep(ON_TOP_POLL);
+        }
     }
 
     /// This crossing's placeholders: an earlier crossing of the same drag
@@ -1307,7 +1361,45 @@ mod tests {
     }
 
     fn win(layer: i64, pid: i32, bounds: (f64, f64, f64, f64)) -> WinInfo {
-        WinInfo { layer, pid, bounds }
+        WinInfo {
+            number: 0,
+            layer,
+            pid,
+            bounds,
+        }
+    }
+
+    #[test]
+    fn the_press_waits_for_our_panel_on_top_under_the_cursor() {
+        let at = (2.0, 500.0);
+        let panel = WinInfo {
+            number: 42,
+            layer: 25,
+            pid: 1,
+            bounds: (-2.0, 496.0, 8.0, 8.0),
+        };
+        let other = |number, bounds| WinInfo {
+            number,
+            layer: 0,
+            pid: 9,
+            bounds,
+        };
+        let finder = other(7, (0.0, 0.0, 1000.0, 1000.0));
+        assert!(panel_on_top(&[panel.clone(), finder.clone()], at, 42));
+        assert!(
+            !panel_on_top(std::slice::from_ref(&finder), at, 42),
+            "not listed yet: the press would hit Finder"
+        );
+        let over = other(8, (0.0, 490.0, 50.0, 50.0));
+        assert!(
+            !panel_on_top(&[over, panel.clone(), finder.clone()], at, 42),
+            "another window on top would eat the press"
+        );
+        assert!(
+            !panel_on_top(&[panel, finder], (100.0, 500.0), 42),
+            "listed, but not under the point"
+        );
+        assert!(!panel_on_top(&[], at, 42));
     }
 
     #[test]

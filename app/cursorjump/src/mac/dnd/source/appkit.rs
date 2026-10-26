@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use block2::DynBlock;
 use objc2::rc::Retained;
-use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject};
+use objc2::runtime::{AnyClass, AnyObject, NSObject, NSObjectProtocol, ProtocolObject};
 use objc2::{AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2::{define_class, msg_send};
 use objc2_app_kit::{
@@ -83,15 +83,17 @@ fn prune() {
     drop(gone); // Outside the borrow.
 }
 
-/// Main thread: the panel under `at` with the drag's items armed.
+/// Main thread: the panel under `at` with the drag's items armed, drawn
+/// and flushed to the window server. Its window number, for `prepare` to
+/// see it on screen before pressing; None if `prepare` gave up already.
 pub(super) fn arm(
     mtm: MainThreadMarker,
     inner: &Arc<Inner>,
     drag: &Arc<Drag>,
     at: (f64, f64),
-) -> bool {
+) -> Option<isize> {
     if drag.lock().cancelled {
-        return false; // `prepare` gave up waiting.
+        return None; // `prepare` gave up waiting.
     }
     prune();
     let armed = drag
@@ -109,6 +111,7 @@ pub(super) fn arm(
         },
     );
     let panel = drag_panel(mtm, at, &view);
+    let number = panel.windowNumber();
     KEPT.with(|k| {
         k.borrow_mut().push(Kept {
             drag: drag.clone(),
@@ -117,7 +120,7 @@ pub(super) fn arm(
             closed_at: None,
         });
     });
-    true
+    Some(number)
 }
 
 /// An 8×8 pt borderless, non-activating, nearly invisible panel centred
@@ -152,7 +155,23 @@ fn drag_panel(mtm: MainThreadMarker, at: (f64, f64), view: &NSView) -> Retained<
     panel.setIgnoresMouseEvents(false);
     panel.setContentView(Some(view));
     panel.orderFrontRegardless();
+    // The window server hit-tests per pixel: until the panel has a drawn
+    // backing it is transparent there, and a click falls through to the
+    // window behind. Draw it now and push it out.
+    panel.display();
+    flush_core_animation();
+    #[expect(deprecated, reason = "the window must reach the window server now")]
+    panel.flushWindow();
     panel
+}
+
+/// `[CATransaction flush]`: commits the layer tree (AppKit's windows are
+/// layer-backed) without waiting for the run loop to turn.
+fn flush_core_animation() {
+    if let Some(cls) = AnyClass::get(c"CATransaction") {
+        // SAFETY: `+[CATransaction flush]` takes and returns nothing.
+        let _: () = unsafe { msg_send![cls, flush] };
+    }
 }
 
 /// Run `f`, catching and logging a panic: for code AppKit calls, which
