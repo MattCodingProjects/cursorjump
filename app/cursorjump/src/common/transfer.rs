@@ -7,7 +7,6 @@
 //! each is flushed and closed before the rename, but not fsynced.
 
 use std::fs;
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, PoisonError};
@@ -47,6 +46,8 @@ pub enum Dest {
 }
 
 /// Free space at a destination, as a trait so tests can fake a full disk.
+/// `receive_item` asks it off the runtime's threads (`spawn_blocking`),
+/// which is why it takes a `&'static dyn FreeSpace`.
 pub trait FreeSpace: Send + Sync {
     fn free_bytes(&self, dir: &Path) -> io::Result<u64>;
 }
@@ -61,7 +62,8 @@ impl FreeSpace for OsFreeSpace {
         use windows::core::HSTRING;
         let mut free = 0u64;
         // SAFETY: the name is a valid wide string and `free` outlives the call.
-        unsafe { GetDiskFreeSpaceExW(&HSTRING::from(dir), Some(&raw mut free), None, None) }
+        let name = HSTRING::from(verbatim(dir)?.as_path());
+        unsafe { GetDiskFreeSpaceExW(&name, Some(&raw mut free), None, None) }
             .map_err(win_io_error)?;
         Ok(free)
     }
@@ -106,8 +108,10 @@ impl Stop {
                     FailReason::Cancelled
                 }
                 _ if cancel.is_cancelled() => FailReason::Cancelled,
+                // A lost link, or the peer breaking the stream protocol:
+                // the error doesn't say which.
                 _ => {
-                    info!("files stream lost: {e:#}");
+                    warn!("files stream failed: {e:#}");
                     FailReason::Disconnected
                 }
             },
@@ -292,13 +296,14 @@ async fn send_file(
             name: display_name(&src.path),
         })
     };
-    let mut file = tokio::fs::File::open(&src.path).await.map_err(unreadable)?;
+    let mut file = unless_cancelled(cancel, tokio::fs::File::open(&src.path))
+        .await?
+        .map_err(unreadable)?;
     let mut left = src.entry.size;
     loop {
-        if cancel.is_cancelled() {
-            return Err(Stop::Cancelled);
-        }
-        let n = file.read(buf).await.map_err(unreadable)?;
+        let n = unless_cancelled(cancel, file.read(buf))
+            .await?
+            .map_err(unreadable)?;
         #[cfg(test)]
         hooks::after_read(&src.path);
         if n == 0 {
@@ -333,48 +338,100 @@ async fn send_file(
 pub async fn receive_item(
     mut files: FilesIn,
     dest: Dest,
-    space: &dyn FreeSpace,
+    space: &'static dyn FreeSpace,
     mut progress: impl FnMut(u64) + Send,
     cancel: &CancellationToken,
 ) -> Result<PathBuf, FailReason> {
     let header = files.header().clone();
-    let (parent, name) = match &dest {
-        Dest::Exact(p) => match (p.parent(), p.file_name()) {
-            (Some(parent), Some(name)) => (parent, name.to_string_lossy().into_owned()),
-            _ => {
-                warn!("cannot write a received item to {}", p.display());
-                files.cancel();
-                return Err(FailReason::Unwritable);
-            }
-        },
-        Dest::InDir(d) => (d.as_path(), sanitize_component(&header.name)),
-    };
-    let parent = if parent.as_os_str().is_empty() {
-        Path::new(".")
-    } else {
-        parent
+    let Some((parent, name, target)) = place(&dest, &header) else {
+        files.cancel();
+        return Err(FailReason::Unwritable);
     };
     let spot = Spot {
-        parent,
+        parent: &parent,
         part: &parent.join(part_name(&name)),
-        target: &parent.join(&name),
+        target: &target,
     };
+    // Removes the part however this ends short of the rename: failure,
+    // cancel, a panic, or the future being dropped.
+    let mut guard = PartGuard(Some(spot.part.to_path_buf()));
     let mut report = Progress {
         report: &mut progress,
         done: 0,
         last: Instant::now(),
     };
-    match receive_into(&mut files, &header, spot, space, &mut report, cancel).await {
+    let received = receive_into(&mut files, &header, spot, space, &mut report, cancel).await;
+    match received {
         Ok(()) => {
+            guard.disarm();
             progress(header.total_bytes);
-            Ok(spot.target.to_path_buf())
+            Ok(target)
         }
         Err(stop) => {
             files.cancel();
+            // Off the runtime's threads where it can be; the guard is for
+            // when it can't.
             if let Err(e) = remove_any(spot.part).await {
                 warn!("{} not cleaned up: {e}", spot.part.display());
+            } else {
+                guard.disarm();
             }
             Err(stop.reason(cancel))
+        }
+    }
+}
+
+/// The folder a received item lands in, the name it is known by there, and
+/// its final path; None for an `Exact` path without both.
+fn place(dest: &Dest, header: &FilesHeader) -> Option<(PathBuf, String, PathBuf)> {
+    let (parent, name, target) = match dest {
+        Dest::Exact(p) => {
+            let (Some(parent), Some(name)) = (p.parent(), p.file_name()) else {
+                warn!("cannot write a received item to {}", p.display());
+                return None;
+            };
+            (parent, name.to_string_lossy().into_owned(), p.clone())
+        }
+        Dest::InDir(d) => {
+            let name = sanitize_component(&header.name);
+            (d.as_path(), name.clone(), d.join(name))
+        }
+    };
+    if !parent.as_os_str().is_empty() {
+        return Some((parent.to_path_buf(), name, target));
+    }
+    match std::path::absolute(".") {
+        Ok(cwd) => Some((cwd, name, target)),
+        Err(e) => {
+            warn!("no current folder for {}: {e}", target.display());
+            None
+        }
+    }
+}
+
+/// A part to remove when dropped, unless disarmed once the item is in
+/// place. It removes synchronously, since a drop can't await.
+struct PartGuard(Option<PathBuf>);
+
+impl PartGuard {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for PartGuard {
+    fn drop(&mut self) {
+        let Some(p) = self.0.take() else { return };
+        let removed = match fs::symlink_metadata(&p) {
+            Ok(m) if m.is_dir() => fs::remove_dir_all(&p),
+            Ok(_) => fs::remove_file(&p),
+            Err(e) => Err(e),
+        };
+        match removed {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => {
+                warn!("{} not cleaned up: {e}", p.display());
+            }
+            _ => {}
         }
     }
 }
@@ -408,15 +465,22 @@ impl Progress<'_> {
     }
 }
 
+/// Folders and files are created synchronously, not on tokio's blocking
+/// pool: a creation still running there when the future is dropped could
+/// land after the `PartGuard` had cleaned up, and be left behind.
 async fn receive_into(
     files: &mut FilesIn,
     header: &FilesHeader,
     spot: Spot<'_>,
-    space: &dyn FreeSpace,
+    space: &'static dyn FreeSpace,
     progress: &mut Progress<'_>,
     cancel: &CancellationToken,
 ) -> Result<(), Stop> {
-    let free = space.free_bytes(spot.parent).map_err(Stop::Disk)?;
+    let dir = spot.parent.to_path_buf();
+    let free = tokio::task::spawn_blocking(move || space.free_bytes(&dir))
+        .await
+        .map_err(|e| Stop::Disk(io::Error::other(e)))?
+        .map_err(Stop::Disk)?;
     if free < header.total_bytes.saturating_add(SPACE_MARGIN) {
         info!(
             "{free} bytes free in {}; a {}-byte item needs {SPACE_MARGIN} more",
@@ -428,6 +492,7 @@ async fn receive_into(
     // Left by a crash.
     remove_any(spot.part).await.map_err(Stop::Disk)?;
     let mut buf = vec![0u8; CHUNK];
+    let mut hidden = false;
     while let Some(entry) = unless_cancelled(cancel, files.next_entry())
         .await?
         .map_err(Stop::Stream)?
@@ -444,17 +509,29 @@ async fn receive_into(
         } else {
             spot.part.join(rel)
         };
+        let root = entry.path.is_empty();
         match entry.kind {
-            ItemKind::Dir => tokio::fs::create_dir_all(&path).await.map_err(Stop::Disk)?,
+            ItemKind::Dir => {
+                fs::create_dir_all(&path).map_err(Stop::Disk)?;
+                hidden |= root && hide(&path);
+            }
             ItemKind::File => {
-                if !entry.path.is_empty()
-                    && let Some(dir) = path.parent()
-                {
-                    tokio::fs::create_dir_all(dir).await.map_err(Stop::Disk)?;
+                if !root && let Some(dir) = path.parent() {
+                    fs::create_dir_all(dir).map_err(Stop::Disk)?;
                 }
-                receive_file(files, &path, &mut buf, progress, cancel).await?;
+                let file = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+                    .map_err(Stop::Disk)?;
+                hidden |= root && hide(&path);
+                let file = tokio::fs::File::from_std(file);
+                receive_file(files, file, &mut buf, progress, cancel).await?;
             }
         }
+    }
+    if hidden {
+        unhide(spot.part).map_err(Stop::Disk)?;
     }
     match rename_new(spot.part, spot.target).await {
         Ok(()) => Ok(()),
@@ -466,21 +543,15 @@ async fn receive_into(
     }
 }
 
-/// Writes the current entry's bytes to a new file at `path`, then flushes
+/// Writes the current entry's bytes to `file`, just created, then flushes
 /// and closes it.
 async fn receive_file(
     files: &mut FilesIn,
-    path: &Path,
+    file: tokio::fs::File,
     buf: &mut [u8],
     progress: &mut Progress<'_>,
     cancel: &CancellationToken,
 ) -> Result<(), Stop> {
-    let file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .await
-        .map_err(Stop::Disk)?;
     let mut w = BufWriter::with_capacity(CHUNK, file);
     let written = async {
         loop {
@@ -497,9 +568,10 @@ async fn receive_file(
     }
     .await;
     if written.is_err() {
-        // So no write is still in flight, holding the file open, when the
-        // `.cjpart` is removed.
-        let _ = w.flush().await;
+        // Waits for a write still in flight, which holds the file open, so
+        // it is closed before the `.cjpart` is removed; what is still in the
+        // buffer is dropped, not written.
+        let _ = w.get_mut().flush().await;
     }
     written
 }
@@ -527,9 +599,7 @@ fn part_name(name: &str) -> String {
     if fits(plain.len(), plain.encode_utf16().count()) {
         return plain;
     }
-    let mut h = DefaultHasher::new();
-    name.hash(&mut h);
-    let tail = format!("~{:016x}.cjpart", h.finish());
+    let tail = format!("~{:016x}.cjpart", fnv1a(name.as_bytes()));
     let mut out = String::from(".");
     let (mut bytes, mut units) = (1 + tail.len(), 1 + tail.len());
     for c in name.chars() {
@@ -544,13 +614,76 @@ fn part_name(name: &str) -> String {
     out
 }
 
+/// 64-bit FNV-1a: unlike std's hashers, the same in every Rust release,
+/// so a part left by a crash is still found after an update.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+        (h ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+/// Hides a part in Explorer so one left by a hard kill isn't in plain
+/// sight; best effort. Whether it is now hidden.
+#[cfg(windows)]
+fn hide(p: &Path) -> bool {
+    match set_hidden(p, true) {
+        Ok(()) => true,
+        Err(e) => {
+            info!("{} not hidden: {e}", p.display());
+            false
+        }
+    }
+}
+
+/// On the Mac its leading dot already hides it.
+#[cfg(not(windows))]
+fn hide(_p: &Path) -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn unhide(p: &Path) -> io::Result<()> {
+    set_hidden(p, false)
+}
+
+#[cfg(not(windows))]
+fn unhide(_p: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(windows)]
+fn set_hidden(p: &Path, hidden: bool) -> io::Result<()> {
+    use std::os::windows::fs::MetadataExt;
+    use windows::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_NORMAL, FILE_FLAGS_AND_ATTRIBUTES, SetFileAttributesW,
+    };
+    use windows::core::HSTRING;
+    // The attributes SetFileAttributesW takes: read-only, hidden, system,
+    // archive, normal, temporary, offline and not-content-indexed.
+    const SETTABLE: u32 = 0x1 | 0x2 | 0x4 | 0x20 | 0x80 | 0x100 | 0x1000 | 0x2000;
+    let attrs = fs::symlink_metadata(p)?.file_attributes() & SETTABLE;
+    let attrs = match hidden {
+        true => attrs | FILE_ATTRIBUTE_HIDDEN.0,
+        false => attrs & !FILE_ATTRIBUTE_HIDDEN.0,
+    };
+    let attrs = if attrs == 0 {
+        FILE_ATTRIBUTE_NORMAL
+    } else {
+        FILE_FLAGS_AND_ATTRIBUTES(attrs)
+    };
+    let name = HSTRING::from(verbatim(p)?.as_path());
+    // SAFETY: the name is a valid wide string.
+    unsafe { SetFileAttributesW(&name, attrs) }.map_err(win_io_error)
+}
+
 /// Renames `from` to `to`, failing with `AlreadyExists` rather than
 /// replacing anything already at `to`.
 #[cfg(windows)]
 async fn rename_new(from: &Path, to: &Path) -> io::Result<()> {
     use windows::Win32::Storage::FileSystem::{MOVE_FILE_FLAGS, MoveFileExW};
     use windows::core::HSTRING;
-    let (from, to) = (HSTRING::from(from), HSTRING::from(to));
+    let from = HSTRING::from(verbatim(from)?.as_path());
+    let to = HSTRING::from(verbatim(to)?.as_path());
     let mut tries = 0;
     loop {
         // Without MOVEFILE_REPLACE_EXISTING an existing target is an error.
@@ -570,29 +703,69 @@ async fn rename_new(from: &Path, to: &Path) -> io::Result<()> {
 
 /// Renames `from` to `to`, failing with `AlreadyExists` rather than
 /// replacing anything already at `to`.
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
 async fn rename_new(from: &Path, to: &Path) -> io::Result<()> {
-    let (f, t) = (c_path(from)?, c_path(to)?);
-    // SAFETY: both paths are NUL-terminated.
-    if unsafe { libc::renamex_np(f.as_ptr(), t.as_ptr(), libc::RENAME_EXCL) } == 0 {
-        return Ok(());
-    }
-    let e = io::Error::last_os_error();
-    // A volume without RENAME_EXCL (some network and FAT volumes): look
-    // first instead, which leaves a moment for something to appear there.
-    if e.raw_os_error() != Some(libc::ENOTSUP) {
-        return Err(e);
-    }
-    if fs::symlink_metadata(to).is_ok() {
-        return Err(io::ErrorKind::AlreadyExists.into());
-    }
-    tokio::fs::rename(from, to).await
+    let (from, to) = (from.to_path_buf(), to.to_path_buf());
+    let renamed = tokio::task::spawn_blocking(move || {
+        let (f, t) = (c_path(&from)?, c_path(&to)?);
+        // SAFETY: both paths are NUL-terminated.
+        if unsafe { libc::renamex_np(f.as_ptr(), t.as_ptr(), libc::RENAME_EXCL) } == 0 {
+            return Ok(());
+        }
+        let e = io::Error::last_os_error();
+        // A volume without RENAME_EXCL (some network and FAT volumes): look
+        // first instead, which leaves a moment for something to appear.
+        if e.raw_os_error() != Some(libc::ENOTSUP) {
+            return Err(e);
+        }
+        if fs::symlink_metadata(&to).is_ok() {
+            return Err(io::ErrorKind::AlreadyExists.into());
+        }
+        fs::rename(&from, &to)
+    });
+    renamed.await.map_err(io::Error::other)?
+}
+
+/// `p` made absolute with a `\\?\` prefix, so the Win32 calls made
+/// directly here (std's own already do this) take paths beyond MAX_PATH:
+/// the app isn't marked long-path aware.
+#[cfg(windows)]
+fn verbatim(p: &Path) -> io::Result<PathBuf> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use std::path::{Component, Prefix};
+    // On Windows this also resolves `.` and `..` and turns `/` into `\`,
+    // as a verbatim path needs.
+    let abs = std::path::absolute(p)?;
+    let wide: Vec<u16> = match abs.components().next() {
+        Some(Component::Prefix(pre)) => match pre.kind() {
+            Prefix::Disk(_) => r"\\?\"
+                .encode_utf16()
+                .chain(abs.as_os_str().encode_wide())
+                .collect(),
+            // `\\server\share\x` becomes `\\?\UNC\server\share\x`.
+            Prefix::UNC(..) => r"\\?\UNC"
+                .encode_utf16()
+                .chain(abs.as_os_str().encode_wide().skip(1))
+                .collect(),
+            // Already verbatim, or a device path.
+            _ => return Ok(abs),
+        },
+        _ => return Ok(abs),
+    };
+    Ok(OsString::from_wide(&wide).into())
 }
 
 #[cfg(windows)]
 fn win_io_error(e: windows::core::Error) -> io::Error {
-    // Win32 errors arrive as HRESULTs with the code in the low 16 bits.
-    io::Error::from_raw_os_error(e.code().0 & 0xFFFF)
+    // A Win32 error arrives as an HRESULT with FACILITY_WIN32 (7) and the
+    // code in the low 16 bits; anything else isn't an OS error code.
+    let hr = e.code().0 as u32;
+    if hr & 0xFFFF_0000 == 0x8007_0000 {
+        io::Error::from_raw_os_error((hr & 0xFFFF) as i32)
+    } else {
+        io::Error::other(e)
+    }
 }
 
 #[cfg(not(windows))]
@@ -692,7 +865,7 @@ mod tests {
     async fn transfer(
         root: &Path,
         dest: Dest,
-        space: &dyn FreeSpace,
+        space: &'static dyn FreeSpace,
     ) -> (Result<(), FailReason>, Result<PathBuf, FailReason>) {
         let (_l, sa, sb) = session_pair().await;
         let never = CancellationToken::new();
@@ -773,6 +946,14 @@ mod tests {
         assert_eq!(received, Ok(dest.path().join("report.pdf")));
         assert_eq!(fs::read(dest.path().join("report.pdf")).unwrap(), data);
         assert_eq!(names(dest.path()), ["report.pdf"]);
+        #[cfg(windows)]
+        assert!(!is_hidden(&dest.path().join("report.pdf")), "still hidden");
+    }
+
+    #[cfg(windows)]
+    fn is_hidden(p: &Path) -> bool {
+        use std::os::windows::fs::MetadataExt;
+        fs::metadata(p).unwrap().file_attributes() & 0x2 != 0
     }
 
     #[tokio::test]
@@ -1058,6 +1239,58 @@ mod tests {
         }
     }
 
+    /// The receive is aborted, or panics, mid-folder: its part is removed
+    /// as the future is dropped. (On Windows the part is hidden meanwhile.)
+    #[tokio::test]
+    async fn dropped_or_panicking_receive_leaves_nothing() {
+        for abort in [true, false] {
+            let (src, dest) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+            let root = videos(src.path());
+            let (_l, sa, sb) = session_pair().await;
+            let never = CancellationToken::new();
+            let (got_tx, mut got_rx) = watch::channel(0u64);
+            let receiver = tokio::spawn({
+                let (sb, dest, never) = (sb.clone(), dest.path().to_path_buf(), never.clone());
+                async move {
+                    let f = files_in(&sb).await;
+                    let progress = move |n| {
+                        if !abort && n >= 6 << 20 {
+                            panic!("progress panics on purpose");
+                        }
+                        got_tx.send_replace(n);
+                    };
+                    receive_item(f, Dest::InDir(dest), &LOTS, progress, &never).await
+                }
+            });
+            let sender = tokio::spawn({
+                let (sa, root, never) = (sa.clone(), root.clone(), never.clone());
+                async move { send_item(&sa, 7, 0, &root, &pacer(), &never).await }
+            });
+            if abort {
+                timeout(T, got_rx.wait_for(|n| *n >= 6 << 20))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let part = dest.path().join(".Videos.cjpart");
+                assert!(part.is_dir(), "{:?}", names(dest.path()));
+                #[cfg(windows)]
+                assert!(is_hidden(&part), "part not hidden");
+                receiver.abort();
+            }
+            let joined = timeout(T, receiver).await.unwrap();
+            assert!(joined.is_err(), "{joined:?}");
+            // The drop has run by the time the join reports it; poll anyway
+            // in case removal is slow.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !names(dest.path()).is_empty() && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(names(dest.path()).is_empty(), "{:?}", names(dest.path()));
+            let sent = timeout(T, sender).await.unwrap().unwrap();
+            assert_eq!(sent, Err(FailReason::Cancelled), "abort {abort}");
+        }
+    }
+
     /// A disk with this much free space that notes where it was asked about.
     struct Recorded(u64, Mutex<Vec<PathBuf>>);
 
@@ -1074,8 +1307,11 @@ mod tests {
         let root = src.path().join("disk.img");
         fs::write(&root, bytes(1000, 0)).unwrap();
 
-        let space = Recorded(1000 + SPACE_MARGIN - 1, Mutex::default());
-        let (sent, received) = transfer(&root, Dest::InDir(dest.path().into()), &space).await;
+        let space: &'static Recorded = Box::leak(Box::new(Recorded(
+            1000 + SPACE_MARGIN - 1,
+            Mutex::default(),
+        )));
+        let (sent, received) = transfer(&root, Dest::InDir(dest.path().into()), space).await;
         assert_eq!(received, Err(FailReason::NoSpace));
         assert!(
             matches!(sent, Ok(()) | Err(FailReason::Cancelled)),
@@ -1085,9 +1321,10 @@ mod tests {
         assert_eq!(*space.1.lock().unwrap(), [dest.path()]);
 
         // Exactly enough is enough.
-        let space = Recorded(1000 + SPACE_MARGIN, Mutex::default());
+        let space: &'static Recorded =
+            Box::leak(Box::new(Recorded(1000 + SPACE_MARGIN, Mutex::default())));
         let exact = dest.path().join("x.img");
-        let (sent, received) = transfer(&root, Dest::Exact(exact.clone()), &space).await;
+        let (sent, received) = transfer(&root, Dest::Exact(exact.clone()), space).await;
         assert_eq!((sent, received), (Ok(()), Ok(exact)));
         assert_eq!(*space.1.lock().unwrap(), [dest.path()]);
     }
@@ -1248,6 +1485,51 @@ mod tests {
                 .all(|w| w[1].0 - w[0].0 >= Duration::from_millis(100)),
             "{seen:?}"
         );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn destination_paths_beyond_max_path_work() {
+        let (src, dest) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let root = src.path().join("report.pdf");
+        fs::write(&root, b"far down").unwrap();
+        let deep = dest
+            .path()
+            .join("a".repeat(100))
+            .join("b".repeat(100))
+            .join("c".repeat(100));
+        fs::create_dir_all(&deep).unwrap();
+        let target = deep.join("report.pdf");
+        assert!(target.as_os_str().len() > 260);
+
+        // OsFreeSpace and the rename are the raw Win32 calls; the folder
+        // item also gets hidden and shown again.
+        let (sent, received) = transfer(&root, Dest::InDir(deep.clone()), &OsFreeSpace).await;
+        assert_eq!((sent, received), (Ok(()), Ok(target.clone())));
+        assert_eq!(fs::read(&target).unwrap(), b"far down");
+        assert!(!is_hidden(&target));
+        let album = album(src.path());
+        let (sent, received) = transfer(&album, Dest::InDir(deep.clone()), &OsFreeSpace).await;
+        assert_eq!((sent, received), (Ok(()), Ok(deep.join("Album"))));
+        assert!(!is_hidden(&deep.join("Album")));
+        assert_eq!(names(&deep), ["Album", "report.pdf"]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn verbatim_paths() {
+        let v = |p: &str| verbatim(Path::new(p)).unwrap();
+        assert_eq!(v(r"C:\a\..\b/c"), Path::new(r"\\?\C:\b\c"));
+        assert_eq!(v(r"\\server\share\x"), Path::new(r"\\?\UNC\server\share\x"));
+        assert_eq!(v(r"\\?\D:\y"), Path::new(r"\\?\D:\y"));
+        assert!(v("rel").is_absolute());
+    }
+
+    #[test]
+    fn fnv1a_is_the_standard_one() {
+        assert_eq!(fnv1a(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv1a(b"foobar"), 0x8594_4171_f739_67e8);
     }
 
     #[test]
