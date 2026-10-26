@@ -46,8 +46,7 @@ pub enum Dest {
 }
 
 /// Free space at a destination, as a trait so tests can fake a full disk.
-/// `receive_item` asks it off the runtime's threads (`spawn_blocking`),
-/// which is why it takes a `&'static dyn FreeSpace`.
+/// `receive_item` asks it off the runtime's threads (`spawn_blocking`).
 pub trait FreeSpace: Send + Sync {
     fn free_bytes(&self, dir: &Path) -> io::Result<u64>;
 }
@@ -338,7 +337,7 @@ async fn send_file(
 pub async fn receive_item(
     mut files: FilesIn,
     dest: Dest,
-    space: &'static dyn FreeSpace,
+    space: Arc<dyn FreeSpace>,
     mut progress: impl FnMut(u64) + Send,
     cancel: &CancellationToken,
 ) -> Result<PathBuf, FailReason> {
@@ -465,14 +464,16 @@ impl Progress<'_> {
     }
 }
 
-/// Folders and files are created synchronously, not on tokio's blocking
-/// pool: a creation still running there when the future is dropped could
-/// land after the `PartGuard` had cleaned up, and be left behind.
+/// Folders and files are created, and the part renamed into place,
+/// synchronously, not on tokio's blocking pool: a creation still running
+/// there when the future is dropped could land after the `PartGuard` had
+/// cleaned up, and a rename could land a tree the guard was halfway through
+/// removing.
 async fn receive_into(
     files: &mut FilesIn,
     header: &FilesHeader,
     spot: Spot<'_>,
-    space: &'static dyn FreeSpace,
+    space: Arc<dyn FreeSpace>,
     progress: &mut Progress<'_>,
     cancel: &CancellationToken,
 ) -> Result<(), Stop> {
@@ -677,7 +678,8 @@ fn set_hidden(p: &Path, hidden: bool) -> io::Result<()> {
 }
 
 /// Renames `from` to `to`, failing with `AlreadyExists` rather than
-/// replacing anything already at `to`.
+/// replacing anything already at `to`. Each try runs on this thread (see
+/// `receive_into`); only the waits between them yield.
 #[cfg(windows)]
 async fn rename_new(from: &Path, to: &Path) -> io::Result<()> {
     use windows::Win32::Storage::FileSystem::{MOVE_FILE_FLAGS, MoveFileExW};
@@ -703,27 +705,24 @@ async fn rename_new(from: &Path, to: &Path) -> io::Result<()> {
 
 /// Renames `from` to `to`, failing with `AlreadyExists` rather than
 /// replacing anything already at `to`.
+/// Synchronous, fallback included (see `receive_into`).
 #[cfg(target_os = "macos")]
 async fn rename_new(from: &Path, to: &Path) -> io::Result<()> {
-    let (from, to) = (from.to_path_buf(), to.to_path_buf());
-    let renamed = tokio::task::spawn_blocking(move || {
-        let (f, t) = (c_path(&from)?, c_path(&to)?);
-        // SAFETY: both paths are NUL-terminated.
-        if unsafe { libc::renamex_np(f.as_ptr(), t.as_ptr(), libc::RENAME_EXCL) } == 0 {
-            return Ok(());
-        }
-        let e = io::Error::last_os_error();
-        // A volume without RENAME_EXCL (some network and FAT volumes): look
-        // first instead, which leaves a moment for something to appear.
-        if e.raw_os_error() != Some(libc::ENOTSUP) {
-            return Err(e);
-        }
-        if fs::symlink_metadata(&to).is_ok() {
-            return Err(io::ErrorKind::AlreadyExists.into());
-        }
-        fs::rename(&from, &to)
-    });
-    renamed.await.map_err(io::Error::other)?
+    let (f, t) = (c_path(from)?, c_path(to)?);
+    // SAFETY: both paths are NUL-terminated.
+    if unsafe { libc::renamex_np(f.as_ptr(), t.as_ptr(), libc::RENAME_EXCL) } == 0 {
+        return Ok(());
+    }
+    let e = io::Error::last_os_error();
+    // A volume without RENAME_EXCL (some network and FAT volumes): look
+    // first instead, which leaves a moment for something to appear.
+    if e.raw_os_error() != Some(libc::ENOTSUP) {
+        return Err(e);
+    }
+    if fs::symlink_metadata(to).is_ok() {
+        return Err(io::ErrorKind::AlreadyExists.into());
+    }
+    fs::rename(from, to)
 }
 
 /// `p` made absolute with a `\\?\` prefix, so the Win32 calls made
@@ -858,14 +857,17 @@ mod tests {
         }
     }
 
-    const LOTS: Space = Space(u64::MAX);
+    /// A disk with all the space anyone could want.
+    fn lots() -> Arc<dyn FreeSpace> {
+        Arc::new(Space(u64::MAX))
+    }
 
     /// Sends `root` from one end of a fresh session and receives it into
     /// `dest` at the other.
     async fn transfer(
         root: &Path,
         dest: Dest,
-        space: &'static dyn FreeSpace,
+        space: Arc<dyn FreeSpace>,
     ) -> (Result<(), FailReason>, Result<PathBuf, FailReason>) {
         let (_l, sa, sb) = session_pair().await;
         let never = CancellationToken::new();
@@ -941,7 +943,12 @@ mod tests {
         let data = bytes(CHUNK * 4 + 17, 3);
         fs::write(&root, &data).unwrap();
 
-        let (sent, received) = transfer(&root, Dest::InDir(dest.path().into()), &OsFreeSpace).await;
+        let (sent, received) = transfer(
+            &root,
+            Dest::InDir(dest.path().into()),
+            Arc::new(OsFreeSpace),
+        )
+        .await;
         assert_eq!(sent, Ok(()));
         assert_eq!(received, Ok(dest.path().join("report.pdf")));
         assert_eq!(fs::read(dest.path().join("report.pdf")).unwrap(), data);
@@ -963,7 +970,7 @@ mod tests {
         fs::write(&root, bytes(5000, 9)).unwrap();
         let exact = dest.path().join("Promised Name.bin");
 
-        let (sent, received) = transfer(&root, Dest::Exact(exact.clone()), &LOTS).await;
+        let (sent, received) = transfer(&root, Dest::Exact(exact.clone()), lots()).await;
         assert_eq!(sent, Ok(()));
         assert_eq!(received, Ok(exact.clone()));
         assert_eq!(fs::read(&exact).unwrap(), bytes(5000, 9));
@@ -975,7 +982,12 @@ mod tests {
         let (src, dest) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         let root = album(src.path());
 
-        let (sent, received) = transfer(&root, Dest::InDir(dest.path().into()), &OsFreeSpace).await;
+        let (sent, received) = transfer(
+            &root,
+            Dest::InDir(dest.path().into()),
+            Arc::new(OsFreeSpace),
+        )
+        .await;
         assert_eq!(sent, Ok(()));
         assert_eq!(received, Ok(dest.path().join("Album")));
         let (want, got) = (tree(&root), tree(&dest.path().join("Album")));
@@ -1044,7 +1056,7 @@ mod tests {
             return;
         }
 
-        let (sent, received) = transfer(&root, Dest::InDir(dest.path().into()), &LOTS).await;
+        let (sent, received) = transfer(&root, Dest::InDir(dest.path().into()), lots()).await;
         assert_eq!(sent, Ok(()));
         assert_eq!(received, Ok(dest.path().join("Linked")));
         let got = tree(&dest.path().join("Linked"));
@@ -1075,7 +1087,7 @@ mod tests {
                 .unwrap()
                 .push((root.clone(), change));
 
-            let (sent, received) = transfer(&root, Dest::InDir(dest.path().into()), &LOTS).await;
+            let (sent, received) = transfer(&root, Dest::InDir(dest.path().into()), lots()).await;
             assert_eq!(
                 sent,
                 Err(FailReason::Changed {
@@ -1115,7 +1127,7 @@ mod tests {
             }
         }
 
-        let (sent, received) = transfer(&root, Dest::InDir(dest.path().into()), &LOTS).await;
+        let (sent, received) = transfer(&root, Dest::InDir(dest.path().into()), lots()).await;
         assert_eq!(
             sent,
             Err(FailReason::Unreadable {
@@ -1166,7 +1178,7 @@ mod tests {
                 receive_item(
                     f,
                     Dest::InDir(dest.path().into()),
-                    &LOTS,
+                    lots(),
                     move |n| {
                         got_tx.send_replace(n);
                     },
@@ -1226,7 +1238,7 @@ mod tests {
                             trip.cancel();
                         }
                     };
-                    receive_item(f, Dest::InDir(dest), &LOTS, progress, &recv_cancel).await
+                    receive_item(f, Dest::InDir(dest), lots(), progress, &recv_cancel).await
                 }
             });
             let sent = timeout(T, send_item(&sa, 7, 0, &root, &pacer(), &send_cancel))
@@ -1259,7 +1271,7 @@ mod tests {
                         }
                         got_tx.send_replace(n);
                     };
-                    receive_item(f, Dest::InDir(dest), &LOTS, progress, &never).await
+                    receive_item(f, Dest::InDir(dest), lots(), progress, &never).await
                 }
             });
             let sender = tokio::spawn({
@@ -1307,11 +1319,9 @@ mod tests {
         let root = src.path().join("disk.img");
         fs::write(&root, bytes(1000, 0)).unwrap();
 
-        let space: &'static Recorded = Box::leak(Box::new(Recorded(
-            1000 + SPACE_MARGIN - 1,
-            Mutex::default(),
-        )));
-        let (sent, received) = transfer(&root, Dest::InDir(dest.path().into()), space).await;
+        let space = Arc::new(Recorded(1000 + SPACE_MARGIN - 1, Mutex::default()));
+        let (sent, received) =
+            transfer(&root, Dest::InDir(dest.path().into()), space.clone()).await;
         assert_eq!(received, Err(FailReason::NoSpace));
         assert!(
             matches!(sent, Ok(()) | Err(FailReason::Cancelled)),
@@ -1321,10 +1331,9 @@ mod tests {
         assert_eq!(*space.1.lock().unwrap(), [dest.path()]);
 
         // Exactly enough is enough.
-        let space: &'static Recorded =
-            Box::leak(Box::new(Recorded(1000 + SPACE_MARGIN, Mutex::default())));
+        let space = Arc::new(Recorded(1000 + SPACE_MARGIN, Mutex::default()));
         let exact = dest.path().join("x.img");
-        let (sent, received) = transfer(&root, Dest::Exact(exact.clone()), space).await;
+        let (sent, received) = transfer(&root, Dest::Exact(exact.clone()), space.clone()).await;
         assert_eq!((sent, received), (Ok(()), Ok(exact)));
         assert_eq!(*space.1.lock().unwrap(), [dest.path()]);
     }
@@ -1401,7 +1410,7 @@ mod tests {
             (&file, Dest::Exact(dest.path().join("one.txt"))),
         ] {
             // The sender may have finished before the refusal reached it.
-            let (sent, received) = transfer(root, dest, &LOTS).await;
+            let (sent, received) = transfer(root, dest, lots()).await;
             assert_eq!(received, Err(FailReason::Unwritable));
             assert!(
                 matches!(sent, Ok(()) | Err(FailReason::Cancelled)),
@@ -1426,7 +1435,7 @@ mod tests {
             (&file, Dest::Exact(dest.path().join("report.pdf"))),
             (&root, Dest::InDir(dest.path().into())),
         ] {
-            let (_, received) = transfer(root, dest.clone(), &LOTS).await;
+            let (_, received) = transfer(root, dest.clone(), lots()).await;
             assert_eq!(received, Err(FailReason::Unwritable), "{dest:?}");
         }
         assert_eq!(names(dest.path()), ["Album", "report.pdf"]);
@@ -1446,7 +1455,7 @@ mod tests {
         fs::create_dir(&stale).unwrap();
         fs::write(stale.join("junk"), b"junk").unwrap();
 
-        let (sent, received) = transfer(&root, Dest::InDir(dest.path().into()), &LOTS).await;
+        let (sent, received) = transfer(&root, Dest::InDir(dest.path().into()), lots()).await;
         assert_eq!(sent, Ok(()));
         assert_eq!(received, Ok(dest.path().join("report.pdf")));
         assert_eq!(names(dest.path()), ["report.pdf"]);
@@ -1468,7 +1477,7 @@ mod tests {
             tokio::join!(send_item(&sa, 7, 0, &root, &p, &never), async {
                 let f = files_in(&sb).await;
                 let progress = |n| seen.push((Instant::now(), n));
-                receive_item(f, Dest::InDir(dest.path().into()), &LOTS, progress, &never).await
+                receive_item(f, Dest::InDir(dest.path().into()), lots(), progress, &never).await
             })
         })
         .await
@@ -1504,12 +1513,14 @@ mod tests {
 
         // OsFreeSpace and the rename are the raw Win32 calls; the folder
         // item also gets hidden and shown again.
-        let (sent, received) = transfer(&root, Dest::InDir(deep.clone()), &OsFreeSpace).await;
+        let (sent, received) =
+            transfer(&root, Dest::InDir(deep.clone()), Arc::new(OsFreeSpace)).await;
         assert_eq!((sent, received), (Ok(()), Ok(target.clone())));
         assert_eq!(fs::read(&target).unwrap(), b"far down");
         assert!(!is_hidden(&target));
         let album = album(src.path());
-        let (sent, received) = transfer(&album, Dest::InDir(deep.clone()), &OsFreeSpace).await;
+        let (sent, received) =
+            transfer(&album, Dest::InDir(deep.clone()), Arc::new(OsFreeSpace)).await;
         assert_eq!((sent, received), (Ok(()), Ok(deep.join("Album"))));
         assert!(!is_hidden(&deep.join("Album")));
         assert_eq!(names(&deep), ["Album", "report.pdf"]);
