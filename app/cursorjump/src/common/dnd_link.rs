@@ -12,7 +12,7 @@
 //! tokens, never aborted, so `transfer` always cleans up on its own path.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -25,6 +25,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
+use unicode_normalization::UnicodeNormalization;
 
 use super::transfer::{Dest, FreeSpace, SharedPacer, receive_item, send_item};
 
@@ -48,7 +49,9 @@ pub enum Source {
 #[derive(Debug, Clone, PartialEq)]
 pub enum DndEv {
     /// Receiver side, over all the drag's items; at most 10 a second per
-    /// drag, and always the value as each item ends.
+    /// drag. A change held back by that limit is sent as soon as it allows,
+    /// so the last value always arrives, possibly just after its item's
+    /// `Received`.
     Progress {
         drag: DragId,
         done: u64,
@@ -75,8 +78,9 @@ pub enum DndEv {
 /// Two fetches in flight at once never write the same place: one into
 /// the same `Exact` path, or into the same folder under the same sanitized
 /// name, is refused with `Unwritable` rather than racing the first on its
-/// `.cjpart`. Callers normally pick a fresh folder per drag. Paths are
-/// compared as given, without folding case.
+/// `.cjpart`. Paths are compared folded (NFC, lowercase) on every OS, as
+/// NTFS and APFS compare names, so "Foo.txt" and "foo.txt" clash too.
+/// Callers normally pick a fresh folder per drag.
 pub struct DndLink {
     session: Session,
     pacer: SharedPacer,
@@ -123,8 +127,8 @@ struct Incoming {
 struct Fetch {
     id: u64,
     dest: Dest,
-    /// Where the item lands, as far as is known yet.
-    target: PathBuf,
+    /// Where the item lands, as far as is known yet (`dest_key`).
+    key: String,
     /// Its files stream has arrived.
     started: bool,
     cancel: CancellationToken,
@@ -152,8 +156,33 @@ impl Shared {
         true
     }
 
+    /// Sends `drag`'s progress if a report is due, or has it sent once one
+    /// is.
+    fn report(self: &Arc<Self>, drag: DragId, tally: &mut Tally) {
+        match tally.report(Instant::now()) {
+            Report::Now((done, total)) => self.emit(DndEv::Progress { drag, done, total }),
+            Report::At(at) => {
+                let shared = Arc::clone(self);
+                tokio::spawn(async move {
+                    tokio::time::sleep_until(at.into()).await;
+                    shared.flush(drag);
+                });
+            }
+            Report::Not => {}
+        }
+    }
+
+    /// Sends the change `report` held back, if the drag is still going.
+    fn flush(self: &Arc<Self>, drag: DragId) {
+        let mut st = self.lock();
+        if let Some(inc) = st.incoming.get_mut(&drag) {
+            inc.tally.flushed();
+            self.report(drag, &mut inc.tally);
+        }
+    }
+
     /// Fetch `id` of `item` has `done` bytes so far.
-    fn progress(&self, drag: DragId, item: u32, id: u64, done: u64) {
+    fn progress(self: &Arc<Self>, drag: DragId, item: u32, id: u64, done: u64) {
         let mut st = self.lock();
         let Some(inc) = st.incoming.get_mut(&drag) else {
             return;
@@ -162,14 +191,18 @@ impl Shared {
             return;
         }
         inc.tally.set(item, done);
-        if let Some((done, total)) = inc.tally.report(Instant::now(), false) {
-            self.emit(DndEv::Progress { drag, done, total });
-        }
+        self.report(drag, &mut inc.tally);
     }
 
     /// Fetch `id` of `item` ended; nothing if it was already settled.
     /// Events are sent under the lock, so they keep their order.
-    fn received(&self, drag: DragId, item: u32, id: u64, result: Result<PathBuf, FailReason>) {
+    fn received(
+        self: &Arc<Self>,
+        drag: DragId,
+        item: u32,
+        id: u64,
+        result: Result<PathBuf, FailReason>,
+    ) {
         let mut st = self.lock();
         let Some(inc) = st.incoming.get_mut(&drag) else {
             return;
@@ -182,27 +215,44 @@ impl Shared {
             (Err(FailReason::Cancelled), Some(why)) => Err(why.clone()),
             (r, _) => r,
         };
-        if let Some((done, total)) = inc.tally.report(Instant::now(), true) {
-            self.emit(DndEv::Progress { drag, done, total });
-        }
+        self.report(drag, &mut inc.tally);
         self.emit(DndEv::Received { drag, item, result });
     }
 }
 
-/// Whether a fetch other than `except` is in flight to `target`.
-fn lands_at(st: &State, target: &Path, except: u64) -> bool {
+/// Ends a drag that started here because an item can't be sent, and tells
+/// the receiver why.
+async fn fail_origin(shared: &Shared, session: &Session, drag: DragId, reason: FailReason) {
+    if shared.origin_failed(drag, &reason) {
+        let c = Control::DragCancel { drag, reason };
+        if let Err(e) = session.send_control(&c).await {
+            debug!("cancel of drag {drag} not sent: {e:#}");
+        }
+    }
+}
+
+/// Whether a fetch other than `except` is in flight to `key`.
+fn lands_at(st: &State, key: &str, except: u64) -> bool {
     st.incoming
         .values()
         .flat_map(|inc| inc.fetches.values())
-        .any(|f| f.id != except && f.target == target)
+        .any(|f| f.id != except && f.key == key)
 }
 
-/// Where an item named `name` lands at `dest`, as `receive_item` places it.
-fn target(dest: &Dest, name: &str) -> PathBuf {
-    match dest {
+/// Where an item named `name` lands at `dest`, as `receive_item` places
+/// it, folded so that two paths NTFS or APFS would take for one (and so
+/// one `.cjpart`) are equal. Folding on every OS can only refuse a rare
+/// second fetch that would have been safe.
+fn dest_key(dest: &Dest, name: &str) -> String {
+    let target = match dest {
         Dest::Exact(p) => p.clone(),
         Dest::InDir(d) => d.join(sanitize_component(name)),
-    }
+    };
+    target
+        .to_string_lossy()
+        .nfc()
+        .collect::<String>()
+        .to_lowercase()
 }
 
 /// The path a pending source resolves to, or why it never will; None if
@@ -292,45 +342,48 @@ impl DndLink {
             return;
         };
         let i = item as usize;
-        let (Some(source), Some(it)) = (out.sources.get(i), out.items.get(i)) else {
-            warn!(
-                "fetch for item {item} of drag {drag}, which has {}",
-                out.items.len()
-            );
-            return;
+        let found = match (out.sources.get(i), out.items.get(i)) {
+            (Some(source), Some(it)) => {
+                Some((source.clone(), it.name.clone(), out.cancel.child_token()))
+            }
+            _ => {
+                warn!(
+                    "fetch for item {item} of drag {drag}, which has {}",
+                    out.items.len()
+                );
+                None
+            }
         };
-        let (source, name) = (source.clone(), it.name.clone());
-        let cancel = out.cancel.child_token();
         drop(st);
         let (shared, session, pacer) = (
             self.shared.clone(),
             self.session.clone(),
             self.pacer.clone(),
         );
+        let Some((source, name, cancel)) = found else {
+            // Ends the drag on both sides rather than leave the fetch
+            // waiting.
+            let reason = FailReason::Unreadable {
+                name: format!("item {item}"),
+            };
+            tokio::spawn(async move { fail_origin(&shared, &session, drag, reason).await });
+            return;
+        };
         tokio::spawn(async move {
             let root = match source {
-                Source::Ready(p) => Ok(p),
+                Source::Ready(p) => p,
                 Source::Pending(rx) => match resolve(rx, &name, &cancel).await {
-                    Some(r) => r,
                     None => return,
+                    Some(Ok(p)) => p,
+                    // Whatever it is, even Cancelled: only this side knows.
+                    Some(Err(why)) => return fail_origin(&shared, &session, drag, why).await,
                 },
             };
-            let sent = match root {
-                Ok(p) => send_item(&session, drag, item, &p, &pacer, &cancel).await,
-                Err(why) => Err(why),
-            };
-            match sent {
+            match send_item(&session, drag, item, &root, &pacer, &cancel).await {
                 // Sent, stopped by the receiver (which knows why) or by
                 // this side, or the link is gone.
                 Ok(()) | Err(FailReason::Cancelled | FailReason::Disconnected) => {}
-                Err(reason) => {
-                    if shared.origin_failed(drag, &reason) {
-                        let c = Control::DragCancel { drag, reason };
-                        if let Err(e) = session.send_control(&c).await {
-                            debug!("cancel of drag {drag} not sent: {e:#}");
-                        }
-                    }
-                }
+                Err(reason) => fail_origin(&shared, &session, drag, reason).await,
             }
         });
     }
@@ -372,8 +425,8 @@ impl DndLink {
     /// Asks the origin for `item` and receives it into `dest`; its
     /// `Received` follows. A drag already cancelled, or a destination
     /// another fetch is writing, fails the fetch at once. Err for an item
-    /// not offered or already being fetched, or if the request can't be
-    /// sent.
+    /// not offered or already being fetched (with no `Received`), or if the
+    /// request can't be sent (received as `Disconnected`).
     pub async fn fetch(&mut self, drag: DragId, item: u32, dest: Dest) -> Result<()> {
         let Some(id) = self.start_fetch(drag, item, dest)? else {
             return Ok(());
@@ -388,6 +441,8 @@ impl DndLink {
                 && inc.fetches.get(&item).is_some_and(|f| f.id == id)
             {
                 inc.fetches.remove(&item);
+                let result = Err(FailReason::Disconnected);
+                self.shared.emit(DndEv::Received { drag, item, result });
             }
         }
         sent
@@ -399,10 +454,10 @@ impl DndLink {
         let Some(it) = self.items(drag).and_then(|items| items.get(item as usize)) else {
             bail!("drag {drag} has no item {item}");
         };
-        let target = target(&dest, &it.name);
+        let key = dest_key(&dest, &it.name);
         let mut guard = self.shared.lock();
         let st = &mut *guard;
-        let taken = lands_at(st, &target, 0);
+        let taken = lands_at(st, &key, 0);
         let Some(inc) = st.incoming.get_mut(&drag) else {
             bail!("drag {drag} is over");
         };
@@ -412,7 +467,7 @@ impl DndLink {
         let failed = if let Some(why) = &inc.reason {
             Some(why.clone())
         } else if taken {
-            warn!("{} is already being received; refused", target.display());
+            warn!("{key} is already being received; refused");
             Some(FailReason::Unwritable)
         } else {
             None
@@ -430,7 +485,7 @@ impl DndLink {
         let fetch = Fetch {
             id,
             dest,
-            target,
+            key,
             started: false,
             cancel: inc.cancel.child_token(),
         };
@@ -439,7 +494,10 @@ impl DndLink {
     }
 
     /// A files stream from the origin: received, on a task, if it is one
-    /// that was fetched, else cancelled.
+    /// that was fetched, else cancelled. A stream the session's acceptor
+    /// refuses before it gets here (a bad header, which only a broken peer
+    /// sends) leaves its fetch waiting until a cancel, `finish` or
+    /// `disconnected`.
     pub fn on_files(&mut self, files: FilesIn) {
         let h = files.header().clone();
         let (drag, item) = (h.drag, h.item);
@@ -450,20 +508,20 @@ impl DndLink {
             .get(&drag)
             .and_then(|inc| inc.fetches.get(&item))
             .filter(|f| !f.started)
-            .map(|f| (f.id, target(&f.dest, &h.name)));
-        let Some((id, target)) = found else {
+            .map(|f| (f.id, dest_key(&f.dest, &h.name)));
+        let Some((id, key)) = found else {
             drop(guard);
             debug!("files stream for item {item} of drag {drag}, which wasn't fetched");
             files.cancel();
             return;
         };
         // Its name may only be known now, from its header.
-        let taken = lands_at(st, &target, id);
+        let taken = lands_at(st, &key, id);
         let Some(inc) = st.incoming.get_mut(&drag) else {
             return;
         };
         if taken {
-            warn!("{} is already being received; refused", target.display());
+            warn!("{key} is already being received; refused");
             inc.fetches.remove(&item);
             let result = Err(FailReason::Unwritable);
             self.shared.emit(DndEv::Received { drag, item, result });
@@ -474,13 +532,11 @@ impl DndLink {
         let Some(f) = inc.fetches.get_mut(&item) else {
             return;
         };
-        f.target = target;
+        f.key = key;
         f.started = true;
         let (dest, cancel) = (f.dest.clone(), f.cancel.clone());
         inc.tally.start(item, h.total_bytes);
-        if let Some((done, total)) = inc.tally.report(Instant::now(), false) {
-            self.shared.emit(DndEv::Progress { drag, done, total });
-        }
+        self.shared.report(drag, &mut inc.tally);
         drop(guard);
 
         let (shared, space) = (self.shared.clone(), self.space.clone());
@@ -516,6 +572,8 @@ impl DndLink {
     /// Ends an incoming drag here: what is in flight is cancelled and
     /// received as `leftover` (by default the drag's cancel reason, else
     /// `Cancelled`), then it finishes with `outcome`. False if unknown.
+    /// The events go out before the cancelled transfers have removed their
+    /// parts; each does so shortly after, on its own path.
     fn end_incoming(
         &mut self,
         drag: DragId,
@@ -608,6 +666,19 @@ impl Drop for DndLink {
     }
 }
 
+/// Bytes done, and the total if known.
+type Sample = (u64, Option<u64>);
+
+/// What `Tally::report` says to do.
+#[derive(Debug, PartialEq)]
+enum Report {
+    Now(Sample),
+    /// Throttled: report again at this time.
+    At(Instant),
+    /// Unchanged, or already to be reported again.
+    Not,
+}
+
 /// An incoming drag's progress over all its items.
 struct Tally {
     /// Each item's size: its header's once its stream has started, else a
@@ -615,7 +686,9 @@ struct Tally {
     sizes: Vec<Option<u64>>,
     done: Vec<u64>,
     /// When the last report was made, and what it said.
-    last: Option<(Instant, (u64, Option<u64>))>,
+    last: Option<(Instant, Sample)>,
+    /// A throttled change waits for a report at `Report::At`.
+    flushing: bool,
 }
 
 impl Tally {
@@ -631,6 +704,7 @@ impl Tally {
             sizes,
             done: vec![0; items.len()],
             last: None,
+            flushing: false,
         }
     }
 
@@ -646,24 +720,36 @@ impl Tally {
         }
     }
 
-    /// Bytes done and the total, to report at `now` if they changed and a
-    /// report is due: one per `PROGRESS_EVERY`, unless `force`d.
-    fn report(&mut self, now: Instant, force: bool) -> Option<(u64, Option<u64>)> {
+    /// Whether to report at `now`: a change is reported at most once per
+    /// `PROGRESS_EVERY`; one that comes sooner is to be reported once that
+    /// has passed.
+    fn report(&mut self, now: Instant) -> Report {
         let done = self.done.iter().fold(0u64, |a, d| a.saturating_add(*d));
         let total = self
             .sizes
             .iter()
             .try_fold(0u64, |a, s| Some(a.saturating_add((*s)?)));
         let value = (done, total);
-        let due = match self.last {
-            None => true,
-            Some((_, said)) if said == value => false,
-            Some((at, _)) => force || now.saturating_duration_since(at) >= PROGRESS_EVERY,
-        };
-        if due {
-            self.last = Some((now, value));
+        match self.last {
+            Some((_, said)) if said == value => Report::Not,
+            Some((at, _)) if now.saturating_duration_since(at) < PROGRESS_EVERY => {
+                if self.flushing {
+                    Report::Not
+                } else {
+                    self.flushing = true;
+                    Report::At(at + PROGRESS_EVERY)
+                }
+            }
+            _ => {
+                self.last = Some((now, value));
+                Report::Now(value)
+            }
         }
-        due.then_some(value)
+    }
+
+    /// The report a throttled change waited for is being made.
+    fn flushed(&mut self) {
+        self.flushing = false;
     }
 }
 
@@ -919,6 +1005,27 @@ mod tests {
                 .collect()
         }
 
+        /// The latest progress for `drag`.
+        fn last_progress(&self, drag: DragId) -> Option<(u64, Option<u64>)> {
+            let (done, total, _) = *self.progress(drag).last()?;
+            Some((done, total))
+        }
+
+        /// Checks `drag`'s progress events kept to 10 a second. Times are
+        /// the pump's, which can bunch two up, hence one to spare.
+        fn assert_capped(&self, drag: DragId) {
+            let progress = self.progress(drag);
+            let (Some(first), Some(last)) = (progress.first(), progress.last()) else {
+                panic!("no progress for drag {drag}");
+            };
+            let over = last.2.duration_since(first.2).as_millis() as usize;
+            assert!(
+                progress.len() <= over / 100 + 2,
+                "{} events in {over} ms",
+                progress.len()
+            );
+        }
+
         fn has_progress(&self, drag: DragId) -> bool {
             self.progress(drag).iter().any(|(done, _, _)| *done > 0)
         }
@@ -1019,8 +1126,8 @@ mod tests {
             fs::read(dest.path().join("Photos").join("a.jpg")).unwrap(),
             bytes(5000, 2)
         );
-        let last = *p.progress(7).last().unwrap();
-        assert_eq!((last.0, last.1), (305_000, Some(305_000)));
+        p.until(|p| p.last_progress(7) == Some((305_000, Some(305_000))))
+            .await;
 
         let outcome = incoming_outcome(true, &[Some(Ok(())), Some(Ok(()))]).unwrap();
         assert_eq!(outcome, DragOutcome::Done);
@@ -1281,16 +1388,18 @@ mod tests {
             },
         ];
         let mut tally = Tally::new(&items);
-        assert_eq!(tally.report(t0, false), Some((0, None)));
+        assert_eq!(tally.report(t0), Report::Now((0, None)));
         tally.start(1, 50);
         tally.set(1, 20);
-        assert_eq!(tally.report(ms(50), false), None, "throttled");
-        assert_eq!(tally.report(ms(50), true), Some((20, Some(60))));
-        assert_eq!(tally.report(ms(60), true), None, "unchanged");
+        assert_eq!(tally.report(ms(50)), Report::At(ms(100)), "throttled");
+        tally.set(1, 30);
+        assert_eq!(tally.report(ms(60)), Report::Not, "already to be sent");
+        tally.flushed();
+        assert_eq!(tally.report(ms(100)), Report::Now((30, Some(60))));
+        assert_eq!(tally.report(ms(300)), Report::Not, "unchanged");
         tally.start(0, 12);
         tally.set(0, 5);
-        assert_eq!(tally.report(ms(100), false), None, "throttled");
-        assert_eq!(tally.report(ms(150), false), Some((25, Some(62))));
+        assert_eq!(tally.report(ms(350)), Report::Now((35, Some(62))));
 
         // Over a session: two files sent together, reported as one.
         let (src, dest) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
@@ -1308,24 +1417,62 @@ mod tests {
             let into = Dest::InDir(dest.path().into());
             p.receiver.link.fetch(21, item, into).await.unwrap();
         }
+        let all = 2 * size as u64;
+        p.until(|p| p.last_progress(21) == Some((all, Some(all))))
+            .await;
         p.until(|p| !p.received(21, 0).is_empty() && !p.received(21, 1).is_empty())
             .await;
         assert!(p.received(21, 0)[0].is_ok() && p.received(21, 1)[0].is_ok());
 
-        let all = 2 * size as u64;
         let progress = p.progress(21);
         assert!(progress.iter().all(|(_, total, _)| *total == Some(all)));
         assert!(progress.windows(2).all(|w| w[0].0 <= w[1].0), "went back");
-        let (last_done, _, last_at) = *progress.last().unwrap();
-        assert_eq!(last_done, all);
-        // One at the start, at most one per 100 ms, and one as each item ends.
-        let over = last_at.duration_since(progress[0].2).as_millis() as usize;
-        assert!(
-            progress.len() <= over / 100 + 3,
-            "{} events in {over} ms",
-            progress.len()
-        );
         assert!(progress.len() >= 2, "{progress:?}");
+        p.assert_capped(21);
+    }
+
+    /// Many items ending within 100 ms, at once or one after another, still
+    /// make at most 10 events a second, and the last value still arrives.
+    #[tokio::test]
+    async fn progress_cap_holds_for_many_small_items() {
+        let (src, dest) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let mut items = Vec::new();
+        let mut sources = Vec::new();
+        for i in 0..20u8 {
+            let name = format!("f{i}.txt");
+            sources.push(Source::Ready(write(src.path(), &name, 2000, i)));
+            items.push(file(&name, 2000));
+        }
+        let mut p = Pair::new().await;
+        p.offer(50, items.clone(), sources.clone()).await;
+        p.offer(51, items, sources).await;
+
+        // All at once.
+        let all = 20 * 2000;
+        let at_once = dest.path().join("at once");
+        let serial = dest.path().join("serial");
+        fs::create_dir(&at_once).unwrap();
+        fs::create_dir(&serial).unwrap();
+        for item in 0..20 {
+            let into = Dest::InDir(at_once.clone());
+            p.receiver.link.fetch(50, item, into).await.unwrap();
+        }
+        p.until(|p| p.last_progress(50) == Some((all, Some(all))))
+            .await;
+        p.until(|p| (0..20).all(|i| !p.received(50, i).is_empty()))
+            .await;
+        p.assert_capped(50);
+
+        // One after another.
+        for item in 0..20 {
+            let into = Dest::InDir(serial.clone());
+            p.receiver.link.fetch(51, item, into).await.unwrap();
+            p.until(|p| !p.received(51, item).is_empty()).await;
+        }
+        p.until(|p| p.last_progress(51) == Some((all, Some(all))))
+            .await;
+        p.assert_capped(51);
+        assert_eq!(names(&serial).len(), 20);
     }
 
     /// The apps may run the link's calls on their own tasks.
@@ -1454,7 +1601,20 @@ mod tests {
         // Not named until fetched: refused once its header names it.
         p.offer(42, vec![file("", 10)], vec![Source::Ready(second.clone())])
             .await;
-        p.offer(43, vec![file("other.txt", 10)], vec![Source::Ready(second)])
+        p.offer(
+            43,
+            vec![file("other.txt", 10)],
+            vec![Source::Ready(second.clone())],
+        )
+        .await;
+        // Names NTFS and APFS take for the same one share a part too.
+        p.offer(
+            44,
+            vec![file("Same.txt", 10)],
+            vec![Source::Ready(second.clone())],
+        )
+        .await;
+        p.offer(45, vec![file("other.txt", 10)], vec![Source::Ready(second)])
             .await;
         let in_dir = || Dest::InDir(dest.path().into());
         p.receiver.link.fetch(40, 0, in_dir()).await.unwrap();
@@ -1462,16 +1622,19 @@ mod tests {
         p.receiver.link.fetch(42, 0, in_dir()).await.unwrap();
         let exact = Dest::Exact(dest.path().join("same.txt"));
         p.receiver.link.fetch(43, 0, exact).await.unwrap();
+        p.receiver.link.fetch(44, 0, in_dir()).await.unwrap();
+        let upper = Dest::Exact(dest.path().join("SAME.TXT"));
+        p.receiver.link.fetch(45, 0, upper).await.unwrap();
         // The same item twice at once is the caller's mistake.
         assert!(p.receiver.link.fetch(40, 0, in_dir()).await.is_err());
         p.until(|p| {
-            [40, 41, 42, 43]
+            [40, 41, 42, 43, 44, 45]
                 .iter()
                 .all(|drag| !p.received(*drag, 0).is_empty())
         })
         .await;
 
-        for drag in [41, 42, 43] {
+        for drag in [41, 42, 43, 44, 45] {
             assert_eq!(p.received(drag, 0), [&Err(FailReason::Unwritable)]);
         }
         assert_eq!(p.received(40, 0), [&Ok(dest.path().join("same.txt"))]);
@@ -1480,5 +1643,68 @@ mod tests {
             fs::read(dest.path().join("same.txt")).unwrap(),
             bytes(BIG / 2, 14)
         );
+    }
+
+    #[test]
+    fn destination_keys_fold_case_and_normalization() {
+        let d = PathBuf::from("drop");
+        let key = dest_key(&Dest::InDir(d.clone()), "Cafe\u{301}.TXT");
+        assert_eq!(key, dest_key(&Dest::Exact(d.join("caf\u{e9}.txt")), ""));
+        assert_ne!(key, dest_key(&Dest::InDir(d), "cafe.txt"));
+    }
+
+    /// A pending source that resolves to Cancelled or Disconnected still
+    /// ends the drag on both sides.
+    #[tokio::test]
+    async fn pending_source_cancelled_still_ends_the_drag() {
+        let dest = tempfile::tempdir().unwrap();
+        let mut p = Pair::new().await;
+        let reasons = [(6, FailReason::Cancelled), (8, FailReason::Disconnected)];
+        let mut senders = Vec::new();
+        for (drag, _) in &reasons {
+            let (tx, rx) = watch::channel(None);
+            senders.push(tx);
+            p.offer(*drag, vec![file("doc.txt", 10)], vec![Source::Pending(rx)])
+                .await;
+            let into = Dest::InDir(dest.path().join(drag.to_string()));
+            p.receiver.link.fetch(*drag, 0, into).await.unwrap();
+        }
+        p.pump_for(Duration::from_millis(100)).await;
+        for (tx, (_, why)) in senders.iter().zip(&reasons) {
+            tx.send(Some(Err(why.clone()))).unwrap();
+        }
+        p.until(|p| reasons.iter().all(|(d, _)| !p.received(*d, 0).is_empty()))
+            .await;
+        for (drag, why) in &reasons {
+            assert_eq!(p.received(*drag, 0), [&Err(why.clone())]);
+            let failed = DragOutcome::Failed(why.clone());
+            assert_eq!(p.finished(At::Origin, *drag), [&failed]);
+            assert_eq!(p.cancels_to(At::Receiver, *drag), [why]);
+        }
+    }
+
+    /// A fetch for an item the origin never offered ends the drag on both
+    /// sides.
+    #[tokio::test]
+    async fn out_of_range_fetch_ends_the_drag() {
+        let (src, dest) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let one = write(src.path(), "one.txt", 10, 16);
+        let mut p = Pair::new().await;
+        p.offer(14, vec![file("one.txt", 10)], vec![Source::Ready(one)])
+            .await;
+        let bad = Control::FileFetch { drag: 14, item: 5 };
+        p.receiver.session.send_control(&bad).await.unwrap();
+        p.until(|p| !p.cancels_to(At::Receiver, 14).is_empty())
+            .await;
+        let why = unreadable("item 5");
+        assert_eq!(p.cancels_to(At::Receiver, 14), [&why]);
+        assert_eq!(
+            p.finished(At::Origin, 14),
+            [&DragOutcome::Failed(why.clone())]
+        );
+        let into = Dest::InDir(dest.path().into());
+        p.receiver.link.fetch(14, 0, into).await.unwrap();
+        p.until(|p| !p.received(14, 0).is_empty()).await;
+        assert_eq!(p.received(14, 0), [&Err(why)]);
     }
 }
