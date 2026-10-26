@@ -37,10 +37,11 @@ use objc2_core_graphics::{CGDisplayBounds, CGEvent, CGMainDisplayID};
 use tokio::sync::oneshot;
 use tracing::{info, warn};
 
+use super::MacDndEv;
 use super::on_main;
-use super::source::{DragSource, KVK_ESCAPE, MacDndEv, copy_tree};
+use super::source::{DragSource, KVK_ESCAPE, copy_tree};
 use crate::common::transfer::Dest;
-use crate::mac::control::{Crossing, DragPort, InjectMsg, Input, spawn_inject_thread};
+use crate::mac::control::{Crossing, DragPort, InjectMsg, Input, NoCatcher, spawn_inject_thread};
 use crate::mac::inject::Injector;
 
 /// The fake fetch takes this many steps of half a second.
@@ -187,6 +188,7 @@ pub fn run_smoke(mode: SmokeMode) -> anyhow::Result<()> {
     let tx = spawn_inject_thread(
         Injector::new()?,
         drags,
+        None::<NoCatcher>,
         Arc::new(AtomicBool::new(true)),
         |ev| info!(?ev, "smoke: injection thread event"),
     )?;

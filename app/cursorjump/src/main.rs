@@ -30,7 +30,7 @@ const FLAGS: [&str; 5] = [
 
 /// Hidden options of debug builds, for a person to look at a piece of the app.
 #[cfg(all(target_os = "macos", debug_assertions))]
-const DEBUG_FLAGS: [&str; 2] = ["--smoke-pill", "--smoke-drag"];
+const DEBUG_FLAGS: [&str; 3] = ["--smoke-pill", "--smoke-drag", "--smoke-catcher"];
 #[cfg(not(all(target_os = "macos", debug_assertions)))]
 const DEBUG_FLAGS: [&str; 0] = [];
 
@@ -75,6 +75,27 @@ fn main() {
             std::process::exit(2);
         };
         if let Err(e) = mac::run_smoke_drag(mode) {
+            error!("{e:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    // A drag leaving the Mac, onto the real catcher at the left edge
+    // (mac/dnd/smoke_catcher.rs): `--smoke-catcher [posted|manual]`.
+    #[cfg(all(target_os = "macos", debug_assertions))]
+    if has("--smoke-catcher") {
+        let words = args
+            .iter()
+            .skip_while(|a| *a != "--smoke-catcher")
+            .skip(1)
+            .take_while(|a| !a.starts_with("--"))
+            .map(String::as_str);
+        let Some(mode) = mac::CatcherSmoke::parse(words) else {
+            error!("--smoke-catcher takes posted or manual");
+            std::process::exit(2);
+        };
+        if let Err(e) = mac::run_smoke_catcher(mode) {
             error!("{e:#}");
             std::process::exit(1);
         }
@@ -294,6 +315,8 @@ mod tests {
         let smoke = unknown_flag(&args(&["--smoke-pill"])).is_none();
         assert_eq!(smoke, cfg!(all(target_os = "macos", debug_assertions)));
         let smoke = unknown_flag(&args(&["--smoke-drag", "hold"])).is_none();
+        assert_eq!(smoke, cfg!(all(target_os = "macos", debug_assertions)));
+        let smoke = unknown_flag(&args(&["--smoke-catcher", "manual"])).is_none();
         assert_eq!(smoke, cfg!(all(target_os = "macos", debug_assertions)));
         assert_eq!(
             unknown_flag(&args(&["--enable-autostart", "--bogus"])),

@@ -18,6 +18,18 @@ pub enum MacEvent {
         buttons_held: bool,
         offer: Option<DragId>,
     },
+    /// A push-out with only the left button held and no catcher offer, on
+    /// a Mac with a catcher (R48): a drag that starts late (Chrome,
+    /// WhatsApp) may yet drop on the catcher at the release, so the
+    /// release goes out now and the leave waits for `LateDrop`.
+    PushOutLate {
+        frac: f32,
+    },
+    /// The wait after `PushOutLate` is over: `drag` is the drag that
+    /// dropped on the catcher meanwhile, if any.
+    LateDrop {
+        drag: Option<DragId>,
+    },
     /// The incoming drag ended on the Mac (dropped or cancelled).
     DragEnded {
         drag: DragId,
@@ -48,6 +60,9 @@ pub enum MacAction {
     CancelDrag {
         drag: DragId,
     },
+    /// Start the wait for a late drop (R48), after the release went out;
+    /// `LateDrop` ends it.
+    AwaitLateDrop,
 }
 
 #[derive(Debug, Default)]
@@ -56,6 +71,8 @@ pub struct MacMachine {
     entry: Option<Side>,
     /// The PC's drag riding on the Mac.
     incoming: Option<DragId>,
+    /// Where the cursor pushed out, while the leave waits for a late drop.
+    leaving: Option<f32>,
 }
 
 impl MacMachine {
@@ -75,6 +92,7 @@ impl MacMachine {
                 self.controlled = true;
                 self.entry = Some(edge);
                 self.incoming = drag;
+                self.leaving = None;
                 actions.extend([
                     MacAction::WakeDisplay,
                     MacAction::WarpTo { edge, frac },
@@ -113,6 +131,31 @@ impl MacMachine {
                 ]);
                 actions
             }
+            MacEvent::PushOutLate { frac } => {
+                if self.incoming.is_some() {
+                    // The PC's drag goes home at once; nothing waits.
+                    return self.on(MacEvent::PushOut {
+                        frac,
+                        buttons_held: true,
+                        offer: None,
+                    });
+                }
+                if !self.controlled {
+                    return vec![];
+                }
+                self.controlled = false;
+                self.entry = None;
+                self.leaving = Some(frac);
+                vec![
+                    MacAction::ReleaseAllInjected,
+                    MacAction::AwaitLateDrop,
+                    MacAction::StopControl,
+                ]
+            }
+            MacEvent::LateDrop { drag } => match self.leaving.take() {
+                Some(frac) => vec![MacAction::SendLeave { frac, drag }],
+                None => vec![],
+            },
             MacEvent::DragEnded { drag } => {
                 if self.incoming == Some(drag) {
                     self.incoming = None;
@@ -121,6 +164,7 @@ impl MacMachine {
             }
             // The PC took the cursor back (hotkey, hook lost, pause, quit).
             MacEvent::ReleaseAll => {
+                self.leaving = None;
                 let mut actions = self.cancel_incoming();
                 if !self.controlled {
                     actions.push(MacAction::ReleaseAllInjected);
@@ -132,6 +176,7 @@ impl MacMachine {
                 actions
             }
             MacEvent::Disconnected => {
+                self.leaving = None;
                 let mut actions = self.cancel_incoming();
                 if !self.controlled {
                     return actions;
@@ -165,6 +210,12 @@ impl MacMachine {
     /// The PC's drag riding on the Mac, if any.
     pub fn incoming(&self) -> Option<DragId> {
         self.incoming
+    }
+
+    /// Whether a leave waits for a late drop (between `PushOutLate` and
+    /// `LateDrop`).
+    pub fn awaiting_late_drop(&self) -> bool {
+        self.leaving.is_some()
     }
 }
 
@@ -476,5 +527,99 @@ mod tests {
                 MacAction::BeginDrag { drag: 7 }
             ]
         );
+    }
+
+    // ------------------------------------------------ late drags (R48)
+
+    fn push_out_late() -> MacEvent {
+        MacEvent::PushOutLate { frac: 0.5 }
+    }
+
+    #[test]
+    fn left_held_push_out_releases_then_waits_before_leaving() {
+        let mut m = entered();
+        assert_eq!(
+            m.on(push_out_late()),
+            vec![
+                MacAction::ReleaseAllInjected,
+                MacAction::AwaitLateDrop,
+                MacAction::StopControl
+            ]
+        );
+        assert!(!m.controlled(), "input is ignored during the wait");
+        assert!(m.awaiting_late_drop());
+        assert_eq!(m.entry_edge(), None);
+    }
+
+    #[test]
+    fn late_drop_leave_carries_the_caught_drag_or_none() {
+        let mut m = entered();
+        m.on(push_out_late());
+        assert_eq!(
+            m.on(MacEvent::LateDrop { drag: Some(11) }),
+            vec![MacAction::SendLeave {
+                frac: 0.5,
+                drag: Some(11)
+            }]
+        );
+        assert!(!m.awaiting_late_drop());
+        assert_eq!(m.on(MacEvent::LateDrop { drag: None }), vec![], "once");
+        let mut m = entered();
+        m.on(push_out_late());
+        assert_eq!(
+            m.on(MacEvent::LateDrop { drag: None }),
+            vec![MacAction::SendLeave {
+                frac: 0.5,
+                drag: None
+            }]
+        );
+    }
+
+    #[test]
+    fn late_drop_without_a_wait_does_nothing() {
+        let mut m = entered();
+        assert_eq!(m.on(MacEvent::LateDrop { drag: Some(11) }), vec![]);
+        assert!(m.controlled());
+        let mut m = MacMachine::new();
+        assert_eq!(m.on(push_out_late()), vec![], "not controlled");
+        assert!(!m.awaiting_late_drop());
+    }
+
+    #[test]
+    fn taking_the_cursor_back_during_the_wait_sends_no_leave() {
+        for ev in [MacEvent::ReleaseAll, MacEvent::Disconnected] {
+            let mut m = entered();
+            m.on(push_out_late());
+            m.on(ev.clone());
+            assert!(!m.awaiting_late_drop(), "{ev:?}");
+            assert_eq!(
+                m.on(MacEvent::LateDrop { drag: Some(11) }),
+                vec![],
+                "{ev:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn late_push_out_over_an_incoming_drag_sends_it_home_at_once() {
+        let mut m = entered_with_drag();
+        assert_eq!(
+            m.on(push_out_late()),
+            going_home_actions(),
+            "the PC's drag goes home; nothing waits"
+        );
+        assert!(!m.awaiting_late_drop());
+    }
+
+    fn going_home_actions() -> Vec<MacAction> {
+        vec![
+            MacAction::CancelDrag { drag: 7 },
+            MacAction::ReleaseAllInjected,
+            MacAction::SendLeave {
+                frac: 0.5,
+                drag: Some(7),
+            },
+            MacAction::StopControl,
+        ]
     }
 }

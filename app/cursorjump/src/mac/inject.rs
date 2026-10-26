@@ -411,6 +411,11 @@ impl Injector {
         self.current_pos()
     }
 
+    /// The main display's bounds, as of the last motion or warp.
+    pub fn bounds(&self) -> Rectf {
+        self.bounds
+    }
+
     /// Posts a dragged event of the first held button 1 pt off the cursor
     /// (`nudge`) or back on it, leaving the virtual cursor where it is: a
     /// drag session whose drop is held stays alive (R47). Nothing without

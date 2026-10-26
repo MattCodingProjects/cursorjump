@@ -59,9 +59,9 @@ use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 use unicode_normalization::UnicodeNormalization;
 
-use super::{on_main, on_main_sync};
+use super::{MacDndEv, on_main, on_main_sync};
 use crate::common::transfer::Dest;
-use crate::mac::control::{Crossing, DragPort, InjectMsg};
+use crate::mac::control::{Crossing, DragPort};
 
 /// The Escape key's virtual keycode: a posted Esc cancels a drag session.
 pub const KVK_ESCAPE: u16 = 0x35;
@@ -98,83 +98,10 @@ const PAST_MAX: usize = 8;
 /// home and returned) never fetches where an old fetch may still write.
 static ATTEMPT: AtomicU64 = AtomicU64::new(1);
 
-/// What the drag source tells the app (Task 17).
-#[derive(Debug)]
-pub enum MacDndEv {
-    /// The session of `drag`'s `crossing` ended here, on a target that
-    /// took it (`dropped`) or not. Exactly one per crossing, a failed
-    /// `prepare` included (crossing 0 if it never got a token). A drag
-    /// that went home and came back ends once per crossing: only its
-    /// latest crossing's end counts for the drag. A drop whose promise
-    /// writes still wait is dropped: the outcome comes from the fetches
-    /// (`incoming_outcome`).
-    Ended {
-        drag: DragId,
-        crossing: Crossing,
-        dropped: bool,
-    },
-    /// Fetch item `item` of `drag` into `dest`, a staging folder
-    /// (`Dest::InDir`), and reply with the received path or why it failed.
-    /// One per item not already here, sent from the prefetch thread just
-    /// after `prepare`. A reply dropped unanswered fails the item. The source drops its receiver when the drag goes home or is
-    /// cancelled: stop the fetch when `reply.closed()` resolves.
-    Fetch {
-        drag: DragId,
-        item: u32,
-        dest: Dest,
-        reply: oneshot::Sender<Result<PathBuf, FailReason>>,
-    },
-    /// The user let go while the drag rode here, at `at` (global points,
-    /// origin top left of the main display): R49, the pill starts now.
-    #[cfg_attr(
-        debug_assertions,
-        expect(dead_code, reason = "Task 17 starts the pill from it")
-    )]
-    Released { drag: DragId, at: (f64, f64) },
-    /// Every item of `drag`'s `crossing` is in place.
-    Ready { drag: DragId, crossing: Crossing },
-    /// A session started just as its drag was cancelled: cj-inject posts
-    /// Esc to end it undropped.
-    NeedsEscape { drag: DragId, crossing: Crossing },
-    /// Item `item` of `drag`'s `crossing` failed; cj-inject cancels the
-    /// drag.
-    #[cfg_attr(
-        all(debug_assertions, not(test)),
-        expect(dead_code, reason = "Task 17 tells the pill why")
-    )]
-    Failed {
-        drag: DragId,
-        crossing: Crossing,
-        item: u32,
-        reason: FailReason,
-    },
-}
-
-impl MacDndEv {
-    /// What cj-inject must be told of this event: Task 17's events
-    /// callback sends it on the injection thread's channel.
-    pub fn inject_msg(&self) -> Option<InjectMsg> {
-        match *self {
-            MacDndEv::Ended { drag, crossing, .. } => Some(InjectMsg::DragEnded { drag, crossing }),
-            MacDndEv::Ready { drag, crossing } => Some(InjectMsg::DragReady { drag, crossing }),
-            MacDndEv::Failed { drag, crossing, .. } => {
-                Some(InjectMsg::DragFailed { drag, crossing })
-            }
-            MacDndEv::NeedsEscape { drag, crossing } => {
-                Some(InjectMsg::EscapeSession { drag, crossing })
-            }
-            MacDndEv::Fetch { .. } | MacDndEv::Released { .. } => None,
-        }
-    }
-}
-
 /// `~/Library/Caches/CursorJump/incoming`: each drag from the PC has a
 /// folder here, named after its id. The sweep (R37a) cleans it.
 pub fn incoming_dir() -> PathBuf {
-    let caches = std::env::var_os("HOME").map_or_else(std::env::temp_dir, |home| {
-        PathBuf::from(home).join("Library").join("Caches")
-    });
-    caches.join("CursorJump").join("incoming")
+    super::cache_dir("incoming")
 }
 
 // ------------------------------------------------------------ names
@@ -1224,6 +1151,7 @@ fn prefetch(inner: &Inner, drag: &Drag) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mac::control::InjectMsg;
 
     fn item(name: &str, kind: ItemKind) -> DragItem {
         DragItem {

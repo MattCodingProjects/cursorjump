@@ -45,6 +45,25 @@ pub enum Source {
     Pending(watch::Receiver<Option<Result<PathBuf, FailReason>>>),
 }
 
+/// A new id for a drag that starts on this computer: 64 random bits,
+/// never 0. Both sides allocate them this way, so the PC's and the Mac's
+/// ids collide only by chance (one in 2^64), and an id never repeats one
+/// of an earlier run's leftovers.
+pub fn fresh_drag_id() -> DragId {
+    loop {
+        if let Some(id) = drag_id_from(cj_net::random_nonce()) {
+            return id;
+        }
+    }
+}
+
+/// The id made of the first 8 random bytes; None for 0.
+fn drag_id_from(random: [u8; 32]) -> Option<DragId> {
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&random[..8]);
+    Some(u64::from_le_bytes(b)).filter(|&id| id != 0)
+}
+
 /// What the link tells the app.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DndEv {
@@ -864,6 +883,19 @@ mod tests {
     use tokio::sync::mpsc::{self, UnboundedReceiver};
     use tokio::task::JoinHandle;
     use tokio::time::{sleep, timeout};
+
+    #[test]
+    fn drag_ids_are_random_and_never_zero() {
+        let mut r = [0u8; 32];
+        assert_eq!(drag_id_from(r), None, "0 means no drag");
+        r[8..].fill(0xFF);
+        assert_eq!(drag_id_from(r), None, "only the first 8 bytes count");
+        r[0] = 1;
+        assert_eq!(drag_id_from(r), Some(1));
+        let ids: std::collections::BTreeSet<DragId> = (0..1000).map(|_| fresh_drag_id()).collect();
+        assert_eq!(ids.len(), 1000, "no repeats");
+        assert!(!ids.contains(&0));
+    }
 
     const T: Duration = Duration::from_secs(30);
     /// Big enough to still be on its way 100 ms in: the pacer starts at

@@ -9,7 +9,7 @@ pub mod control;
     not(debug_assertions),
     expect(
         dead_code,
-        reason = "the pills and the drag source are used once Task 17 wires them in"
+        reason = "the pills, the drag source and the catcher are used once Task 17 wires them in"
     )
 )]
 mod dnd;
@@ -27,6 +27,9 @@ pub mod permissions;
 pub mod pill;
 pub mod power;
 
+/// The catcher smoke (`--smoke-catcher`, debug builds).
+#[cfg(debug_assertions)]
+pub use dnd::smoke_catcher::{CatcherSmoke, run_smoke as run_smoke_catcher};
 /// The drag smoke (`--smoke-drag`, debug builds).
 #[cfg(debug_assertions)]
 pub use dnd::smoke_drag::{SmokeMode, run_smoke as run_smoke_drag};

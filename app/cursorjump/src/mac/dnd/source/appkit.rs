@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use block2::DynBlock;
 use objc2::rc::Retained;
-use objc2::runtime::{AnyClass, AnyObject, NSObject, NSObjectProtocol, ProtocolObject};
+use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject};
 use objc2::{AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2::{define_class, msg_send};
 use objc2_app_kit::{
@@ -159,27 +159,15 @@ fn drag_panel(mtm: MainThreadMarker, at: (f64, f64), view: &NSView) -> Retained<
     // backing it is transparent there, and a click falls through to the
     // window behind. Draw it now and push it out.
     panel.display();
-    flush_core_animation();
+    super::super::flush_core_animation();
     #[expect(deprecated, reason = "the window must reach the window server now")]
     panel.flushWindow();
     panel
 }
 
-/// `[CATransaction flush]`: commits the layer tree (AppKit's windows are
-/// layer-backed) without waiting for the run loop to turn.
-fn flush_core_animation() {
-    if let Some(cls) = AnyClass::get(c"CATransaction") {
-        // SAFETY: `+[CATransaction flush]` takes and returns nothing.
-        let _: () = unsafe { msg_send![cls, flush] };
-    }
-}
-
-/// Run `f`, catching and logging a panic: for code AppKit calls, which
-/// must not be unwound into.
+/// Run `f`, catching and logging a panic: for code AppKit calls.
 fn guarded(what: &str, f: impl FnOnce()) {
-    if catch_unwind(AssertUnwindSafe(f)).is_err() {
-        warn!("drag source: {what} panicked");
-    }
+    super::super::guarded("drag source", what, (), f);
 }
 
 /// One item's pasteboard writer and its delegate.

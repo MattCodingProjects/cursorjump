@@ -112,7 +112,7 @@ use catcher::{Offered, Pending, Target, into_offer, strip_rect};
 
 use super::monitors::{edge_monitor, monitors};
 use super::probe::virtual_screen;
-use crate::common::dnd_link::Source;
+use crate::common::dnd_link::{Source, fresh_drag_id};
 
 const CLASS: PCWSTR = w!("CursorJumpCatcher");
 /// The shield's side, logical px.
@@ -612,16 +612,6 @@ fn edge_of(side: Side) -> Option<Rect> {
 pub(super) fn left_button_down() -> bool {
     // SAFETY: GetAsyncKeyState has no preconditions.
     (unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } as u16) & 0x8000 != 0
-}
-
-fn fresh_drag_id() -> DragId {
-    loop {
-        let n = cj_net::random_nonce();
-        let id = u64::from_le_bytes([n[0], n[1], n[2], n[3], n[4], n[5], n[6], n[7]]);
-        if id != 0 {
-            return id;
-        }
-    }
 }
 
 /// Where the catcher is.

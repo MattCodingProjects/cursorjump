@@ -25,6 +25,23 @@
 //! - Each crossing of a drag has its own token: news from an earlier
 //!   crossing of the same drag (it went home and came back) never touches
 //!   the ride of a later one.
+//!
+//! A Mac drag going to the PC is caught at the entry edge
+//! (`dnd::catcher`, Task 16):
+//! - The strip shows (`CatchPort::zone`, on changes only) while the PC
+//!   controls this Mac, the user holds only the left button (pressed with
+//!   the PC's mouse, not for a ride), and the cursor is within
+//!   `CATCH_ZONE_PT` (48 pt) of the entry edge.
+//! - A push-out then (`CatchPort::push_out`) carries the strip's drag:
+//!   the release goes out and drops it there, and the `Leave` carries it.
+//!   With no drag there yet, the release goes out all the same, and the
+//!   `Leave` waits up to [`LATE_DRAG_WAIT`] for a drag that starts late
+//!   to drop on the strip (`InjectMsg::LateDrop`, R48). The wait is a
+//!   deadline of the thread's loop, never a sleep: input keeps flowing
+//!   (and is dropped, the PC no longer controlling this Mac).
+//! - After either, the strip stays up for [`LATE_DRAG_WAIT`], so a late
+//!   drag always ends on it.
+//! - Without a catcher, holding a button at the edge is a wall, as before.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
@@ -38,8 +55,9 @@ use cj_core::proto::{MouseButton, Side};
 use crossbeam_channel::RecvTimeoutError;
 use tracing::{error, info, warn};
 
+use super::dnd::catcher::{LATE_DRAG_WAIT, in_catch_zone};
 use super::dnd::source::KVK_ESCAPE;
-use super::inject::Injector;
+use super::inject::{Injector, Rectf};
 use super::power;
 
 /// The "no Accessibility" bounce is logged at most this often.
@@ -66,6 +84,8 @@ pub trait Inject {
     fn entry_frac(&self) -> f32;
     /// Where the cursor is now, in global points (origin top left).
     fn cursor(&mut self) -> (f64, f64);
+    /// The main display's bounds, in global points.
+    fn bounds(&self) -> Rectf;
     /// A dragged event of the held button 1 pt off the cursor (`nudge`) or
     /// back on it; the cursor itself stays put.
     fn jiggle(&mut self, nudge: bool);
@@ -119,6 +139,39 @@ impl DragPort for NoDrags {
     }
 }
 
+/// What the thread needs from the Mac's edge catcher
+/// (`dnd::catcher::Catcher`); a trait so the routing can be tested
+/// without AppKit.
+pub trait CatchPort {
+    /// Some(edge) shows the strip along that edge; None hides it. Called
+    /// only when that changes.
+    fn zone(&mut self, show: Option<Side>);
+    /// A push-out with only the left button held is about to post the
+    /// release, over the strip. Returns the strip's drag, whose drop there
+    /// is then taken; or None, and then a drag that drops on the strip
+    /// before `end_late_wait` is taken (R48).
+    fn push_out(&mut self) -> Option<DragId>;
+    /// The late wait is over: the drag that dropped on the strip during
+    /// it, if any; a later drop is refused. `carry`: whether a `Leave`
+    /// carries that drag; if not, its offer is withdrawn.
+    fn end_late_wait(&mut self, carry: bool) -> Option<DragId>;
+}
+
+/// The type of a Router without a catcher (it has none to give).
+pub enum NoCatcher {}
+
+impl CatchPort for NoCatcher {
+    fn zone(&mut self, _show: Option<Side>) {
+        match *self {}
+    }
+    fn push_out(&mut self) -> Option<DragId> {
+        match *self {}
+    }
+    fn end_late_wait(&mut self, _carry: bool) -> Option<DragId> {
+        match *self {}
+    }
+}
+
 impl Inject for Injector {
     fn wake_display(&mut self) {
         power::wake_display();
@@ -155,6 +208,9 @@ impl Inject for Injector {
     }
     fn cursor(&mut self) -> (f64, f64) {
         Injector::cursor(self)
+    }
+    fn bounds(&self) -> Rectf {
+        Injector::bounds(self)
     }
     fn jiggle(&mut self, nudge: bool) {
         Injector::jiggle(self, nudge);
@@ -241,6 +297,11 @@ pub enum InjectMsg {
         drag: DragId,
         crossing: Crossing,
     },
+    /// From the catcher (`MacDndEv::LateDrop`): `drag` dropped on the
+    /// strip while a push-out waits for a late drag: leave with it now.
+    LateDrop {
+        drag: DragId,
+    },
     /// Cancel `drag` (the pill's ✕, the PC's `DragCancel`): Esc, then the
     /// button goes up if the PC doesn't hold it any more.
     #[cfg_attr(
@@ -306,8 +367,13 @@ impl LogLimit {
 /// What the thread reports to the app's loop.
 #[derive(Debug, Clone, PartialEq)]
 pub enum InjectEv {
-    /// Send `Control::Leave` with `frac` on session `sid`.
-    SendLeave { sid: u64, frac: f32 },
+    /// Send `Control::Leave` with `frac` on session `sid`; `drag`: the
+    /// drag it carries, the PC's going home or one from the catcher.
+    SendLeave {
+        sid: u64,
+        frac: f32,
+        drag: Option<DragId>,
+    },
     /// The PC started (true) or stopped controlling this Mac.
     Controlled { sid: u64, on: bool },
     /// The thread has released everything and exited.
@@ -336,10 +402,20 @@ struct Hold {
     nudged: bool,
 }
 
+/// The other buttons than the left one.
+const NOT_LEFT: [MouseButton; 4] = [
+    MouseButton::Right,
+    MouseButton::Middle,
+    MouseButton::Back,
+    MouseButton::Forward,
+];
+
 /// Routes messages to the Injector through the `MacMachine`.
-pub struct Router<I: Inject, D: DragPort> {
+pub struct Router<I: Inject, D: DragPort, C: CatchPort = NoCatcher> {
     inj: I,
     drags: D,
+    /// The edge catcher, if this Mac has one.
+    catcher: Option<C>,
     machine: MacMachine,
     /// The session whose input is accepted.
     sid: Option<u64>,
@@ -353,13 +429,34 @@ pub struct Router<I: Inject, D: DragPort> {
     ride: Option<Ride>,
     /// How often a held drop jiggles.
     jiggle_every: Duration,
+    /// The held left button was pressed by the PC's own left-down (the
+    /// user drags something here), not for a ride.
+    left_is_users: bool,
+    /// Where the strip is, as last told to the catcher.
+    zone: Option<Side>,
+    /// After a push-out with only the left button held, the strip stays
+    /// up on this edge until then (R48).
+    linger: Option<(Instant, Side)>,
+    /// Until when a push-out waits for a late drop before leaving (R48).
+    late_until: Option<Instant>,
+    /// How long that wait and the strip's linger last.
+    late_wait: Duration,
 }
 
+#[cfg(test)]
 impl<I: Inject, D: DragPort> Router<I, D> {
+    /// A router without a catcher.
     pub fn new(inj: I, drags: D, access: Arc<AtomicBool>) -> Self {
+        Router::with_catcher(inj, drags, None, access)
+    }
+}
+
+impl<I: Inject, D: DragPort, C: CatchPort> Router<I, D, C> {
+    pub fn with_catcher(inj: I, drags: D, catcher: Option<C>, access: Arc<AtomicBool>) -> Self {
         Router {
             inj,
             drags,
+            catcher,
             machine: MacMachine::new(),
             sid: None,
             access,
@@ -367,12 +464,23 @@ impl<I: Inject, D: DragPort> Router<I, D> {
             offer: None,
             ride: None,
             jiggle_every: JIGGLE_EVERY,
+            left_is_users: false,
+            zone: None,
+            linger: None,
+            late_until: None,
+            late_wait: LATE_DRAG_WAIT,
         }
     }
 
     #[cfg(test)]
     fn with_jiggle_every(mut self, every: Duration) -> Self {
         self.jiggle_every = every;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_late_wait(mut self, wait: Duration) -> Self {
+        self.late_wait = wait;
         self
     }
 
@@ -393,30 +501,48 @@ impl<I: Inject, D: DragPort> Router<I, D> {
         self.inj.release_all();
     }
 
-    /// When `tick` must next run: the next jiggle of a held drop.
+    /// When `tick` must next run: the next jiggle of a held drop, the end
+    /// of a late wait, or of the strip's linger.
     pub fn next_tick(&self) -> Option<Instant> {
-        self.ride.and_then(|r| r.hold).map(|h| h.next_jiggle)
+        let jiggle = self.ride.and_then(|r| r.hold).map(|h| h.next_jiggle);
+        [jiggle, self.late_until, self.linger.map(|(until, _)| until)]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
-    /// Jiggles the cursor of a held drop when it is due.
-    pub fn tick(&mut self, now: Instant) {
-        let Some(Ride {
+    /// Jiggles the cursor of a held drop, ends a late wait and hides a
+    /// lingering strip, when due; returns what to report to the loop.
+    pub fn tick(&mut self, now: Instant) -> Vec<InjectEv> {
+        if let Some(Ride {
             hold: Some(hold), ..
         }) = &mut self.ride
-        else {
-            return;
-        };
-        if now < hold.next_jiggle {
-            return;
+            && now >= hold.next_jiggle
+        {
+            hold.nudged = !hold.nudged;
+            hold.next_jiggle = now + self.jiggle_every;
+            let nudge = hold.nudged;
+            self.inj.jiggle(nudge);
         }
-        hold.nudged = !hold.nudged;
-        hold.next_jiggle = now + self.jiggle_every;
-        let nudge = hold.nudged;
-        self.inj.jiggle(nudge);
+        let out = match self.sid {
+            Some(sid) if self.late_until.is_some_and(|t| now >= t) => {
+                info!("no late drop came: leaving without a drag");
+                self.end_late_wait(sid)
+            }
+            _ => Vec::new(),
+        };
+        self.update_zone(now);
+        out
     }
 
     /// Handles one message; returns what to report to the loop.
     pub fn handle(&mut self, msg: InjectMsg) -> Vec<InjectEv> {
+        let out = self.handle_msg(msg);
+        self.update_zone(Instant::now());
+        out
+    }
+
+    fn handle_msg(&mut self, msg: InjectMsg) -> Vec<InjectEv> {
         match msg {
             InjectMsg::Begin { sid } => {
                 let out = self.end_session();
@@ -455,6 +581,13 @@ impl<I: Inject, D: DragPort> Router<I, D> {
                 self.abort_drag(drag);
                 Vec::new()
             }
+            InjectMsg::LateDrop { drag } => match self.sid {
+                Some(sid) if self.late_until.is_some() => {
+                    info!(drag, "a late drag dropped on the strip: leaving with it");
+                    self.end_late_wait(sid)
+                }
+                _ => Vec::new(), // The wait is over; the catcher refused it.
+            },
             InjectMsg::DragEnded { drag, crossing } => {
                 self.session_ended(drag, crossing);
                 Vec::new()
@@ -478,6 +611,7 @@ impl<I: Inject, D: DragPort> Router<I, D> {
 
     fn end_session(&mut self) -> Vec<InjectEv> {
         self.offer = None;
+        self.linger = None;
         match self.sid.take() {
             Some(sid) => self.feed(sid, MacEvent::Disconnected),
             None => Vec::new(),
@@ -516,17 +650,7 @@ impl<I: Inject, D: DragPort> Router<I, D> {
             // A held drop keeps the cursor on the drop spot.
             Input::Motion { .. } | Input::Scroll { .. } if held => Vec::new(),
             Input::Motion { dx, dy } if controlled => match self.inj.motion(dx, dy) {
-                Some(frac) => {
-                    let buttons_held = self.inj.buttons_held();
-                    self.feed(
-                        sid,
-                        MacEvent::PushOut {
-                            frac,
-                            buttons_held,
-                            offer: None,
-                        },
-                    )
-                }
+                Some(frac) => self.push_out(sid, frac),
                 None => Vec::new(),
             },
             Input::Scroll { dx, dy } if controlled => {
@@ -548,6 +672,9 @@ impl<I: Inject, D: DragPort> Router<I, D> {
             Input::Button { button, down } => {
                 if controlled || (!down && self.inj.button_held(button)) {
                     self.inj.button(button, down);
+                    if button == MouseButton::Left {
+                        self.left_is_users = down;
+                    }
                 }
                 Vec::new()
             }
@@ -563,6 +690,88 @@ impl<I: Inject, D: DragPort> Router<I, D> {
                 Vec::new()
             }
             Input::Motion { .. } | Input::Scroll { .. } => Vec::new(),
+        }
+    }
+
+    /// The cursor pushes out through the entry edge at `frac`. With only
+    /// the user's left button held and a catcher here, the release goes
+    /// out over the strip: carrying the strip's drag, or waiting for a
+    /// late one (R48).
+    fn push_out(&mut self, sid: u64, frac: f32) -> Vec<InjectEv> {
+        let buttons_held = self.inj.buttons_held();
+        let catching = self.catcher.is_some() && self.users_left_alone();
+        let Some(edge) = self.machine.entry_edge().filter(|_| catching) else {
+            let offer = None;
+            return self.feed(
+                sid,
+                MacEvent::PushOut {
+                    frac,
+                    buttons_held,
+                    offer,
+                },
+            );
+        };
+        // Up before the release goes out, and a while after it.
+        self.linger = Some((Instant::now() + self.late_wait, edge));
+        self.update_zone(Instant::now());
+        let offer = self.catcher.as_mut().and_then(|c| c.push_out());
+        if let Some(drag) = offer {
+            info!(drag, "pushing out with the strip's drag");
+            return self.feed(
+                sid,
+                MacEvent::PushOut {
+                    frac,
+                    buttons_held,
+                    offer,
+                },
+            );
+        }
+        info!(
+            ms = self.late_wait.as_millis() as u64,
+            "pushing out with the left button held: waiting for a late drag"
+        );
+        self.feed(sid, MacEvent::PushOutLate { frac })
+    }
+
+    /// Whether the only button held is the left one, pressed by the user
+    /// here (not for a ride, nor left down after one).
+    fn users_left_alone(&self) -> bool {
+        self.left_is_users
+            && self.ride.is_none()
+            && self.inj.button_held(MouseButton::Left)
+            && !NOT_LEFT.iter().any(|&b| self.inj.button_held(b))
+    }
+
+    /// The late wait is over: leave, with the drag the catcher caught.
+    fn end_late_wait(&mut self, sid: u64) -> Vec<InjectEv> {
+        self.late_until = None;
+        let drag = self.catcher.as_mut().and_then(|c| c.end_late_wait(true));
+        self.feed(sid, MacEvent::LateDrop { drag })
+    }
+
+    /// Tells the catcher where the strip should be, if that changed: on
+    /// the entry edge while the user drags with only the left button near
+    /// it, or lingering after a push-out; nowhere otherwise.
+    fn update_zone(&mut self, now: Instant) {
+        if self.catcher.is_none() {
+            return;
+        }
+        if self.linger.is_some_and(|(until, _)| now >= until) {
+            self.linger = None;
+        }
+        let near = match self.machine.entry_edge() {
+            Some(edge) if self.machine.controlled() && self.users_left_alone() => {
+                let (bounds, at) = (self.inj.bounds(), self.inj.cursor());
+                in_catch_zone(bounds, edge, at).then_some(edge)
+            }
+            _ => None,
+        };
+        let want = near.or(self.linger.map(|(_, edge)| edge));
+        if want != self.zone {
+            self.zone = want;
+            if let Some(c) = self.catcher.as_mut() {
+                c.zone(want);
+            }
         }
     }
 
@@ -586,6 +795,7 @@ impl<I: Inject, D: DragPort> Router<I, D> {
         let at = self.inj.cursor();
         if let Some(crossing) = self.drags.prepare(drag, items, at) {
             self.inj.button(MouseButton::Left, true);
+            self.left_is_users = false;
             self.ride = Some(Ride {
                 drag,
                 crossing,
@@ -725,7 +935,9 @@ impl<I: Inject, D: DragPort> Router<I, D> {
                 MacAction::WakeDisplay | MacAction::WarpTo { .. } if !move_cursor => {}
                 MacAction::WakeDisplay => self.inj.wake_display(),
                 MacAction::WarpTo { edge, frac } => self.inj.warp_to(edge, frac),
-                MacAction::SendLeave { frac, .. } => out.push(InjectEv::SendLeave { sid, frac }),
+                MacAction::SendLeave { frac, drag } => {
+                    out.push(InjectEv::SendLeave { sid, frac, drag })
+                }
                 MacAction::ReleaseAllInjected => self.inj.release_all(),
                 MacAction::StartControl => out.push(InjectEv::Controlled { sid, on: true }),
                 MacAction::StopControl => out.push(InjectEv::Controlled { sid, on: false }),
@@ -735,6 +947,19 @@ impl<I: Inject, D: DragPort> Router<I, D> {
                     self.abort_drag(drag);
                     cancelled = true;
                 }
+                // It ends with the strip's linger, set at the push-out.
+                MacAction::AwaitLateDrop => {
+                    let until = self.linger.map(|(until, _)| until);
+                    self.late_until = until.or_else(|| Some(Instant::now() + self.late_wait));
+                }
+            }
+        }
+        // The PC took the cursor back, or the session ended, during the
+        // wait: no leave comes, and none carries what the strip caught.
+        if self.late_until.is_some() && !self.machine.awaiting_late_drop() {
+            self.late_until = None;
+            if let Some(c) = self.catcher.as_mut() {
+                c.end_late_wait(false);
             }
         }
         if cancelled && !lets_go && self.ride.is_none() && self.inj.button_held(MouseButton::Left) {
@@ -747,19 +972,30 @@ impl<I: Inject, D: DragPort> Router<I, D> {
 /// Starts the injection thread; `report` passes its events to the app's
 /// loop. It always ends by reporting `Stopped`: after `Quit`, or, having
 /// released everything, after a panic.
-pub fn spawn_inject_thread<I: Inject + Send + 'static, D: DragPort + Send + 'static>(
+pub fn spawn_inject_thread<I, D, C>(
     inj: I,
     drags: D,
+    catcher: Option<C>,
     access: Arc<AtomicBool>,
     report: impl Fn(InjectEv) + Send + 'static,
-) -> Result<crossbeam_channel::Sender<InjectMsg>> {
-    spawn_router(Router::new(inj, drags, access), report)
+) -> Result<crossbeam_channel::Sender<InjectMsg>>
+where
+    I: Inject + Send + 'static,
+    D: DragPort + Send + 'static,
+    C: CatchPort + Send + 'static,
+{
+    spawn_router(Router::with_catcher(inj, drags, catcher, access), report)
 }
 
-fn spawn_router<I: Inject + Send + 'static, D: DragPort + Send + 'static>(
-    mut router: Router<I, D>,
+fn spawn_router<I, D, C>(
+    mut router: Router<I, D, C>,
     report: impl Fn(InjectEv) + Send + 'static,
-) -> Result<crossbeam_channel::Sender<InjectMsg>> {
+) -> Result<crossbeam_channel::Sender<InjectMsg>>
+where
+    I: Inject + Send + 'static,
+    D: DragPort + Send + 'static,
+    C: CatchPort + Send + 'static,
+{
     let (tx, rx) = crossbeam_channel::unbounded::<InjectMsg>();
     std::thread::Builder::new()
         .name("cj-inject".into())
@@ -771,7 +1007,9 @@ fn spawn_router<I: Inject + Send + 'static, D: DragPort + Send + 'static>(
                         Some(at) => match rx.recv_deadline(at) {
                             Ok(msg) => msg,
                             Err(RecvTimeoutError::Timeout) => {
-                                router.tick(Instant::now());
+                                for ev in router.tick(Instant::now()) {
+                                    report(ev);
+                                }
                                 continue;
                             }
                             Err(RecvTimeoutError::Disconnected) => break,
@@ -838,6 +1076,10 @@ pub(super) mod tests {
         Released(DragId),
         MayRelease(DragId),
         CancelSource(DragId),
+        // The catcher's calls.
+        Zone(Option<Side>),
+        CatchPushOut,
+        EndLateWait(bool),
     }
 
     /// Records every call; holds keys and buttons like the Injector does.
@@ -853,6 +1095,8 @@ pub(super) mod tests {
         at_frac: f32,
         keys: BTreeSet<u16>,
         buttons: Vec<MouseButton>,
+        /// Where the cursor is, in global points.
+        pos: (f64, f64),
     }
 
     impl Fake {
@@ -866,6 +1110,7 @@ pub(super) mod tests {
                 at_frac: 0.5,
                 keys: BTreeSet::new(),
                 buttons: Vec::new(),
+                pos: (300.0, 200.0),
             };
             (fake, calls)
         }
@@ -924,7 +1169,15 @@ pub(super) mod tests {
             self.at_frac
         }
         fn cursor(&mut self) -> (f64, f64) {
-            (300.0, 200.0)
+            self.pos
+        }
+        fn bounds(&self) -> Rectf {
+            Rectf {
+                x: 0.0,
+                y: 0.0,
+                w: 1512.0,
+                h: 982.0,
+            }
         }
         fn jiggle(&mut self, nudge: bool) {
             self.log(Call::Jiggle(nudge));
@@ -1122,7 +1375,11 @@ pub(super) mod tests {
         assert_eq!(
             r.handle(input(1, Input::Motion { dx: -9, dy: 0 })),
             vec![
-                InjectEv::SendLeave { sid: 1, frac: 0.3 },
+                InjectEv::SendLeave {
+                    sid: 1,
+                    frac: 0.3,
+                    drag: None
+                },
                 InjectEv::Controlled { sid: 1, on: false }
             ]
         );
@@ -1213,7 +1470,11 @@ pub(super) mod tests {
             r.handle(input(1, enter(0.7))),
             vec![
                 InjectEv::Controlled { sid: 1, on: true },
-                InjectEv::SendLeave { sid: 1, frac: 0.7 },
+                InjectEv::SendLeave {
+                    sid: 1,
+                    frac: 0.7,
+                    drag: None
+                },
                 InjectEv::Controlled { sid: 1, on: false },
             ]
         );
@@ -1231,7 +1492,11 @@ pub(super) mod tests {
         let access = Arc::new(AtomicBool::new(false));
         let mut r = begun_with(fake, access.clone());
         let bounced = r.handle(input(1, enter(0.7)));
-        assert!(bounced.contains(&InjectEv::SendLeave { sid: 1, frac: 0.7 }));
+        assert!(bounced.contains(&InjectEv::SendLeave {
+            sid: 1,
+            frac: 0.7,
+            drag: None
+        }));
         access.store(true, Ordering::Relaxed);
         take(&calls);
         assert_eq!(
@@ -1255,7 +1520,11 @@ pub(super) mod tests {
             r.handle(InjectMsg::AccessLost),
             vec![
                 // Where the cursor is now along the entry edge, not where it came in.
-                InjectEv::SendLeave { sid: 1, frac: 0.8 },
+                InjectEv::SendLeave {
+                    sid: 1,
+                    frac: 0.8,
+                    drag: None
+                },
                 InjectEv::Controlled { sid: 1, on: false },
             ]
         );
@@ -1324,7 +1593,7 @@ pub(super) mod tests {
     fn thread_injects_in_order_and_reports_until_quit() {
         let (fake, calls) = Fake::new();
         let (ev_tx, ev_rx) = crossbeam_channel::unbounded();
-        let tx = spawn_inject_thread(fake, NoDrags, granted(), move |ev| {
+        let tx = spawn_inject_thread(fake, NoDrags, None::<NoCatcher>, granted(), move |ev| {
             let _ = ev_tx.send(ev);
         })
         .unwrap();
@@ -1367,7 +1636,7 @@ pub(super) mod tests {
         let (mut fake, calls) = Fake::new();
         fake.key_panics = true;
         let (ev_tx, ev_rx) = crossbeam_channel::unbounded();
-        let tx = spawn_inject_thread(fake, NoDrags, granted(), move |ev| {
+        let tx = spawn_inject_thread(fake, NoDrags, None::<NoCatcher>, granted(), move |ev| {
             let _ = ev_tx.send(ev);
         })
         .unwrap();
@@ -1518,7 +1787,11 @@ pub(super) mod tests {
         assert_eq!(
             r.handle(input(1, Input::Motion { dx: -9, dy: 0 })),
             vec![
-                InjectEv::SendLeave { sid: 1, frac: 0.3 },
+                InjectEv::SendLeave {
+                    sid: 1,
+                    frac: 0.3,
+                    drag: None
+                },
                 InjectEv::Controlled { sid: 1, on: false }
             ]
         );
@@ -1708,7 +1981,11 @@ pub(super) mod tests {
         assert_eq!(
             r.handle(InjectMsg::AccessLost),
             vec![
-                InjectEv::SendLeave { sid: 1, frac: 0.5 },
+                InjectEv::SendLeave {
+                    sid: 1,
+                    frac: 0.5,
+                    drag: Some(7)
+                },
                 InjectEv::Controlled { sid: 1, on: false }
             ]
         );
@@ -1754,7 +2031,11 @@ pub(super) mod tests {
         assert_eq!(
             r.handle(input(1, Input::Motion { dx: -9, dy: 0 })),
             vec![
-                InjectEv::SendLeave { sid: 1, frac: 0.3 },
+                InjectEv::SendLeave {
+                    sid: 1,
+                    frac: 0.3,
+                    drag: None
+                },
                 InjectEv::Controlled { sid: 1, on: false }
             ]
         );
@@ -1770,7 +2051,11 @@ pub(super) mod tests {
         assert_eq!(
             r.handle(input(1, Input::Motion { dx: -9, dy: 0 })),
             vec![
-                InjectEv::SendLeave { sid: 1, frac: 0.3 },
+                InjectEv::SendLeave {
+                    sid: 1,
+                    frac: 0.3,
+                    drag: Some(7)
+                },
                 InjectEv::Controlled { sid: 1, on: false }
             ]
         );
@@ -1869,7 +2154,7 @@ pub(super) mod tests {
         fake.motion_panics = true;
         let drags = FakeDrags::new(&calls);
         let (ev_tx, ev_rx) = crossbeam_channel::unbounded();
-        let tx = spawn_inject_thread(fake, drags, granted(), move |ev| {
+        let tx = spawn_inject_thread(fake, drags, None::<NoCatcher>, granted(), move |ev| {
             let _ = ev_tx.send(ev);
         })
         .unwrap();
@@ -2043,7 +2328,7 @@ pub(super) mod tests {
         fake.key_panics = true;
         let drags = FakeDrags::new(&calls);
         let (ev_tx, ev_rx) = crossbeam_channel::unbounded();
-        let tx = spawn_inject_thread(fake, drags, granted(), move |ev| {
+        let tx = spawn_inject_thread(fake, drags, None::<NoCatcher>, granted(), move |ev| {
             let _ = ev_tx.send(ev);
         })
         .unwrap();
@@ -2070,5 +2355,393 @@ pub(super) mod tests {
             [Call::CancelSource(7), Call::ReleaseAll],
             "{calls:?}"
         );
+    }
+
+    // ------------------------------------------------ drags leaving the Mac
+
+    const RIGHT_DOWN: Call = Call::Button(MouseButton::Right, true);
+    const RIGHT_UP: Call = Call::Button(MouseButton::Right, false);
+    /// A short late wait, so the thread tests run fast.
+    const WAIT: Duration = Duration::from_millis(40);
+
+    /// A catcher that records its calls in the Fake's list.
+    pub(crate) struct FakeCatcher {
+        calls: Arc<Mutex<Vec<Call>>>,
+        /// The drag on the strip: what `push_out` carries.
+        offer: Option<DragId>,
+        /// What dropped during the late wait: what `end_late_wait` gives.
+        caught: Arc<Mutex<Option<DragId>>>,
+    }
+
+    impl CatchPort for FakeCatcher {
+        fn zone(&mut self, show: Option<Side>) {
+            self.calls.lock().unwrap().push(Call::Zone(show));
+        }
+        fn push_out(&mut self) -> Option<DragId> {
+            self.calls.lock().unwrap().push(Call::CatchPushOut);
+            self.offer
+        }
+        fn end_late_wait(&mut self, carry: bool) -> Option<DragId> {
+            self.calls.lock().unwrap().push(Call::EndLateWait(carry));
+            self.caught.lock().unwrap().take()
+        }
+    }
+
+    type Catching = Router<Fake, FakeDrags, FakeCatcher>;
+    /// A router with a fake catcher, the call list, and the catcher's
+    /// `caught` slot.
+    type CatchSetup = (Catching, Arc<Mutex<Vec<Call>>>, Arc<Mutex<Option<DragId>>>);
+
+    /// Session 1 begun with a fake drag source and catcher; the cursor is
+    /// near the left edge and pushes out at 0.3. Returns the catcher's
+    /// `caught` slot.
+    fn begun_catching(offer: Option<DragId>) -> CatchSetup {
+        let (mut fake, calls) = Fake::new();
+        fake.push_out = Some(0.3);
+        fake.pos = (10.0, 200.0);
+        let caught = Arc::new(Mutex::new(None));
+        let catcher = FakeCatcher {
+            calls: calls.clone(),
+            offer,
+            caught: caught.clone(),
+        };
+        let drags = FakeDrags::new(&calls);
+        let mut r =
+            Router::with_catcher(fake, drags, Some(catcher), granted()).with_late_wait(WAIT);
+        assert_eq!(r.handle(InjectMsg::Begin { sid: 1 }), vec![]);
+        (r, calls, caught)
+    }
+
+    /// Controlled, with the user's left button down near the left edge:
+    /// the strip is up; the calls so far are taken.
+    fn dragging_near_the_edge(offer: Option<DragId>) -> CatchSetup {
+        let (mut r, calls, caught) = begun_catching(offer);
+        r.handle(input(1, enter(0.5)));
+        r.handle(input(1, button(true)));
+        assert_eq!(take(&calls).last(), Some(&Call::Zone(Some(Side::Left))));
+        (r, calls, caught)
+    }
+
+    fn zones(calls: &[Call]) -> Vec<Option<Side>> {
+        calls
+            .iter()
+            .filter_map(|c| match c {
+                Call::Zone(z) => Some(*z),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn push(r: &mut Catching) -> Vec<InjectEv> {
+        r.handle(input(1, Input::Motion { dx: -9, dy: 0 }))
+    }
+
+    #[test]
+    fn push_out_carries_catcher_offer_only_with_left_alone() {
+        // Only Left: the strip's drag goes with the release and the leave.
+        let (mut r, calls, _) = dragging_near_the_edge(Some(9));
+        assert_eq!(
+            push(&mut r),
+            vec![
+                InjectEv::SendLeave {
+                    sid: 1,
+                    frac: 0.3,
+                    drag: Some(9)
+                },
+                InjectEv::Controlled { sid: 1, on: false }
+            ]
+        );
+        assert_eq!(
+            take(&calls),
+            vec![Call::Motion(-9, 0), Call::CatchPushOut, Call::ReleaseAll],
+            "asked just before the release"
+        );
+        assert!(r.next_tick().is_some(), "the strip lingers");
+
+        // Right held too: a wall, and the catcher is not asked.
+        let (mut r, calls, _) = dragging_near_the_edge(Some(9));
+        r.handle(input(
+            1,
+            Input::Button {
+                button: MouseButton::Right,
+                down: true,
+            },
+        ));
+        assert_eq!(push(&mut r), vec![]);
+        let c = take(&calls);
+        assert!(!c.contains(&Call::CatchPushOut), "{c:?}");
+        assert!(!c.contains(&Call::ReleaseAll), "{c:?}");
+
+        // Nothing held: a plain leave, no offer.
+        let (mut r, calls, _) = begun_catching(Some(9));
+        r.handle(input(1, enter(0.5)));
+        take(&calls);
+        assert_eq!(
+            push(&mut r),
+            vec![
+                InjectEv::SendLeave {
+                    sid: 1,
+                    frac: 0.3,
+                    drag: None
+                },
+                InjectEv::Controlled { sid: 1, on: false }
+            ]
+        );
+        assert_eq!(take(&calls), vec![Call::Motion(-9, 0), Call::ReleaseAll]);
+        assert_eq!(r.next_tick(), None);
+    }
+
+    #[test]
+    fn zone_shown_only_while_controlled_with_left_alone_near_the_edge() {
+        let (mut r, calls, _) = begun_catching(None);
+        let left = |down| input(1, button(down));
+        let right = |down| {
+            input(
+                1,
+                Input::Button {
+                    button: MouseButton::Right,
+                    down,
+                },
+            )
+        };
+        let mv = || input(1, Input::Motion { dx: 1, dy: 0 });
+        r.inj.push_out = None;
+        // Not controlled: nothing, whatever is pressed.
+        r.handle(left(true));
+        r.handle(mv());
+        assert_eq!(zones(&take(&calls)), vec![]);
+        r.handle(input(1, enter(0.5)));
+        r.inj.pos = (300.0, 200.0);
+        r.handle(left(true));
+        r.handle(mv());
+        assert_eq!(zones(&take(&calls)), vec![], "far from the edge");
+        r.inj.pos = (47.0, 200.0);
+        r.handle(mv());
+        r.handle(mv());
+        assert_eq!(
+            zones(&take(&calls)),
+            vec![Some(Side::Left)],
+            "once, at the change"
+        );
+        r.handle(right(true));
+        assert_eq!(take(&calls), vec![RIGHT_DOWN, Call::Zone(None)]);
+        r.handle(right(false));
+        assert_eq!(take(&calls), vec![RIGHT_UP, Call::Zone(Some(Side::Left))]);
+        r.inj.pos = (49.0, 200.0);
+        r.handle(mv());
+        assert_eq!(zones(&take(&calls)), vec![None]);
+        r.inj.pos = (2.0, 200.0);
+        r.handle(mv());
+        assert_eq!(zones(&take(&calls)), vec![Some(Side::Left)]);
+        r.handle(left(false));
+        assert_eq!(zones(&take(&calls)), vec![None], "let go");
+        r.handle(left(true));
+        assert_eq!(zones(&take(&calls)), vec![Some(Side::Left)]);
+        // The PC takes the cursor back; then the session ends.
+        r.handle(input(1, Input::ReleaseAll));
+        assert_eq!(zones(&take(&calls)), vec![None]);
+        r.handle(input(1, enter(0.5)));
+        r.handle(left(true));
+        assert_eq!(zones(&take(&calls)), vec![Some(Side::Left)]);
+        r.handle(InjectMsg::End { sid: 1 });
+        assert_eq!(zones(&take(&calls)), vec![None]);
+    }
+
+    #[test]
+    fn zone_hidden_while_an_incoming_drag_rides() {
+        let (mut r, calls, _) = begun_catching(None);
+        r.inj.push_out = None;
+        r.inj.pos = (300.0, 200.0);
+        r.handle(input(
+            1,
+            Input::DragOffer {
+                drag: 7,
+                items: items(1),
+            },
+        ));
+        r.handle(input(1, enter_with(7)));
+        r.inj.pos = (10.0, 200.0);
+        r.handle(input(1, Input::Motion { dx: -1, dy: 0 }));
+        assert!(r.inj.button_held(MouseButton::Left), "pressed for the ride");
+        assert_eq!(zones(&take(&calls)), vec![]);
+        // The ride's session ends (Esc on the PC); the PC still holds the
+        // button, which is no drag of the user's here.
+        r.handle(InjectMsg::DragEnded {
+            drag: 7,
+            crossing: 1,
+        });
+        r.handle(input(1, Input::Motion { dx: -1, dy: 0 }));
+        assert_eq!(zones(&take(&calls)), vec![]);
+        // Pushing out with it is still a wall.
+        r.inj.push_out = Some(0.3);
+        assert_eq!(push(&mut r), vec![]);
+        assert!(!take(&calls).contains(&Call::CatchPushOut));
+    }
+
+    #[test]
+    fn late_perform_within_wait_becomes_the_offer() {
+        let (mut r, calls, caught) = dragging_near_the_edge(None);
+        assert_eq!(
+            push(&mut r),
+            vec![InjectEv::Controlled { sid: 1, on: false }],
+            "no leave yet"
+        );
+        assert_eq!(
+            take(&calls),
+            vec![Call::Motion(-9, 0), Call::CatchPushOut, Call::ReleaseAll],
+            "the release went out over the strip"
+        );
+        let due = r.next_tick().unwrap();
+        *caught.lock().unwrap() = Some(11);
+        assert_eq!(
+            r.handle(InjectMsg::LateDrop { drag: 11 }),
+            vec![InjectEv::SendLeave {
+                sid: 1,
+                frac: 0.3,
+                drag: Some(11)
+            }]
+        );
+        assert_eq!(take(&calls), vec![Call::EndLateWait(true)]);
+        // The strip stays up for the rest of the wait, then goes.
+        assert_eq!(r.next_tick(), Some(due));
+        assert_eq!(r.tick(due - Duration::from_millis(1)), vec![]);
+        assert_eq!(take(&calls), vec![]);
+        assert_eq!(r.tick(due), vec![], "the leave went already");
+        assert_eq!(take(&calls), vec![Call::Zone(None)]);
+        assert_eq!(r.next_tick(), None);
+        // A late message after that is no news.
+        assert_eq!(r.handle(InjectMsg::LateDrop { drag: 11 }), vec![]);
+    }
+
+    #[test]
+    fn no_perform_within_wait_leaves_without_offer() {
+        let (mut r, calls, _) = dragging_near_the_edge(None);
+        push(&mut r);
+        take(&calls);
+        let due = r.next_tick().unwrap();
+        assert_eq!(r.tick(due - Duration::from_millis(1)), vec![]);
+        assert_eq!(take(&calls), vec![], "the strip is still up");
+        assert_eq!(
+            r.tick(due),
+            vec![InjectEv::SendLeave {
+                sid: 1,
+                frac: 0.3,
+                drag: None
+            }]
+        );
+        assert_eq!(
+            take(&calls),
+            vec![Call::EndLateWait(true), Call::Zone(None)]
+        );
+        assert_eq!(r.next_tick(), None);
+    }
+
+    #[test]
+    fn taking_the_cursor_back_during_the_wait_leaves_nothing_behind() {
+        for msg in [
+            input(1, Input::ReleaseAll),
+            InjectMsg::End { sid: 1 },
+            InjectMsg::Begin { sid: 2 },
+        ] {
+            let (mut r, calls, caught) = dragging_near_the_edge(None);
+            push(&mut r);
+            take(&calls);
+            *caught.lock().unwrap() = Some(11);
+            let out = r.handle(msg.clone());
+            assert!(
+                !out.iter().any(|e| matches!(e, InjectEv::SendLeave { .. })),
+                "{msg:?}: {out:?}"
+            );
+            let c = take(&calls);
+            assert!(c.contains(&Call::EndLateWait(false)), "{msg:?}: {c:?}");
+            // The strip may linger (a late drag still ends on it, refused),
+            // but no leave comes.
+            assert_eq!(r.tick(Instant::now() + WAIT * 2), vec![], "{msg:?}");
+            let c = take(&calls);
+            assert!(!c.contains(&Call::EndLateWait(true)), "{msg:?}: {c:?}");
+            assert_eq!(r.next_tick(), None, "{msg:?}");
+            assert_eq!(r.zone, None, "{msg:?}");
+        }
+    }
+
+    #[test]
+    fn late_wait_does_not_block_other_input() {
+        let (mut r, calls, _) = dragging_near_the_edge(None);
+        let t0 = Instant::now();
+        push(&mut r);
+        // Input during the wait is handled at once: dropped, the PC no
+        // longer controlling this Mac.
+        for i in [
+            Input::Motion { dx: 5, dy: 0 },
+            key(0x00, true),
+            button(true),
+            Input::Scroll { dx: 0, dy: 3 },
+        ] {
+            assert_eq!(r.handle(input(1, i)), vec![]);
+        }
+        assert!(t0.elapsed() < WAIT, "nothing waited");
+        let c = take(&calls);
+        assert_eq!(
+            c,
+            vec![Call::Motion(-9, 0), Call::CatchPushOut, Call::ReleaseAll],
+            "nothing injected after the release"
+        );
+        assert!(r.next_tick().is_some(), "the leave is still due");
+    }
+
+    #[test]
+    fn thread_sends_the_late_leave_after_the_wait_meanwhile_handling_input() {
+        let (r, calls, _) = dragging_near_the_edge(None);
+        let (ev_tx, ev_rx) = crossbeam_channel::unbounded();
+        let tx = spawn_router(r, move |ev| {
+            let _ = ev_tx.send((Instant::now(), ev));
+        })
+        .unwrap();
+        let t0 = Instant::now();
+        tx.send(input(1, Input::Motion { dx: -9, dy: 0 })).unwrap();
+        let t = Duration::from_secs(2);
+        let (at, ev) = ev_rx.recv_timeout(t).unwrap();
+        assert_eq!(ev, InjectEv::Controlled { sid: 1, on: false });
+        assert!(at - t0 < WAIT, "reported before the wait is over");
+        // Input sent during the wait is taken off the channel at once.
+        tx.send(input(1, key(0x00, true))).unwrap();
+        tx.send(InjectMsg::DragReady {
+            drag: 3,
+            crossing: 1,
+        })
+        .unwrap();
+        let (at, ev) = ev_rx.recv_timeout(t).unwrap();
+        assert_eq!(
+            ev,
+            InjectEv::SendLeave {
+                sid: 1,
+                frac: 0.3,
+                drag: None
+            }
+        );
+        assert!(at - t0 >= WAIT, "the leave waited");
+        tx.send(InjectMsg::Quit).unwrap();
+        while ev_rx.recv_timeout(t).unwrap().1 != InjectEv::Stopped {}
+        let c = take(&calls);
+        assert!(!c.contains(&Call::Key(0x00, true)), "{c:?}");
+        assert_eq!(
+            zones(&c),
+            vec![None],
+            "the strip went at the end of the wait: {c:?}"
+        );
+    }
+
+    #[test]
+    fn without_a_catcher_left_held_at_the_edge_is_still_a_wall() {
+        let (mut fake, calls) = Fake::new();
+        fake.push_out = Some(0.3);
+        fake.pos = (0.0, 200.0);
+        let mut r = begun(fake);
+        r.handle(input(1, enter(0.5)));
+        r.handle(input(1, button(true)));
+        take(&calls);
+        assert_eq!(r.handle(input(1, Input::Motion { dx: -9, dy: 0 })), vec![]);
+        assert_eq!(take(&calls), vec![Call::Motion(-9, 0)]);
+        assert_eq!(r.next_tick(), None);
     }
 }

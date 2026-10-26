@@ -31,7 +31,8 @@ use tracing::{debug, error, info, warn};
 
 use super::clipboard::{read_clipboard, spawn_clipboard_watcher, write_clipboard};
 use super::control::{
-    InjectEv, InjectMsg, NoDrags, set_user_interactive_qos, spawn_inject_thread, update_access,
+    InjectEv, InjectMsg, NoCatcher, NoDrags, set_user_interactive_qos, spawn_inject_thread,
+    update_access,
 };
 use super::inject::Injector;
 use super::link::{Live, run_pairing};
@@ -126,10 +127,17 @@ pub fn run_mac() -> Result<()> {
             "Accessibility is on, but posting events is not confirmed"
         );
     }
-    // Task 17 passes the drag source (dnd::source::DragSource) instead.
-    let inject = spawn_inject_thread(Injector::new()?, NoDrags, access.clone(), move |ev| {
-        let _ = inject_events.send(Ev::Inject(ev));
-    })?;
+    // Task 17 passes the drag source (dnd::source::DragSource) and the
+    // catcher (dnd::catcher::Catcher) instead.
+    let inject = spawn_inject_thread(
+        Injector::new()?,
+        NoDrags,
+        None::<NoCatcher>,
+        access.clone(),
+        move |ev| {
+            let _ = inject_events.send(Ev::Inject(ev));
+        },
+    )?;
     let clip_link = Arc::new(ClipboardLink::new(cfg.clipboard_max_bytes));
     let clip_events = events.clone();
     let clip_write = bridge_clipboard(
@@ -557,7 +565,10 @@ impl App {
 
     async fn on_inject(&mut self, ev: InjectEv) {
         match ev {
-            InjectEv::SendLeave { sid, frac } => {
+            // Task 17 sends the catcher's offer first and passes `drag`
+            // (`leave_needs_offer`); without a catcher or a drag source,
+            // nothing rides either way yet.
+            InjectEv::SendLeave { sid, frac, .. } => {
                 let Some(session) = self
                     .live()
                     .filter(|l| l.sid == sid)
