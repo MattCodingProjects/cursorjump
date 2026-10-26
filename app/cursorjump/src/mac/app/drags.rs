@@ -204,7 +204,9 @@ fn leave_step(
 ) -> LeaveStep {
     match drag {
         Some(d) if leave_needs_offer(drag, local_offer, incoming) => LeaveStep::OfferThenLeave(d),
-        _ => LeaveStep::Leave(drag),
+        // Only the PC's own drag rides home; one the PC was never offered
+        // (a catcher drag whose offer is gone) must not ride along.
+        _ => LeaveStep::Leave(incoming),
     }
 }
 
@@ -732,7 +734,15 @@ impl App {
     /// couldn't be made.
     pub(super) async fn leave_drag(&mut self, drag: Option<DragId>) -> Option<DragId> {
         let local = self.drags.offer.as_ref().map(|o| o.drag);
-        let incoming = drag.filter(|d| self.drags.incoming.contains_key(d));
+        // The PC's drag: one riding here, or one its link still knows.
+        let incoming = drag.filter(|d| {
+            self.drags.incoming.contains_key(d)
+                || self
+                    .drags
+                    .link
+                    .as_ref()
+                    .is_some_and(|l| l.items(*d).is_some())
+        });
         let d = match leave_step(drag, local, incoming) {
             LeaveStep::Leave(carried) => return carried,
             LeaveStep::OfferThenLeave(d) => d,
@@ -880,6 +890,11 @@ mod tests {
             "the PC's drag goes home"
         );
         assert_eq!(leave_step(None, Some(9), None), LeaveStep::Leave(None));
+        assert_eq!(
+            leave_step(Some(5), None, None),
+            LeaveStep::Leave(None),
+            "a drag the PC was never offered doesn't ride along"
+        );
         assert_eq!(leave_after_offer(9, true), Some(9));
         assert_eq!(
             leave_after_offer(9, false),

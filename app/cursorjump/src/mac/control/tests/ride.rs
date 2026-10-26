@@ -741,7 +741,7 @@ fn the_leave_is_reported_before_the_drag_source_says_it_ended() {
     .unwrap();
     // Goes home.
     tx.send(input(1, Input::Motion { dx: -9, dy: 0 })).unwrap();
-    // A crossing whose prepare fails, then goes home at once.
+    // A crossing whose prepare fails: its end comes after cj-inject reported.
     tx.send(input(
         1,
         Input::DragOffer {
