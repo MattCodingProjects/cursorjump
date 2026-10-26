@@ -171,11 +171,22 @@ pub async fn send_item(
         total_bytes: sources.iter().map(|s| s.entry.size).sum(),
         entries: sources.len() as u64,
     };
+    // A single file is opened before its stream, so one that can't be read
+    // fails without the other computer seeing anything. A folder's files
+    // are opened as they are sent.
+    let first = match header.kind {
+        ItemKind::File => Some(
+            open_source(&sources[0], cancel)
+                .await
+                .map_err(|stop| stop.reason(cancel))?,
+        ),
+        ItemKind::Dir => None,
+    };
     let opened = unless_cancelled(cancel, s.open_files(&header))
         .await
         .and_then(|r| r.map_err(Stop::Stream));
     let mut out = opened.map_err(|stop| stop.reason(cancel))?;
-    match send_entries(&mut out, &sources, pacer, cancel).await {
+    match send_entries(&mut out, &sources, first, pacer, cancel).await {
         Ok(()) => out.finish().map_err(|e| Stop::Stream(e).reason(cancel)),
         Err(stop) => {
             out.cancel();
@@ -256,9 +267,11 @@ fn walk(root: &Path) -> Result<Vec<Source>, FailReason> {
     Ok(out)
 }
 
+/// Sends every entry; `first` is the first file, if already open.
 async fn send_entries(
     out: &mut FilesOut,
     sources: &[Source],
+    mut first: Option<tokio::fs::File>,
     pacer: &SharedPacer,
     cancel: &CancellationToken,
 ) -> Result<(), Stop> {
@@ -268,10 +281,27 @@ async fn send_entries(
             .await?
             .map_err(Stop::Stream)?;
         if src.entry.kind == ItemKind::File {
-            send_file(out, src, &mut buf, pacer, cancel).await?;
+            let file = match first.take() {
+                Some(f) => f,
+                None => open_source(src, cancel).await?,
+            };
+            send_file(out, src, file, &mut buf, pacer, cancel).await?;
         }
     }
     Ok(())
+}
+
+async fn open_source(src: &Source, cancel: &CancellationToken) -> Result<tokio::fs::File, Stop> {
+    unless_cancelled(cancel, tokio::fs::File::open(&src.path))
+        .await?
+        .map_err(|e| unreadable(src, e))
+}
+
+fn unreadable(src: &Source, e: io::Error) -> Stop {
+    warn!("{} cannot be sent: {e}", src.path.display());
+    Stop::Fail(FailReason::Unreadable {
+        name: display_name(&src.path),
+    })
 }
 
 /// Sends a file's bytes, reading to its end: a file that is not the size
@@ -279,30 +309,22 @@ async fn send_entries(
 async fn send_file(
     out: &mut FilesOut,
     src: &Source,
+    mut file: tokio::fs::File,
     buf: &mut [u8],
     pacer: &SharedPacer,
     cancel: &CancellationToken,
 ) -> Result<(), Stop> {
-    let unreadable = |e: io::Error| {
-        warn!("{} cannot be sent: {e}", src.path.display());
-        Stop::Fail(FailReason::Unreadable {
-            name: display_name(&src.path),
-        })
-    };
     let changed = || {
         warn!("{} changed while it was being sent", src.path.display());
         Stop::Fail(FailReason::Changed {
             name: display_name(&src.path),
         })
     };
-    let mut file = unless_cancelled(cancel, tokio::fs::File::open(&src.path))
-        .await?
-        .map_err(unreadable)?;
     let mut left = src.entry.size;
     loop {
         let n = unless_cancelled(cancel, file.read(buf))
             .await?
-            .map_err(unreadable)?;
+            .map_err(|e| unreadable(src, e))?;
         #[cfg(test)]
         hooks::after_read(&src.path);
         if n == 0 {
@@ -882,6 +904,35 @@ mod tests {
         .unwrap()
     }
 
+    /// Like `transfer`, for a sender that fails once the stream is open.
+    /// Its reset may reach the receiver before the stream's tag is read,
+    /// so accepting it fails (None), or after, so the receive is cancelled.
+    async fn transfer_cut_short(
+        root: &Path,
+        dest: Dest,
+    ) -> (Result<(), FailReason>, Option<Result<PathBuf, FailReason>>) {
+        let (_l, sa, sb) = session_pair().await;
+        let never = CancellationToken::new();
+        let p = pacer();
+        timeout(T, async {
+            tokio::join!(send_item(&sa, 7, 0, root, &p, &never), async {
+                match sb.accept_stream().await {
+                    Ok(IncomingStream::Files(f)) => {
+                        Some(receive_item(f, dest, lots(), |_| {}, &never).await)
+                    }
+                    Ok(other) => panic!("expected a files stream, got {other:?}"),
+                    Err(e) => {
+                        let e = format!("{e:#}");
+                        assert!(e.contains("reset by peer"), "{e}");
+                        None
+                    }
+                }
+            })
+        })
+        .await
+        .unwrap()
+    }
+
     fn bytes(n: usize, seed: u8) -> Vec<u8> {
         (0..n)
             .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
@@ -1087,14 +1138,17 @@ mod tests {
                 .unwrap()
                 .push((root.clone(), change));
 
-            let (sent, received) = transfer(&root, Dest::InDir(dest.path().into()), lots()).await;
+            let (sent, received) = transfer_cut_short(&root, Dest::InDir(dest.path().into())).await;
             assert_eq!(
                 sent,
                 Err(FailReason::Changed {
                     name: "growing.log".into()
                 })
             );
-            assert_eq!(received, Err(FailReason::Cancelled));
+            assert!(
+                matches!(received, None | Some(Err(FailReason::Cancelled))),
+                "{received:?}"
+            );
             assert!(names(dest.path()).is_empty(), "{:?}", names(dest.path()));
         }
     }
@@ -1127,15 +1181,24 @@ mod tests {
             }
         }
 
-        let (sent, received) = transfer(&root, Dest::InDir(dest.path().into()), lots()).await;
-        assert_eq!(
-            sent,
-            Err(FailReason::Unreadable {
-                name: "locked.txt".into()
-            })
+        let unreadable = Err(FailReason::Unreadable {
+            name: "locked.txt".into(),
+        });
+        let (sent, received) = transfer_cut_short(&root, Dest::InDir(dest.path().into())).await;
+        assert_eq!(sent, unreadable);
+        assert!(
+            matches!(received, None | Some(Err(FailReason::Cancelled))),
+            "{received:?}"
         );
-        assert_eq!(received, Err(FailReason::Cancelled));
         assert!(names(dest.path()).is_empty(), "{:?}", names(dest.path()));
+
+        // Dragged on its own, it fails before any stream is opened.
+        let (_l, sa, sb) = session_pair().await;
+        let never = CancellationToken::new();
+        let sent = send_item(&sa, 7, 1, &locked, &pacer(), &never).await;
+        assert_eq!(sent, unreadable);
+        let stream = timeout(Duration::from_millis(300), sb.accept_stream()).await;
+        assert!(stream.is_err(), "a stream arrived: {stream:?}");
     }
 
     #[tokio::test]
