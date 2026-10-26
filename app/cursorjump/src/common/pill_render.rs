@@ -147,7 +147,8 @@ pub fn pill_px(scale: f32) -> (u32, u32) {
     )
 }
 
-fn pixmap_px(scale: f32) -> (u32, u32) {
+/// The pixmap's size: the body plus `SHADOW_PAD` on each side, in pixmap px.
+pub fn pixmap_px(scale: f32) -> (u32, u32) {
     let (w, h) = pill_px(scale);
     let pad = 2 * Layout::new(scale).origin as u32;
     (w + pad, h + pad)

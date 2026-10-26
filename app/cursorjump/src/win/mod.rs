@@ -7,6 +7,14 @@ pub mod cursor;
 pub mod input_thread;
 mod link;
 pub mod monitors;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the app shows drags from the Mac through it in a later task"
+    )
+)]
+mod pill;
 pub mod probe;
 mod settings_window;
 
