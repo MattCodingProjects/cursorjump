@@ -25,6 +25,9 @@
 //! - Each crossing of a drag has its own token: news from an earlier
 //!   crossing of the same drag (it went home and came back) never touches
 //!   the ride of a later one.
+//! - What the source emits on this thread while it handles a message waits
+//!   until the thread has reported (`DragPort::hold`): the `SendLeave` of a
+//!   drag going home reaches the app before that drag's `Ended`.
 //!
 //! A Mac drag going to the PC is caught at the entry edge
 //! (`dnd::catcher`, Task 16):
@@ -127,6 +130,11 @@ pub trait DragPort {
     /// Whether the session of `drag`'s `crossing` is live: started and not
     /// ended, so that Esc reaches it.
     fn session_live(&mut self, drag: DragId, crossing: Crossing) -> bool;
+    /// The thread is about to handle a message: what the source emits on
+    /// it meanwhile waits for `release`, which comes once the thread has
+    /// reported its own events (a `SendLeave` before an `Ended`).
+    fn hold(&mut self) {}
+    fn release(&mut self) {}
 }
 
 /// For a Mac without a drag source: no PC drag starts here.
@@ -794,9 +802,11 @@ where
                         Some(at) => match rx.recv_deadline(at) {
                             Ok(msg) => msg,
                             Err(RecvTimeoutError::Timeout) => {
+                                router.drags.hold();
                                 for ev in router.tick(Instant::now()) {
                                     report(ev);
                                 }
+                                router.drags.release();
                                 continue;
                             }
                             Err(RecvTimeoutError::Disconnected) => break,
@@ -807,9 +817,11 @@ where
                         },
                     };
                     let quit = msg == InjectMsg::Quit;
+                    router.drags.hold();
                     for ev in router.handle(msg) {
                         report(ev);
                     }
+                    router.drags.release();
                     if quit {
                         break;
                     }
@@ -821,6 +833,10 @@ where
                 error!("injection thread panicked; releasing everything");
                 if catch_unwind(AssertUnwindSafe(|| router.let_go_after_panic())).is_err() {
                     error!("releasing after the panic failed too");
+                }
+                // What the source emitted before or during the panic.
+                if catch_unwind(AssertUnwindSafe(|| router.drags.release())).is_err() {
+                    error!("sending the drag source's held events failed");
                 }
             }
             report(InjectEv::Stopped);

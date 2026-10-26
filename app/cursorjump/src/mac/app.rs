@@ -209,15 +209,8 @@ pub fn run_mac() -> Result<()> {
     std::thread::Builder::new()
         .name("cj-link".into())
         .spawn(move || {
-            let app = App::new(
-                cfg,
-                config_file,
-                listener,
-                advertiser,
-                channels,
-                (drags, drag_events),
-            );
-            runtime.block_on(app.run(events_rx));
+            let app = App::new(cfg, config_file, listener, advertiser, channels, drags);
+            runtime.block_on(app.run(events_rx, drag_events));
             // Dropping the app drops the tray's model sender, which ends the process.
         })
         .context("starting the link thread")?;
@@ -457,8 +450,6 @@ struct App {
     /// open this app bundle again on the way out.
     reopen: Option<PathBuf>,
     drags: Drags,
-    /// The links' events; taken by `run`.
-    drag_events: Option<UnboundedReceiver<DndEv>>,
 }
 
 impl App {
@@ -468,7 +459,7 @@ impl App {
         listener: Listener,
         advertiser: Option<Advertiser>,
         ch: Channels,
-        (drags, drag_events): (Drags, UnboundedReceiver<DndEv>),
+        drags: Drags,
     ) -> App {
         let latency = LatencyStats::new();
         let awdl = AwdlKeeper::spawn()
@@ -497,11 +488,15 @@ impl App {
             restart: false,
             reopen: None,
             drags,
-            drag_events: Some(drag_events),
         }
     }
 
-    async fn run(mut self, mut events: UnboundedReceiver<Ev>) {
+    /// `drag_events`: the drag links' events (`Drags::new`).
+    async fn run(
+        mut self,
+        mut events: UnboundedReceiver<Ev>,
+        mut drag_events: UnboundedReceiver<DndEv>,
+    ) {
         self.spawn_acceptor();
         let mut ping = interval(PING_EVERY);
         ping.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -515,9 +510,6 @@ impl App {
             .ok();
         let mut sweep = interval_at(Instant::now() + SWEEP_EVERY, SWEEP_EVERY);
         sweep.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        let Some(mut drag_events) = self.drag_events.take() else {
-            return;
-        };
         self.sweep_temp_dirs(true);
         self.publish();
         loop {

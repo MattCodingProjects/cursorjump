@@ -671,3 +671,108 @@ fn without_accessibility_a_drag_bounces_home_without_a_session() {
         ]
     );
 }
+
+/// A drag source whose `cancel` emits like the real one when no session
+/// began: into the same log the thread reports to, unless held.
+struct OrderDrags {
+    log: Arc<Mutex<Vec<String>>>,
+    held: Option<Vec<String>>,
+}
+
+impl OrderDrags {
+    fn emit(&mut self, line: String) {
+        match self.held.as_mut() {
+            Some(q) => q.push(line),
+            None => self.log.lock().unwrap().push(line),
+        }
+    }
+}
+
+impl DragPort for OrderDrags {
+    fn prepare(&mut self, drag: DragId, _: Vec<DragItem>, _: (f64, f64)) -> Option<Crossing> {
+        self.emit(format!("Ended({drag})"));
+        None
+    }
+    fn released(&mut self, _: DragId, _: (f64, f64)) {}
+    fn may_release(&mut self, _: DragId, _: (f64, f64)) -> bool {
+        true
+    }
+    fn cancel(&mut self, drag: DragId) -> bool {
+        self.emit(format!("Ended({drag})"));
+        false
+    }
+    fn session_live(&mut self, _: DragId, _: Crossing) -> bool {
+        false
+    }
+    fn hold(&mut self) {
+        self.held.get_or_insert_with(Vec::new);
+    }
+    fn release(&mut self) {
+        for line in self.held.take().unwrap_or_default() {
+            self.log.lock().unwrap().push(line);
+        }
+    }
+}
+
+#[test]
+fn the_leave_is_reported_before_the_drag_source_says_it_ended() {
+    // The app turns an undropped end into `DragFinished(NotDropped)`: it
+    // must reach the PC after the `Leave` taking the drag home, or the PC
+    // takes it for over before it is home.
+    let (mut fake, _calls) = Fake::new();
+    fake.push_out = Some(0.3);
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let drags = OrderDrags {
+        log: log.clone(),
+        held: None,
+    };
+    let mut router = Router::new(fake, drags, granted());
+    // Riding without a session yet: the machine has the drag.
+    router.handle(InjectMsg::Begin { sid: 1 });
+    router.machine.on(MacEvent::Enter {
+        edge: Side::Left,
+        frac: 0.5,
+        drag: Some(7),
+    });
+    let reported = log.clone();
+    let tx = spawn_router(router, move |ev| {
+        reported.lock().unwrap().push(format!("{ev:?}"));
+    })
+    .unwrap();
+    // Goes home.
+    tx.send(input(1, Input::Motion { dx: -9, dy: 0 })).unwrap();
+    // A crossing whose prepare fails, then goes home at once.
+    tx.send(input(
+        1,
+        Input::DragOffer {
+            drag: 8,
+            items: items(1),
+        },
+    ))
+    .unwrap();
+    tx.send(input(1, enter_with(8))).unwrap();
+    tx.send(InjectMsg::Quit).unwrap();
+    let t0 = std::time::Instant::now();
+    while !log.lock().unwrap().iter().any(|l| l == "Stopped") {
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            log.lock().unwrap()
+        );
+        std::thread::yield_now();
+    }
+    let log = log.lock().unwrap().clone();
+    let at = |line: &str| {
+        log.iter()
+            .position(|l| l.starts_with(line))
+            .unwrap_or_else(|| panic!("{line} not in {log:?}"))
+    };
+    assert!(
+        at("SendLeave { sid: 1, frac: 0.3, drag: Some(7) }") < at("Ended(7)"),
+        "{log:?}"
+    );
+    assert!(
+        at("Controlled { sid: 1, on: true }") < at("Ended(8)"),
+        "{log:?}"
+    );
+}

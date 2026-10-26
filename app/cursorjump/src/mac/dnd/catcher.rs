@@ -26,10 +26,11 @@
 //!   before [`CatchPort::end_late_wait`] is caught (`LateDrop`).
 //! - `performDragOperation:` takes only those two drops; any other drop on
 //!   the strip is refused (NO), so the drag ends without dropping. A taken
-//!   drop receives its promises into
-//!   `~/Library/Caches/CursorJump/outgoing/<drag>/<item>/` on the
-//!   catcher's own queue; each read resolves its item's source, renamed to
-//!   the offered name if it came under another (R52).
+//!   drop receives each promise into its own folder,
+//!   `~/Library/Caches/CursorJump/outgoing/<drag>/.recv-<n>/`, on the
+//!   catcher's own queue; each file read is moved to its item's own folder
+//!   `outgoing/<drag>/<item>/` under its offered name (R52), and resolves
+//!   its item's source.
 //!
 //! The decisions live in [`Shared`], behind one lock, so cj-inject and the
 //! main thread see one order of events; AppKit is in `appkit`, on the main
@@ -386,8 +387,19 @@ impl Reading {
                 "promised file received"
             );
             let dir = item_dir(&self.root, self.drag, p.item);
-            let served = serve_as(&path, &dir, &p.name);
-            p.resolve(Ok(served));
+            match place(&path, &dir, &p.name) {
+                Ok(placed) => p.resolve(Ok(placed)),
+                Err(e) => {
+                    warn!(
+                        drag = self.drag,
+                        item = p.item,
+                        ?path,
+                        "putting a promised file under its offered name failed: {e}"
+                    );
+                    let name = p.name.clone();
+                    p.resolve(Err(FailReason::Unreadable { name }));
+                }
+            }
         } else {
             let name = if p.name.is_empty() {
                 path.file_name()
@@ -407,45 +419,28 @@ impl Reading {
     }
 }
 
-/// `<root>/<drag>/<item>/`: where an item's promised or copied file goes.
+/// `<root>/<drag>/<item>/`: where an item's promised or copied file is
+/// served from, alone, under its offered name.
 fn item_dir(root: &Path, drag: DragId, item: usize) -> PathBuf {
     root.join(drag.to_string()).join(item.to_string())
 }
 
-/// The path to serve a promised file `received` from, so that the PC gets
-/// it under its offered name `offered` (R52): the PC made its placeholder
-/// from that name, and the transfer names the file after the path it
-/// reads. When the two differ (as the PC would sanitize them), it is
-/// moved into its item's own folder `dir` under the offered name. If that
-/// can't be done (that name is taken there, or the move fails), it is
-/// served as received.
-fn serve_as(received: &Path, dir: &Path, offered: &str) -> PathBuf {
-    let Some(got) = received.file_name() else {
-        return received.to_path_buf();
-    };
-    let want = sanitize_component(offered);
-    if offered.is_empty() || sanitize_component(&got.to_string_lossy()) == want {
-        return received.to_path_buf();
-    }
-    let to = dir.join(&want);
+/// Puts a promised file, received as `received` into its promise's own
+/// folder, into its item's own empty folder `dir` under its offered name
+/// `offered` (R52): the PC made its placeholder from that name, and the
+/// transfer names the file after the path it reads, so the two never
+/// differ. Never overwrites. Returns where it is now.
+fn place(received: &Path, dir: &Path, offered: &str) -> io::Result<PathBuf> {
+    let to = dir.join(sanitize_component(offered));
+    std::fs::create_dir_all(dir)?;
     if std::fs::symlink_metadata(&to).is_ok() {
-        warn!(
-            ?received,
-            ?to,
-            "the offered name is taken; served as received"
-        );
-        return received.to_path_buf();
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("{} exists", to.display()),
+        ));
     }
-    match std::fs::create_dir_all(dir).and_then(|()| std::fs::rename(received, &to)) {
-        Ok(()) => {
-            info!(?received, ?to, "promised file renamed to its offered name");
-            to
-        }
-        Err(e) => {
-            warn!(?received, ?to, "renaming to the offered name failed: {e}");
-            received.to_path_buf()
-        }
-    }
+    std::fs::rename(received, &to)?;
+    Ok(to)
 }
 
 /// Copies a dragged file or folder out of another app's container tmp
@@ -459,6 +454,50 @@ fn copy_scratch(from: &Path, dir: &Path) -> io::Result<PathBuf> {
     let to = dir.join(name);
     copy_item(from, &to)?;
     Ok(to)
+}
+
+/// A file's APFS clone into `dir`, made at once (`clonefile` is a
+/// metadata operation); None when it can't be (a folder, another volume,
+/// the name taken): `copy_scratch` does it then, off the main thread.
+fn clone_now(from: &Path, dir: &Path) -> Option<PathBuf> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    if !std::fs::symlink_metadata(from).ok()?.is_file() {
+        return None;
+    }
+    let to = dir.join(from.file_name()?);
+    std::fs::create_dir_all(dir).ok()?;
+    let (src, dst) = (
+        CString::new(from.as_os_str().as_bytes()).ok()?,
+        CString::new(to.as_os_str().as_bytes()).ok()?,
+    );
+    // SAFETY: two valid NUL-terminated paths; no flags. It never
+    // overwrites: an existing `to` is an error.
+    let ok = unsafe { libc::clonefile(src.as_ptr(), dst.as_ptr(), 0) } == 0;
+    ok.then_some(to)
+}
+
+/// At the drop, on the main thread: clones each of `drag`'s files that
+/// sit in another app's container tmp, resolving its source with the
+/// clone, before the app can delete it (R53). Returns what must be copied
+/// on a thread instead (folders, or a clone that failed).
+fn clone_scratch_now(root: &Path, drag: DragId, scratch: Vec<Scratch>) -> Vec<Scratch> {
+    let mut rest = Vec::new();
+    for s in scratch {
+        match clone_now(&s.from, &item_dir(root, drag, s.to.item)) {
+            Some(clone) => {
+                info!(
+                    drag,
+                    item = s.to.item,
+                    ?clone,
+                    "cloned out of its app's tmp folder"
+                );
+                s.to.resolve(Ok(clone));
+            }
+            None => rest.push(s),
+        }
+    }
+    rest
 }
 
 /// Copies each of `drag`'s files that sit in another app's container tmp,
@@ -718,9 +757,12 @@ impl Shared {
         caught
     }
 
-    /// Where promise receiver files of `drag`'s item `item` go.
-    fn promise_dir(&self, drag: DragId, item: usize) -> PathBuf {
-        item_dir(&self.root, drag, item)
+    /// Where promise receiver `receiver` of `drag` receives its files,
+    /// before each goes to its item's folder.
+    fn receive_dir(&self, drag: DragId, receiver: usize) -> PathBuf {
+        self.root
+            .join(drag.to_string())
+            .join(format!(".recv-{receiver}"))
     }
 }
 
@@ -903,16 +945,22 @@ mod tests {
 
     #[test]
     fn a_promise_read_resolves_its_files_in_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, recv) = (tmp.path(), tmp.path().join("5").join(".recv-0"));
+        std::fs::create_dir_all(&recv).unwrap();
+        std::fs::write(recv.join("a.pdf"), b"a").unwrap();
         let b = build_offer(vec![promise(0, Some(&["a.pdf", ""]))]);
         let (a, unnamed) = (
             pending(&b.sources[0]).clone(),
             pending(&b.sources[1]).clone(),
         );
         let [p] = <[Promise; 1]>::try_from(b.promises).ok().unwrap();
-        let reading = Reading::new(5, "/out".into(), p.files);
-        reading.read("/out/5/0/a.pdf".into(), true);
-        assert_eq!(*a.borrow(), Some(Ok("/out/5/0/a.pdf".into())));
-        reading.read("/out/5/0/b.pdf".into(), false);
+        let reading = Reading::new(5, root.into(), p.files);
+        reading.read(recv.join("a.pdf"), true);
+        let a_pdf = root.join("5").join("0").join("a.pdf");
+        assert_eq!(*a.borrow(), Some(Ok(a_pdf.clone())));
+        assert_eq!(std::fs::read(a_pdf).unwrap(), b"a");
+        reading.read(recv.join("b.pdf"), false);
         assert_eq!(
             *unnamed.borrow(),
             Some(Err(FailReason::Unreadable {
@@ -920,7 +968,7 @@ mod tests {
             })),
             "named after the file it would have been"
         );
-        reading.read("/out/5/0/c.pdf".into(), true); // One too many: ignored.
+        reading.read(recv.join("c.pdf"), true); // One too many: ignored.
     }
 
     #[test]
@@ -1185,6 +1233,19 @@ mod tests {
     }
 
     #[test]
+    fn a_file_is_cloned_at_once_and_never_over_another() {
+        let tmp = tempfile::tempdir().unwrap();
+        let from = tmp.path().join("IMG.jpg");
+        std::fs::write(&from, b"jpeg").unwrap();
+        let dir = tmp.path().join("out").join("0");
+        assert_eq!(clone_now(&from, &dir), Some(dir.join("IMG.jpg")));
+        assert_eq!(std::fs::read(dir.join("IMG.jpg")).unwrap(), b"jpeg");
+        assert_eq!(clone_now(&from, &dir), None, "the name is taken");
+        assert_eq!(clone_now(tmp.path(), &dir), None, "a folder");
+        assert_eq!(clone_now(&tmp.path().join("gone"), &dir), None);
+    }
+
+    #[test]
     fn scratch_files_are_copied_into_their_item_folder() {
         let tmp = tempfile::tempdir().unwrap();
         let app_tmp = tmp.path().join("app");
@@ -1202,10 +1263,15 @@ mod tests {
         }
         let b = build_offer(vec![d, album, gone]);
         let rxs: Vec<_> = b.sources.iter().map(|s| pending(s).clone()).collect();
-        copy_all_scratch(&root, 9, b.scratch);
+        // At the drop: the file is cloned there and then.
+        let rest = clone_scratch_now(&root, 9, b.scratch);
         let copy = root.join("9").join("0").join("IMG.jpg");
         assert_eq!(*rxs[0].borrow(), Some(Ok(copy.clone())));
         assert_eq!(std::fs::read(&copy).unwrap(), b"jpeg");
+        assert_eq!(rest.len(), 2, "the folder and the missing file are left");
+        assert!(rxs[1].borrow().is_none() && rxs[2].borrow().is_none());
+        // Then on the thread.
+        copy_all_scratch(&root, 9, rest);
         let tree = root.join("9").join("1").join("Album");
         assert_eq!(*rxs[1].borrow(), Some(Ok(tree.clone())));
         assert_eq!(std::fs::read(tree.join("a.jpg")).unwrap(), b"a");
@@ -1221,12 +1287,14 @@ mod tests {
     }
 
     #[test]
-    fn a_promised_file_is_served_under_its_offered_name() {
+    fn each_promised_file_is_served_alone_under_its_offered_name() {
+        // One promise, four files, received into its own folder under
+        // whatever names the source chose.
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
-        let dir0 = item_dir(&root, 5, 0);
-        std::fs::create_dir_all(&dir0).unwrap();
-        let mut d = promise(0, Some(&["", "b.pdf", "c?.pdf", "d.pdf"]));
+        let recv = root.join("5").join(".recv-0");
+        std::fs::create_dir_all(&recv).unwrap();
+        let mut d = promise(0, Some(&["", "b.pdf", "c?.pdf", "b.pdf"]));
         if let Dragged::Promise { fallback, .. } = &mut d {
             *fallback = "image.jpeg".into();
         }
@@ -1235,48 +1303,64 @@ mod tests {
         let [p] = <[Promise; 1]>::try_from(b.promises).ok().unwrap();
         let reading = Reading::new(5, root.clone(), p.files);
         let got = |name: &str| {
-            let path = dir0.join(name);
+            let path = recv.join(name);
             std::fs::write(&path, name).unwrap();
             path
         };
-        // Chrome's image, nameless before the drop: renamed in its folder.
+        // Chrome's image, nameless before the drop.
         reading.read(got("images.jpg"), true);
-        let image = dir0.join("image.jpeg");
-        assert_eq!(*rxs[0].borrow(), Some(Ok(image.clone())));
-        assert_eq!(std::fs::read(&image).unwrap(), b"images.jpg");
-        assert!(!dir0.join("images.jpg").exists());
-        // Received as named: served where it is.
         reading.read(got("b.pdf"), true);
-        assert_eq!(*rxs[1].borrow(), Some(Ok(dir0.join("b.pdf"))));
-        // The same name once made safe: nothing to do.
         reading.read(got("c_.pdf"), true);
-        assert_eq!(*rxs[2].borrow(), Some(Ok(dir0.join("c_.pdf"))));
-        // Another name: moved into its own item's folder.
-        reading.read(got("d 2.pdf"), true);
-        let d = item_dir(&root, 5, 3).join("d.pdf");
-        assert_eq!(*rxs[3].borrow(), Some(Ok(d.clone())));
-        assert!(d.exists());
+        // A second "b.pdf", which the source had to name another way.
+        reading.read(got("b 2.pdf"), true);
+        let served = |item: usize, name: &str| item_dir(&root, 5, item).join(name);
+        let want = [
+            (served(0, "image.jpeg"), "images.jpg"),
+            (served(1, "b.pdf"), "b.pdf"),
+            (served(2, "c_.pdf"), "c_.pdf"),
+            (served(3, "b.pdf"), "b 2.pdf"),
+        ];
+        for (rx, (path, bytes)) in rxs.iter().zip(want) {
+            assert_eq!(*rx.borrow(), Some(Ok(path.clone())));
+            assert_eq!(std::fs::read(&path).unwrap(), bytes.as_bytes());
+        }
+        assert!(
+            std::fs::read_dir(&recv).unwrap().next().is_none(),
+            "every file moved out"
+        );
     }
 
     #[test]
-    fn a_taken_offered_name_serves_the_file_as_received() {
+    fn a_promised_file_that_cant_take_its_name_fails() {
         let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("0");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("image.jpeg"), b"other").unwrap();
-        std::fs::write(dir.join("x.jpg"), b"x").unwrap();
+        let root = tmp.path().to_path_buf();
+        let recv = root.join("5").join(".recv-0");
+        std::fs::create_dir_all(&recv).unwrap();
+        std::fs::create_dir_all(item_dir(&root, 5, 0)).unwrap();
+        std::fs::write(item_dir(&root, 5, 0).join("a.pdf"), b"other").unwrap();
+        std::fs::write(recv.join("x.pdf"), b"x").unwrap();
+        let b = build_offer(vec![promise(0, Some(&["a.pdf"]))]);
+        let rx = pending(&b.sources[0]).clone();
+        let [p] = <[Promise; 1]>::try_from(b.promises).ok().unwrap();
+        Reading::new(5, root.clone(), p.files).read(recv.join("x.pdf"), true);
         assert_eq!(
-            serve_as(&dir.join("x.jpg"), &dir, "image.jpeg"),
-            dir.join("x.jpg"),
+            *rx.borrow(),
+            Some(Err(FailReason::Unreadable {
+                name: "a.pdf".into()
+            })),
+            "never served under another name"
+        );
+        assert_eq!(
+            std::fs::read(item_dir(&root, 5, 0).join("a.pdf")).unwrap(),
+            b"other",
             "never overwrites"
         );
-        assert_eq!(std::fs::read(dir.join("image.jpeg")).unwrap(), b"other");
-        assert_eq!(serve_as(&dir.join("x.jpg"), &dir, ""), dir.join("x.jpg"));
     }
 
     #[test]
-    fn promises_go_to_a_folder_per_item() {
+    fn promises_are_received_apart_and_served_per_item() {
         let (s, _) = shared();
-        assert_eq!(s.promise_dir(42, 3), Path::new("/out/42/3"));
+        assert_eq!(s.receive_dir(42, 3), Path::new("/out/42/.recv-3"));
+        assert_eq!(item_dir(&s.root, 42, 3), Path::new("/out/42/3"));
     }
 }

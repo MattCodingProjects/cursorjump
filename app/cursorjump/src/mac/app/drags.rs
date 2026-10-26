@@ -187,6 +187,102 @@ fn leave_needs_offer(
     drag.is_some() && drag == local_offer && drag != incoming
 }
 
+/// What a push-out's `Leave` needs.
+#[derive(Debug, PartialEq)]
+enum LeaveStep {
+    /// Offer the catcher's drag, then the `Leave` with it if that worked
+    /// (`leave_after_offer`).
+    OfferThenLeave(DragId),
+    /// The `Leave`, carrying this: the PC's drag going home, or nothing.
+    Leave(Option<DragId>),
+}
+
+fn leave_step(
+    drag: Option<DragId>,
+    local_offer: Option<DragId>,
+    incoming: Option<DragId>,
+) -> LeaveStep {
+    match drag {
+        Some(d) if leave_needs_offer(drag, local_offer, incoming) => LeaveStep::OfferThenLeave(d),
+        _ => LeaveStep::Leave(drag),
+    }
+}
+
+/// The drag the `Leave` carries once its offer was `sent` or not: a drag
+/// the PC wasn't offered must not ride along.
+fn leave_after_offer(drag: DragId, sent: bool) -> Option<DragId> {
+    sent.then_some(drag)
+}
+
+/// How to end a drag from the PC once its outcome is known.
+#[derive(Debug, PartialEq)]
+enum FinishStep {
+    /// `finish` on the link; its `Finished` closes it here.
+    OnLink,
+    /// The link no longer has it (gone, or a new session): close it here.
+    CloseHere,
+}
+
+fn finish_step(link_knows: bool) -> FinishStep {
+    if link_knows {
+        FinishStep::OnLink
+    } else {
+        FinishStep::CloseHere
+    }
+}
+
+/// A call on the link, for a drag.
+#[derive(Debug, Clone, PartialEq)]
+enum LinkCall {
+    Cancel(FailReason),
+    Finish(DragOutcome),
+}
+
+/// What a pill's ✕ does on the link. Before the drop, cj-inject's cancel
+/// ends the session undropped and that end finishes it; after the drop
+/// the session is over, so the copy is cancelled on the link.
+fn pill_cancel_calls(ended: Option<bool>) -> Vec<LinkCall> {
+    match ended {
+        Some(true) => vec![LinkCall::Cancel(FailReason::Cancelled)],
+        _ => Vec::new(),
+    }
+}
+
+/// What going to sleep does to one drag.
+#[derive(Debug, PartialEq)]
+enum SleepStep {
+    /// A drag from the PC: cj-inject cancels it, its pill fails with
+    /// `Sleep`, and the link cancels it (telling the PC why), then
+    /// finishes it.
+    EndIncoming(DragId),
+    /// A drag from the Mac: the link cancels it, telling the PC why.
+    CancelOutgoing(DragId),
+}
+
+impl SleepStep {
+    fn link_calls(&self) -> Vec<LinkCall> {
+        let slept = FailReason::Sleep;
+        match self {
+            SleepStep::EndIncoming(_) => vec![
+                LinkCall::Cancel(slept.clone()),
+                LinkCall::Finish(DragOutcome::Failed(slept)),
+            ],
+            SleepStep::CancelOutgoing(_) => vec![LinkCall::Cancel(slept)],
+        }
+    }
+}
+
+/// Every drag going to sleep ends, but one from the PC already finishing:
+/// its link's `Finished` closes it.
+fn sleep_steps(incoming: &BTreeMap<DragId, InDrag>, outgoing: &BTreeSet<DragId>) -> Vec<SleepStep> {
+    let ends = incoming
+        .iter()
+        .filter(|(_, inc)| !inc.finishing)
+        .map(|(&drag, _)| SleepStep::EndIncoming(drag));
+    let cancels = outgoing.iter().map(|&drag| SleepStep::CancelOutgoing(drag));
+    ends.chain(cancels).collect()
+}
+
 /// The pill's result for a drag from the PC that ended with `outcome`;
 /// `why` says why one that wasn't dropped ended (an item failed, or a
 /// cancel), if known.
@@ -329,6 +425,9 @@ impl InDrag {
         if !dropped {
             return Some(DragOutcome::NotDropped);
         }
+        // Every item is fetched at the crossing (R47); items handed over
+        // from an earlier crossing of the same id were fetched then, into
+        // this same `InDrag`, and are never fetched again.
         let short = self.fetched.len() < self.items.len();
         if short && self.cancelled.is_none() {
             return None;
@@ -542,18 +641,34 @@ impl App {
         };
         inc.finishing = true;
         info!(drag, ?outcome, "dnd: the drag from the PC is over");
-        let link = self.drags.link.as_mut().filter(|l| l.items(drag).is_some());
-        match link {
-            // Its `Finished` closes it here.
-            Some(link) => {
-                if let Err(e) = link.finish(drag, outcome).await {
-                    debug!(drag, "dnd: finish not sent: {e:#}");
-                }
-            }
-            None => {
+        let knows = self
+            .drags
+            .link
+            .as_ref()
+            .is_some_and(|l| l.items(drag).is_some());
+        match finish_step(knows) {
+            FinishStep::OnLink => self.on_link(drag, vec![LinkCall::Finish(outcome)]).await,
+            FinishStep::CloseHere => {
                 if let Some(inc) = self.drags.incoming.remove(&drag) {
                     self.drags.close_incoming(drag, inc, &outcome);
                 }
+            }
+        }
+    }
+
+    /// Makes `calls` for `drag` on the link, in order, until one fails.
+    async fn on_link(&mut self, drag: DragId, calls: Vec<LinkCall>) {
+        let Some(link) = self.drags.link.as_mut() else {
+            return;
+        };
+        for call in calls {
+            let sent = match call.clone() {
+                LinkCall::Cancel(why) => link.cancel(drag, why).await,
+                LinkCall::Finish(outcome) => link.finish(drag, outcome).await,
+            };
+            if let Err(e) = sent {
+                debug!(drag, ?call, "dnd: not sent: {e:#}");
+                return;
             }
         }
     }
@@ -618,25 +733,24 @@ impl App {
     pub(super) async fn leave_drag(&mut self, drag: Option<DragId>) -> Option<DragId> {
         let local = self.drags.offer.as_ref().map(|o| o.drag);
         let incoming = drag.filter(|d| self.drags.incoming.contains_key(d));
-        if !leave_needs_offer(drag, local, incoming) {
-            return drag;
-        }
+        let d = match leave_step(drag, local, incoming) {
+            LeaveStep::Leave(carried) => return carried,
+            LeaveStep::OfferThenLeave(d) => d,
+        };
         let o = self.drags.offer.take()?;
         let link = self.drags.link.as_mut()?;
-        match link.offer(o.drag, o.items, o.sources).await {
+        let sent = match link.offer(o.drag, o.items, o.sources).await {
             Ok(()) => {
-                info!(drag = o.drag, "dnd: the drag from the Mac goes to the PC");
-                self.drags.outgoing.insert(o.drag);
-                Some(o.drag)
+                info!(drag = d, "dnd: the drag from the Mac goes to the PC");
+                self.drags.outgoing.insert(d);
+                true
             }
             Err(e) => {
-                warn!(
-                    drag = o.drag,
-                    "dnd: offer not sent; leaving without it: {e:#}"
-                );
-                None
+                warn!(drag = d, "dnd: offer not sent; leaving without it: {e:#}");
+                false
             }
-        }
+        };
+        leave_after_offer(d, sent)
     }
 
     // ------------------------------------------------------------- pills
@@ -649,14 +763,9 @@ impl App {
         };
         info!(drag, "dnd: cancelled from its pill");
         inc.cancel(FailReason::Cancelled);
-        let dropped = inc.ended == Some(true);
+        let calls = pill_cancel_calls(inc.ended);
         self.drags.inject(InjectMsg::CancelDrag { drag });
-        if dropped
-            && let Some(link) = self.drags.link.as_mut()
-            && let Err(e) = link.cancel(drag, FailReason::Cancelled).await
-        {
-            debug!(drag, "dnd: cancel not sent: {e:#}");
-        }
+        self.on_link(drag, calls).await;
         self.try_finish(drag).await;
     }
 
@@ -666,39 +775,31 @@ impl App {
     /// while the session is still up; each drag from the PC fails its pill
     /// with `Sleep`.
     pub(super) async fn on_will_sleep(&mut self) {
-        let incoming: Vec<DragId> = self.drags.incoming.keys().copied().collect();
-        let outgoing: Vec<DragId> = self.drags.outgoing.iter().copied().collect();
-        if incoming.is_empty() && outgoing.is_empty() {
+        // The catcher's drag can't be carried any more.
+        self.drags.offer = None;
+        let steps = sleep_steps(&self.drags.incoming, &self.drags.outgoing);
+        if steps.is_empty() {
             return;
         }
         info!(
-            incoming = incoming.len(),
-            outgoing = outgoing.len(),
+            drags = steps.len(),
             "dnd: the Mac is going to sleep; its drags end"
         );
         let slept = DragOutcome::Failed(FailReason::Sleep);
-        for drag in incoming {
-            self.drags.inject(InjectMsg::CancelDrag { drag });
-            if let Some(mut inc) = self.drags.incoming.remove(&drag) {
-                inc.cancel(FailReason::Sleep);
-                self.drags.close_incoming(drag, inc, &slept);
-            }
-            if let Some(link) = self.drags.link.as_mut() {
-                let sent = match link.cancel(drag, FailReason::Sleep).await {
-                    Ok(()) => link.finish(drag, slept.clone()).await,
-                    Err(e) => Err(e),
-                };
-                if let Err(e) = sent {
-                    debug!(drag, "dnd: sleep's cancel not sent: {e:#}");
+        for step in steps {
+            let calls = step.link_calls();
+            let drag = match step {
+                SleepStep::EndIncoming(drag) => {
+                    self.drags.inject(InjectMsg::CancelDrag { drag });
+                    if let Some(mut inc) = self.drags.incoming.remove(&drag) {
+                        inc.cancel(FailReason::Sleep);
+                        self.drags.close_incoming(drag, inc, &slept);
+                    }
+                    drag
                 }
-            }
-        }
-        for drag in outgoing {
-            if let Some(link) = self.drags.link.as_mut()
-                && let Err(e) = link.cancel(drag, FailReason::Sleep).await
-            {
-                debug!(drag, "dnd: sleep's cancel not sent: {e:#}");
-            }
+                SleepStep::CancelOutgoing(drag) => drag,
+            };
+            self.on_link(drag, calls).await;
         }
     }
 
@@ -765,6 +866,67 @@ mod tests {
         assert!(!leave_needs_offer(Some(7), Some(9), Some(7)));
         // The PC's own drag is never offered back to it.
         assert!(!leave_needs_offer(Some(7), Some(7), Some(7)));
+    }
+
+    #[test]
+    fn a_leave_offers_the_catchers_drag_first_or_carries_it_not() {
+        assert_eq!(
+            leave_step(Some(9), Some(9), None),
+            LeaveStep::OfferThenLeave(9)
+        );
+        assert_eq!(
+            leave_step(Some(7), Some(9), Some(7)),
+            LeaveStep::Leave(Some(7)),
+            "the PC's drag goes home"
+        );
+        assert_eq!(leave_step(None, Some(9), None), LeaveStep::Leave(None));
+        assert_eq!(leave_after_offer(9, true), Some(9));
+        assert_eq!(
+            leave_after_offer(9, false),
+            None,
+            "not offered: the PC would refuse it"
+        );
+    }
+
+    #[test]
+    fn a_drag_finishes_on_the_link_that_has_it_or_here() {
+        assert_eq!(finish_step(true), FinishStep::OnLink);
+        assert_eq!(finish_step(false), FinishStep::CloseHere);
+    }
+
+    #[test]
+    fn a_pills_cancel_stops_the_copy_on_the_link_only_after_the_drop() {
+        assert_eq!(
+            pill_cancel_calls(Some(true)),
+            [LinkCall::Cancel(FailReason::Cancelled)]
+        );
+        assert_eq!(pill_cancel_calls(Some(false)), [], "ended already");
+        assert_eq!(pill_cancel_calls(None), [], "its session's end finishes it");
+    }
+
+    #[test]
+    fn sleep_cancels_then_finishes_every_drag_but_one_finishing() {
+        let mut incoming = BTreeMap::new();
+        incoming.insert(1, two());
+        let mut finishing = two();
+        finishing.finishing = true;
+        incoming.insert(2, finishing);
+        let outgoing = BTreeSet::from([3]);
+        let steps = sleep_steps(&incoming, &outgoing);
+        assert_eq!(
+            steps,
+            [SleepStep::EndIncoming(1), SleepStep::CancelOutgoing(3)]
+        );
+        let slept = FailReason::Sleep;
+        assert_eq!(
+            steps[0].link_calls(),
+            [
+                LinkCall::Cancel(slept.clone()),
+                LinkCall::Finish(DragOutcome::Failed(slept.clone()))
+            ]
+        );
+        assert_eq!(steps[1].link_calls(), [LinkCall::Cancel(slept)]);
+        assert!(sleep_steps(&BTreeMap::new(), &BTreeSet::new()).is_empty());
     }
 
     #[test]

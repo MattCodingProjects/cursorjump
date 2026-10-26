@@ -27,8 +27,8 @@ use objc2_uniform_type_identifiers::UTType;
 use tracing::{debug, info, warn};
 
 use super::{
-    Dragged, Facts, Promise, Reading, STRIP_ALPHA, Shared, Taken, TypeKind, copy_all_scratch,
-    fallback_name, in_container_tmp, strip_frame,
+    Dragged, Facts, Promise, Reading, STRIP_ALPHA, Shared, Taken, TypeKind, clone_scratch_now,
+    copy_all_scratch, fallback_name, in_container_tmp, strip_frame,
 };
 use crate::mac::dnd::{flush_core_animation, guarded};
 use crate::mac::inject::Rectf;
@@ -267,8 +267,11 @@ impl StripView {
         else {
             return false;
         };
+        // Files are cloned now, before their app can delete them; folder
+        // trees are copied off the main thread (their sources fail if it
+        // can't start).
+        let scratch = clone_scratch_now(&iv.shared.root, drag, scratch);
         if !scratch.is_empty() {
-            // Off the main thread; their sources fail if it can't start.
             let root = iv.shared.root.clone();
             let spawned = std::thread::Builder::new()
                 .name("cj-catcher-copy".into())
@@ -296,8 +299,7 @@ impl StripView {
     /// resolves the next of its files, on our queue.
     fn receive(&self, drag: DragId, recv: &NSFilePromiseReceiver, p: Promise) {
         let iv = self.ivars();
-        let first = p.files.first().map_or(0, |f| f.item);
-        let dir = iv.shared.promise_dir(drag, first);
+        let dir = iv.shared.receive_dir(drag, p.receiver);
         let reading = Arc::new(Reading::new(drag, iv.shared.root.clone(), p.files));
         if let Err(e) = std::fs::create_dir_all(&dir) {
             // Its files' sources fail as `reading` is dropped.

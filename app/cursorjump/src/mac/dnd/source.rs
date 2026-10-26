@@ -40,6 +40,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
 use cj_core::dnd::{DragId, DragItem, FailReason, ItemKind, sanitize_component};
@@ -719,10 +720,26 @@ struct Inner {
     /// Crossings that ended without a drop, latest last, for a drag that
     /// comes back.
     past: Mutex<Vec<Arc<Drag>>>,
+    /// While cj-inject handles a message (`hold`): its thread, and the
+    /// events it emitted meanwhile, sent at `release`.
+    held: Mutex<Option<(ThreadId, Vec<MacDndEv>)>>,
 }
 
 impl Inner {
     fn emit(&self, ev: MacDndEv) {
+        {
+            let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some((thread, queue)) = held.as_mut()
+                && *thread == std::thread::current().id()
+            {
+                queue.push(ev);
+                return;
+            }
+        }
+        self.send(ev);
+    }
+
+    fn send(&self, ev: MacDndEv) {
         if catch_unwind(AssertUnwindSafe(|| (self.events)(ev))).is_err() {
             warn!("the drag source's events callback panicked");
         }
@@ -835,6 +852,7 @@ impl DragSource {
                 targets,
                 drags: Mutex::new(HashMap::new()),
                 past: Mutex::new(Vec::new()),
+                held: Mutex::new(None),
             }),
         }
     }
@@ -1041,6 +1059,33 @@ impl DragSource {
         })
     }
 
+    /// From now until `release`, events this thread emits wait: cj-inject
+    /// reports what it decided (a `SendLeave`) before the app hears what
+    /// the source did meanwhile (an `Ended` of a drag that never began).
+    pub fn hold(&self) {
+        let mut held = self
+            .inner
+            .held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if held.is_none() {
+            *held = Some((std::thread::current().id(), Vec::new()));
+        }
+    }
+
+    /// Sends the events held since `hold`, in order.
+    pub fn release(&self) {
+        let held = self
+            .inner
+            .held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        for ev in held.map(|(_, q)| q).unwrap_or_default() {
+            self.inner.send(ev);
+        }
+    }
+
     /// Whether every item of `drag` is in place (true once it is over).
     #[cfg(debug_assertions)]
     pub(super) fn all_complete(&self, drag: DragId) -> bool {
@@ -1063,6 +1108,12 @@ impl DragPort for DragSource {
     }
     fn session_live(&mut self, drag: DragId, crossing: Crossing) -> bool {
         DragSource::session_live(self, drag, crossing)
+    }
+    fn hold(&mut self) {
+        DragSource::hold(self);
+    }
+    fn release(&mut self) {
+        DragSource::release(self);
     }
 }
 
@@ -1775,6 +1826,60 @@ mod tests {
         assert!(d.lock().cancelled);
         assert!(!d.try_begin(), "no session can start after it");
         assert!(src.may_release(7, (1.0, 2.0)), "over: the up goes out");
+    }
+
+    /// While cj-inject handles a message, what the source emits on that
+    /// thread waits until it has reported: a drag that goes home before
+    /// its session began, or whose prepare failed, ends after the `Leave`.
+    /// Other threads' events are not held.
+    #[test]
+    fn events_wait_while_cj_inject_reports() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, rx) = source_in(tmp.path());
+        // One item each, never begun.
+        let drag = |id: DragId, crossing: Crossing| {
+            let d = drag_in(&tmp.path().join(id.to_string()), 1);
+            let (slots, staging) = (d.slots.clone(), d.staging.clone());
+            Arc::new(Drag::new(
+                id,
+                crossing,
+                slots,
+                staging,
+                vec![Item::Fetching],
+            ))
+        };
+        src.inner.live().insert(7, drag(7, 1));
+        src.inner.live().insert(8, drag(8, 2));
+        src.hold();
+        // Going home before the session began.
+        assert!(!src.cancel(7), "no session: no Esc");
+        // A crossing whose prepare fails (no main thread in tests).
+        assert_eq!(
+            src.prepare(9, vec![item("a.txt", ItemKind::File)], (5.0, 5.0)),
+            None
+        );
+        assert!(rx.try_recv().is_err(), "held until cj-inject has reported");
+        // Other threads' events (the main thread's) are not held.
+        let other = src.clone();
+        std::thread::spawn(move || other.released(8, (0.0, 0.0)))
+            .join()
+            .unwrap();
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            "Ended { drag: 8, crossing: 2, dropped: false }"
+        );
+        src.release();
+        let evs: Vec<String> = rx.try_iter().collect();
+        assert_eq!(evs.len(), 2, "{evs:?}");
+        assert_eq!(evs[0], "Ended { drag: 7, crossing: 1, dropped: false }");
+        assert!(evs[1].starts_with("Ended { drag: 9, crossing: "), "{evs:?}");
+        // Not held any more.
+        src.inner.live().insert(10, drag(10, 3));
+        src.cancel(10);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            "Ended { drag: 10, crossing: 3, dropped: false }"
+        );
     }
 
     /// A session that began first: the release is a release, and the
