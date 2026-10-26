@@ -315,8 +315,7 @@ impl Incoming {
                     .with_context(|| format!("placeholder {}", s.path.display()))
                 });
             if made.is_err() {
-                // Only what was made here goes.
-                remove_all(&base, &slots[..i]);
+                undo_create(&base, &slots, i);
             }
             made?;
         }
@@ -512,6 +511,18 @@ fn remove_placeholder(slot: &Slot, tries: u32) {
             ),
         }
     }
+}
+
+/// What a `create` made before slot `failed` failed, and only that: the
+/// earlier placeholders and their folders, and a collision folder made for
+/// slot `failed` itself (`remove_dir` takes only an empty one).
+fn undo_create(base: &Path, slots: &[Slot], failed: usize) {
+    if let Some(s) = slots.get(failed)
+        && s.dir != base
+    {
+        let _ = std::fs::remove_dir(&s.dir);
+    }
+    remove_all(base, &slots[..failed]);
 }
 
 /// The placeholders of `slots` and the folders made for them. On cj-dnd-in
@@ -1858,6 +1869,52 @@ mod tests {
              during it: {} (seen at +{app_ms} ms); WM_TIMER ticks during it: {ticks_during}",
             if during { "YES" } else { "NO" },
         );
+    }
+
+    #[test]
+    fn a_failed_placeholder_takes_its_collision_folder_too() {
+        // Slot 1's folder was made, then its placeholder failed: create's
+        // undo leaves nothing of the drag's.
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("23");
+        let items = [item("a.txt", ItemKind::File), item("A.txt", ItemKind::File)];
+        let got = slots(&base, &items);
+        assert_ne!(got[1].dir, base);
+        std::fs::create_dir_all(&got[1].dir).unwrap();
+        File::create(&got[0].path).unwrap();
+        undo_create(&base, &got, 1);
+        assert!(
+            !base.exists(),
+            "{:?}",
+            std::fs::read_dir(&base).map(|d| d.count())
+        );
+    }
+
+    #[test]
+    fn cj_dnd_in_cancels_a_drag_the_relay_missed() {
+        // The relay's cancel came while the drag was still being set up
+        // (nothing registered: it reached nothing); the drag registered;
+        // then cj-dnd-in drains the forwarded CancelIncoming in its
+        // DoDragDrop. That one must reach it.
+        use super::super::DndCmd;
+        use super::super::inbound::InState;
+        let tmp = tempfile::tempdir().unwrap();
+        let live = Live::default();
+        let mut state = InState::new(
+            cj_core::config::Config::default(),
+            Arc::default(),
+            emitter().0,
+            live.clone(),
+        )
+        .unwrap();
+        assert_eq!(cancel_live(&live, Some(24)), 0, "the relay's try");
+        let items = [item("a.txt", ItemKind::File)];
+        let incoming = Incoming::create(24, tmp.path().join("24"), &items, emitter().0).unwrap();
+        register(&live, &incoming);
+        state.on_command(DndCmd::CancelIncoming { drag: 25 });
+        assert!(!incoming.is_cancelled(), "another drag's cancel");
+        state.on_command(DndCmd::CancelIncoming { drag: 24 });
+        assert!(incoming.is_cancelled());
     }
 
     #[test]

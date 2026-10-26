@@ -15,7 +15,10 @@ use cj_core::config::Config;
 use cj_core::dnd::{DragId, DragItem};
 use cj_core::layout::{Rect, Side};
 use tracing::{debug, info, warn};
-use windows::Win32::UI::WindowsAndMessaging::{DestroyWindow, KillTimer, SetTimer};
+use windows::Win32::Foundation::{LPARAM, WPARAM};
+use windows::Win32::UI::WindowsAndMessaging::{
+    DestroyWindow, KillTimer, PostMessageW, SetTimer, WM_NULL,
+};
 use windows::core::w;
 
 use super::super::input_thread::rect_center;
@@ -222,7 +225,12 @@ pub(super) fn keep_tick() {
 }
 
 impl InState {
-    fn new(cfg: Config, shared: Arc<DndShared>, events: Emit, live: source::Live) -> Result<Self> {
+    pub(super) fn new(
+        cfg: Config,
+        shared: Arc<DndShared>,
+        events: Emit,
+        live: source::Live,
+    ) -> Result<Self> {
         let hinst = register_class().context("register catcher window class")?;
         let shield = create_window(hinst, w!("CursorJump shield")).context("create shield")?;
         shared.shield.store(shield.0 as isize, Ordering::Release);
@@ -250,15 +258,27 @@ impl InState {
         self.shared.parked.load(Ordering::Acquire)
     }
 
-    fn on_command(&mut self, cmd: DndCmd) {
+    pub(super) fn on_command(&mut self, cmd: DndCmd) {
         debug!(?cmd, "cj-dnd-in: command");
         self.modes.held = left_button_down();
         match cmd {
             DndCmd::StartIncoming { drag, items } => self.start_incoming(drag, items),
             DndCmd::CancelIncoming { drag } => {
-                // The relay has already cancelled it; this only notes it.
+                // The relay cancels a drag already registered. One it had
+                // not registered yet (the cancel came during its
+                // placeholders' file I/O) is registered by now: commands
+                // reach this thread in order, so this one is drained inside
+                // that drag's DoDragDrop, after `run_incoming` registered it.
+                let reached = source::cancel_live(&self.live, Some(drag));
                 let running = self.modes.incoming == Some(drag);
-                debug!(drag, running, "incoming: CancelIncoming");
+                debug!(drag, running, reached, "incoming: CancelIncoming");
+                if reached > 0 {
+                    // One more QueryContinueDrag, now the flag is set.
+                    // SAFETY: plain FFI call on our own window.
+                    let _ = unsafe {
+                        PostMessageW(Some(self.shield.hwnd), WM_NULL, WPARAM(0), LPARAM(0))
+                    };
+                }
             }
             DndCmd::ApplyConfig(cfg) => {
                 self.side = cfg.mac_side;

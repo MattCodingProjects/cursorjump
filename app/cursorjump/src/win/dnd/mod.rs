@@ -31,7 +31,20 @@
 //! FILECONTENTS in its own `Drop`), COM's modal loop dispatches none of its
 //! posted messages or timers (`probe_posted_messages_during_an_outgoing_com_call`).
 //! That can last minutes. Apart, a long Explorer drop from the Mac doesn't
-//! hold up the catcher, nor a spool the shield.
+//! hold up the catcher, nor a spool the shield. What the split leaves open:
+//! - A µs race at `Park(true)`: the shield is hidden by cj-dnd-out's
+//!   `ShowWindowAsync`, which the shield's own thread carries out, so for a
+//!   moment after `parked` is set the shield may still be up. Only a shield
+//!   kept for a press (within `KEEP_LIMIT` of a return home) can be up
+//!   then, and the input thread parks the cursor only after `AwaitParked`;
+//!   a ride from the PC starting in that moment is the whole exposure.
+//! - A press that went to the catcher, not the shield (the catcher lies
+//!   under the park point when the hook passes it), then a drag from the
+//!   Mac: R35 sees Windows holding the button and runs `DoDragDrop` on
+//!   cj-dnd-in, whose thread did not get the press. Its loop then gets no
+//!   mouse input (spike 5d) until a `CancelIncoming` or the next click.
+//!   The catcher is under the park point only while a PC drag rides,
+//!   which a drag from the Mac can't start during.
 //!
 //! Neither window shows while a game holds the mouse: the strip needs the
 //! input thread's game check, and the shield needs the cursor on the Mac,
@@ -155,9 +168,12 @@ pub enum DndCmd {
     /// The drag from the Mac is cancelled: its `DoDragDrop` ends without a
     /// drop, and a target's wait for its bytes after the drop fails
     /// (`E_FAIL`) within `source::REPLY_POLL`, as it does when cj-dnd
-    /// stops. Handled by the command relay, so it works even while a
-    /// target's `Drop` holds cj-dnd-in. The app should still fail its
-    /// outstanding `Fetch` replies with `Err(Cancelled)`: that is the
+    /// stops. The relay applies it to a drag already registered, so it
+    /// works even while a target's `Drop` holds cj-dnd-in; cj-dnd-in
+    /// applies it to one registered after the relay's try (it gets
+    /// commands in order, so a cancel sent right after `StartIncoming` is
+    /// drained inside that drag's `DoDragDrop`). The app should still fail
+    /// its outstanding `Fetch` replies with `Err(Cancelled)`: that is the
     /// cancel's main path once the drop has happened.
     CancelIncoming { drag: DragId },
 }
@@ -1834,6 +1850,39 @@ mod tests {
         assert!(sent.elapsed() < Duration::from_secs(1));
         shared.incoming.store(0, Ordering::Release);
         drop(cmds);
+    }
+
+    #[test]
+    fn a_cancel_right_after_the_start_ends_the_drag_without_a_drop() {
+        // Through the real relay and cj-dnd-in, back to back. Without a
+        // session DoDragDrop never runs here, whatever the mouse does (a
+        // real drag from a test could drop onto the desktop), so this pins
+        // the order and the outcome; `cj_dnd_in_cancels_a_drag_the_relay_missed`
+        // pins that the cancel reaches a drag registered after the relay.
+        let (tx, rx) = mpsc::channel::<WinDndEv>();
+        let shared = Arc::new(DndShared::default());
+        let cmds = spawn_dnd_thread(Config::default(), shared, move |ev| {
+            let _ = tx.send(ev);
+        })
+        .expect("spawn");
+        let items = vec![DragItem {
+            name: "a.txt".into(),
+            kind: cj_core::dnd::ItemKind::File,
+            size: Some(1),
+        }];
+        cmds.send(DndCmd::StartIncoming { drag: 40, items })
+            .unwrap();
+        cmds.send(DndCmd::CancelIncoming { drag: 40 }).unwrap();
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(WinDndEv::IncomingEnded { drag, dropped }) => {
+                assert_eq!((drag, dropped), (40, false));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "nothing else, no fetch"
+        );
     }
 
     #[test]
