@@ -4,6 +4,14 @@ pub mod clipboard_bridge;
 pub mod config_file;
 pub mod session_tasks;
 pub mod settings_window;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "dnd_link and the OS drag code use it in later tasks"
+    )
+)]
+pub mod transfer;
 
 use cj_core::config::Config;
 use cj_net::Fingerprint;
