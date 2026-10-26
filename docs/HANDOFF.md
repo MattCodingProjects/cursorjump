@@ -1,28 +1,35 @@
 # CursorJump — Handoff
 
-## Phase 2 (file drag-and-drop): PC side done, Mac side next
+## Phase 2 (file drag-and-drop): all code done; acceptance (Task 18) next
 
-Last updated: 2026-10-26, on the PC. Branch **`phase2`** is green in CI on Windows and macOS. It is not merged, and nothing from it is installed yet.
+Last updated: 2026-10-26, on the Mac. Branch **`phase2`** holds every task's code, reviewed. Nothing from it is installed yet. The repo is now **public** (the user's choice, for free CI minutes).
 
 - **Spec:** `docs/superpowers/specs/2026-10-25-file-drag-and-drop-design.md`
-- **Plan:** `docs/superpowers/plans/2026-10-25-file-drag-and-drop.md`
-- **Spike findings:** `docs/superpowers/progress/dnd-spike.md`
-- **Ledger:** `docs/superpowers/progress/phase2-dnd-ledger.md`. It holds every ruling (R1–R43), the per-task notes, and the hands-on list. Read it first.
-- **Done on the PC:**
-  - Task 1a (spike).
-  - Tasks 2–13, plus Task 11b (dragged web links are downloaded). Each task went through an implementer, a reviewer and fix rounds.
-- **Next, on the Mac:**
-  1. Start a Mac session and seed the SDD ledger from `phase2-dnd-ledger.md`.
-  2. Run Task 1b, the Mac spike for A1–A3 and A7 (file promises, a lazy file-url, NSDraggingSession from a posted press, the Mac catcher panel).
-  3. Run Tasks 14–17 (Mac pill, source, catcher, wiring).
-  4. On the Mac, run `cargo test -p cursorjump common::transfer -- --nocapture` and confirm there are no "skipped:" lines.
-  5. Ledger notes to carry into those tasks:
-     - The Task 17 bounce path must feed the real drag and suppress BeginDrag/CancelDrag.
-     - The Mac injector must count the PC-held left button from BeginDrag on.
-     - Reuse `common::link_fetch` for Discord/web links.
-- **PC hands-on demos done (2026-10-26):** the pill, the catcher and the incoming drag all passed with the user. One cosmetic issue is open: while a PC drag rides on the Mac, Explorer's drag image and copy cursor stay visible at the PC park point (see the ledger's Hands-on lines). Fix or accept it before acceptance.
-- **Then:** Task 18, acceptance with the user on both machines. This includes the hands-on smoke tests already built on the PC (pill, catcher, incoming drag; see the ledger's "Hands-on list"). After that, the final whole-branch review, then merge.
-- **Protocol is v3.** Install both machines together, and only once phase 2 is finished. A v2 build and a v3 build won't connect to each other.
+- **Plan:** `docs/superpowers/plans/2026-10-25-file-drag-and-drop.md` (Tasks 15–16 carry amendment blocks from the Mac spike)
+- **Spike findings:** `docs/superpowers/progress/dnd-spike.md` (PC 1a, Mac 1b, F1)
+- **Ledger:** `docs/superpowers/progress/phase2-dnd-ledger.md` (rulings R1–R55, per-task notes, hands-on results). Read it first.
+- **Done:**
+  - **PC:** Task 1a, Tasks 2–13 and 11b; hands-on passed.
+  - **Mac:** Task 1b (spike) and Tasks 14–17; hands-on smokes passed for the pill, drags arriving from the PC, and the edge catcher.
+  - Each task went through an implementer, a reviewer and re-reviews.
+- **How the Mac side works, in short:**
+  - **PC → Mac:** one drag carries a file promise plus a file URL (R47). Finder, the Desktop and WhatsApp take the promise and drop at once. Chromium targets (Gmail) get the file URL, and the posted release is **held** until the file has fully arrived (approved by the user; ✕ or Esc cancels).
+  - **Mac → PC:** an 8 pt invisible strip at the left edge catches the drag (R54). A late-starting drag is caught at the release instead (R48a). The edge stays a wall for window drags and text selections.
+- **Next: Task 18, with the user at both machines.**
+  1. **Install both together** (protocol v3; v2 and v3 won't connect):
+     - Mac: `./scripts/mac/install.sh`. Click "Always Allow" if codesign asks for the keychain.
+     - PC: `git pull`, then `powershell -ExecutionPolicy Bypass -File scripts\win\install.ps1`.
+  2. **Run the acceptance list** (plan Task 18 step 2) and record it in `docs/ACCEPTANCE.md`.
+  3. **Hand checks carried from the reviews:**
+     - a WhatsApp photo is "cloned out of its app's tmp folder";
+     - a Chrome image arrives under its fallback name (e.g. `image.jpg`);
+     - the PC handles a `Leave` while its left button is still down;
+     - Mac sleep mid-copy;
+     - the ghost image follows a PC-mouse Chrome drag on the Mac;
+     - the earlier PC open item (drag image at the park point) was fixed in 39f70d9, so confirm it.
+  4. Then the final whole-branch review (fable), delete the spike examples, update this file, and merge.
+- **Polish backlog** (in the ledger): Mac→PC web-link drags (R55), swapped mouse buttons, uniquifying sanitized names, full Unicode case folding, and a few rare few-ms races.
+- **Quarantine:** files received on the Mac get no quarantine flag (R22). They are treated like a local copy.
 
 ---
 
