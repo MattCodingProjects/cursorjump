@@ -1718,6 +1718,23 @@ mod mac {
     fn source_script(s: (f64, f64), t: (f64, f64)) {
         let c = cfg();
         sleep_ms(500); // let the panel reach the window server
+        // CJ_NOPOST=1: post nothing; another process drives the drag (F1:
+        // does a session follow events posted by a different process?).
+        if std::env::var_os("CJ_NOPOST").is_some() {
+            log!("CJ_NOPOST: panel at S ({:.1}, {:.1}); waiting for another process's events", s.0, s.1);
+            for i in 0..40 {
+                sleep_ms(250);
+                if i % 4 == 0 {
+                    log!(
+                        "nopost: mouseDown seen {}, began {}, moved {}",
+                        MOUSE_DOWN_SEEN.load(Ordering::SeqCst),
+                        SESSION_BEGAN.load(Ordering::SeqCst),
+                        MOVED_CALLS.load(Ordering::SeqCst)
+                    );
+                }
+            }
+            finish(c.quit_after, source_summary);
+        }
         let Some(p) = Poster::new() else {
             log!("CGEventSourceCreate(HIDSystemState) failed; nothing posted");
             finish(c.quit_after, source_summary);
@@ -2181,7 +2198,12 @@ mod mac {
         let app = new_app(mtm);
         log_frontmost("at start");
         let h = main_bounds().3;
-        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(2.0, h));
+        // CJ_STRIP_W=n: a wider strip, to see when posted drags reach it.
+        let w: f64 = std::env::var("CJ_STRIP_W")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2.0);
+        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h));
         let view = CatcherView::new(mtm, NSRect::new(NSPoint::new(0.0, 0.0), frame.size), reject);
         // SAFETY: a static AppKit string.
         let file_url = unsafe { NSPasteboardTypeFileURL }.to_string();

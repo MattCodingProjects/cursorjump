@@ -84,3 +84,11 @@ Chrome starts a renderer-initiated drag late, after an IPC round trip. It calls 
 - Research notes (Chromium's `startDragWithDropData`, the Deskflow and Chrome Remote Desktop event-number fixes) are summarised in the ledger under F1.
 
 To be investigated autonomously while the user is away (a Chrome test page, posted drags, field comparisons). Until then, Task 16 handles late drags at push-out (R48).
+
+## F1 resolved (2026-10-26, controller experiments with the user away)
+
+- **Our own source, started late.** It was started 240 ms after the down in three ways: from a real dragged event, from a synthesized one built like Chromium's, and from a main-queue timer. It followed posted drags in every case, including when another process posted the events.
+- **The thin strip.** A 2 pt strip sees a posted drag only at the release, even our own. An 8 pt or wider strip sees it before the release.
+- **Chrome.** With an 8 pt strip, Chrome's posted `<img>` drag reached the strip before the release, and the promise delivered the file.
+- **What the earlier runs really showed.** The "Chrome won't follow posted drags" symptom came from the 2 pt strip. The breakage that followed came from one drag that never ended: it left Chrome refusing new drags until it cleared.
+- **Change:** R54 makes the catcher strip 8 pt wide.
