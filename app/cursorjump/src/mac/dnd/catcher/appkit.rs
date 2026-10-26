@@ -344,12 +344,9 @@ fn read_dragged(pb: &NSPasteboard) -> Vec<Dragged> {
         } else if let Some(receiver) = receiver {
             let recv = receivers.get(receiver);
             let names = recv.and_then(|r| file_names(r));
-            let dirs = recv.map_or_else(Vec::new, |r| {
-                r.fileTypes()
-                    .iter()
-                    .map(|t| t.to_string() == FOLDER_UTT)
-                    .collect()
-            });
+            let dirs = recv
+                .and_then(|r| file_types(r))
+                .map_or_else(Vec::new, |t| t.iter().map(|t| t == FOLDER_UTT).collect());
             out.push(Dragged::Promise {
                 receiver,
                 names,
@@ -386,6 +383,14 @@ fn read_receivers(pb: &NSPasteboard) -> Vec<Retained<NSFilePromiseReceiver>> {
             .collect()
     })
     .unwrap_or_default()
+}
+
+/// `fileTypes`, read like `fileNames`: the generated binding assumes
+/// non-null.
+fn file_types(recv: &NSFilePromiseReceiver) -> Option<Vec<String>> {
+    // SAFETY: `fileTypes` takes no arguments and returns an NSArray or nil.
+    let types: Option<Retained<NSArray<NSString>>> = unsafe { msg_send![recv, fileTypes] };
+    types.map(|t| t.iter().map(|s| s.to_string()).collect())
 }
 
 /// `fileNames`, which Chrome leaves nil before the drop (the generated

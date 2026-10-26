@@ -411,6 +411,12 @@ impl Injector {
         self.current_pos()
     }
 
+    /// The virtual cursor, as the last motion or warp left it (no system
+    /// query).
+    pub fn pos(&self) -> (f64, f64) {
+        self.pos
+    }
+
     /// The main display's bounds, as of the last motion or warp.
     pub fn bounds(&self) -> Rectf {
         self.bounds

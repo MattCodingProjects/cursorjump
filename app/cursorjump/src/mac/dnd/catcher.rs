@@ -128,7 +128,9 @@ pub fn outgoing_dir() -> PathBuf {
 
 // ------------------------------------------------------------ the offer
 
-/// What the file system says of a dragged file or folder.
+/// What the file system says of a dragged file or folder: one stat, on
+/// the main thread in `draggingEntered:` (the brief allows it; a folder
+/// is never walked).
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Facts {
     is_dir: bool,
@@ -231,11 +233,11 @@ fn build_offer(dragged: Vec<Dragged>) -> Built {
                     .filter(|n| !n.is_empty())
                     .unwrap_or_else(|| vec![String::new()]);
                 let n = names.len();
-                // A type per file, or one type for them all.
+                // A type per file; otherwise, any folder type makes every
+                // file of the promise a folder.
                 let is_dir = |i: usize| match dirs.len() {
                     len if len == n => dirs[i],
-                    1 => dirs[0],
-                    _ => false,
+                    _ => dirs.contains(&true),
                 };
                 let files = names
                     .into_iter()
@@ -550,7 +552,8 @@ impl Catcher {
     /// and the promise queue); it must not block, nor call the catcher.
     pub fn new(events: impl Fn(MacDndEv) + Send + Sync + 'static) -> Catcher {
         let shared = Arc::new(Shared::new(events, outgoing_dir(), drag_pasteboard_count));
-        // Made and drawn once, now, so that showing it is instant.
+        // Made once, now (hidden), so a show only moves, orders front,
+        // draws and flushes it.
         let made = shared.clone();
         on_main(move |mtm| appkit::make(mtm, &made));
         Catcher { shared }
@@ -860,10 +863,25 @@ mod tests {
             promise_of(2, None, &[true]),
             promise_of(3, Some(&["c", "d"]), &[true]),
             promise_of(4, Some(&["e", "f"]), &[true, false, true]),
+            promise_of(5, None, &[false, true]),
+            promise_of(6, Some(&["g", "h"]), &[false]),
+            promise_of(7, Some(&["i"]), &[]),
         ]);
         let kinds: Vec<ItemKind> = b.items.iter().map(|i| i.kind).collect();
         use ItemKind::{Dir, File};
-        assert_eq!(kinds, [Dir, File, Dir, Dir, Dir, Dir, File, File]);
+        assert_eq!(
+            kinds,
+            [
+                Dir, // one name, one folder type
+                File, Dir, // a type per file
+                Dir, // unnamed, a folder type
+                Dir, Dir, // one folder type for two files
+                Dir, Dir, // counts differ, a folder among the types
+                Dir, // unnamed, counts differ, a folder among the types
+                File, File, // no folder type
+                File  // no types at all
+            ]
+        );
     }
 
     #[test]

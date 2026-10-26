@@ -62,8 +62,18 @@ impl CatchPort for NoCatcher {
     }
 }
 
-/// The other buttons than the left one.
-const NOT_LEFT: [MouseButton; 4] = [
+/// Whether `b` is another button than the left one; exhaustive, so a new
+/// button must be decided here.
+pub(super) const fn not_left(b: MouseButton) -> bool {
+    match b {
+        MouseButton::Left => false,
+        MouseButton::Right | MouseButton::Middle | MouseButton::Back | MouseButton::Forward => true,
+    }
+}
+
+/// Every button, for `not_left`; a test checks that none is missing.
+pub(super) const BUTTONS: [MouseButton; 5] = [
+    MouseButton::Left,
     MouseButton::Right,
     MouseButton::Middle,
     MouseButton::Back,
@@ -94,9 +104,6 @@ impl<I: Inject, D: DragPort, C: CatchPort> Router<I, D, C> {
             // A window drag or a text selection: it stays on the Mac.
             return self.feed(sid, wall);
         }
-        if late {
-            c.await_late();
-        }
         // Up before the release goes out, and a while after it.
         self.linger = Some((Instant::now() + self.late_wait, edge));
         self.update_zone(Instant::now());
@@ -125,7 +132,9 @@ impl<I: Inject, D: DragPort, C: CatchPort> Router<I, D, C> {
         self.left_is_users
             && self.ride.is_none()
             && self.inj.button_held(MouseButton::Left)
-            && !NOT_LEFT.iter().any(|&b| self.inj.button_held(b))
+            && !BUTTONS
+                .iter()
+                .any(|&b| not_left(b) && self.inj.button_held(b))
     }
 
     /// The late wait is over: leave, with the drag the catcher caught.
@@ -147,7 +156,8 @@ impl<I: Inject, D: DragPort, C: CatchPort> Router<I, D, C> {
         }
         let near = match self.machine.entry_edge() {
             Some(edge) if self.machine.controlled() && self.users_left_alone() => {
-                let (bounds, at) = (self.inj.bounds(), self.inj.cursor());
+                // Where `motion` just put it: no second system query.
+                let (bounds, at) = (self.inj.bounds(), self.inj.pos());
                 in_catch_zone(bounds, edge, at).then_some(edge)
             }
             _ => None,

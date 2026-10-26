@@ -336,10 +336,10 @@ fn taking_the_cursor_back_during_the_wait_leaves_nothing_behind() {
 #[test]
 fn late_wait_does_not_block_other_input() {
     let (mut r, calls, _) = dragging_near_the_edge(None);
-    let t0 = Instant::now();
     push(&mut r);
-    // Input during the wait is handled at once: dropped, the PC no
-    // longer controlling this Mac.
+    let due = r.next_tick().unwrap();
+    // Input during the wait is handled at once, before the wait ends:
+    // dropped, the PC no longer controlling this Mac.
     for i in [
         Input::Motion { dx: 5, dy: 0 },
         key(0x00, true),
@@ -348,7 +348,6 @@ fn late_wait_does_not_block_other_input() {
     ] {
         assert_eq!(r.handle(input(1, i)), vec![]);
     }
-    assert!(t0.elapsed() < WAIT, "nothing waited");
     let c = take(&calls);
     assert_eq!(
         c,
@@ -360,7 +359,15 @@ fn late_wait_does_not_block_other_input() {
         ],
         "nothing injected after the release"
     );
-    assert!(r.next_tick().is_some(), "the leave is still due");
+    assert_eq!(r.next_tick(), Some(due), "the leave is still due");
+    assert_eq!(
+        r.tick(due),
+        vec![InjectEv::SendLeave {
+            sid: 1,
+            frac: 0.3,
+            drag: None
+        }]
+    );
 }
 
 #[test]
@@ -374,16 +381,17 @@ fn thread_sends_the_late_leave_after_the_wait_meanwhile_handling_input() {
     let t0 = Instant::now();
     tx.send(input(1, Input::Motion { dx: -9, dy: 0 })).unwrap();
     let t = Duration::from_secs(2);
-    let (at, ev) = ev_rx.recv_timeout(t).unwrap();
-    assert_eq!(ev, InjectEv::Controlled { sid: 1, on: false });
-    assert!(at - t0 < WAIT, "reported before the wait is over");
-    // Input sent during the wait is taken off the channel at once.
+    let (_, ev) = ev_rx.recv_timeout(t).unwrap();
+    assert_eq!(
+        ev,
+        InjectEv::Controlled { sid: 1, on: false },
+        "reported first, not after the wait"
+    );
+    // Messages sent during the wait are handled during it: a cancel of
+    // some drag shows in the calls (CancelSource), and must come before
+    // the wait's end (EndLateWait).
     tx.send(input(1, key(0x00, true))).unwrap();
-    tx.send(InjectMsg::DragReady {
-        drag: 3,
-        crossing: 1,
-    })
-    .unwrap();
+    tx.send(InjectMsg::CancelDrag { drag: 3 }).unwrap();
     let (at, ev) = ev_rx.recv_timeout(t).unwrap();
     assert_eq!(
         ev,
@@ -398,6 +406,12 @@ fn thread_sends_the_late_leave_after_the_wait_meanwhile_handling_input() {
     while ev_rx.recv_timeout(t).unwrap().1 != InjectEv::Stopped {}
     let c = take(&calls);
     assert!(!c.contains(&Call::Key(0x00, true)), "{c:?}");
+    let pos = |x: &Call| c.iter().position(|y| y == x);
+    let (cancel, end) = (pos(&Call::CancelSource(3)), pos(&Call::EndLateWait(true)));
+    assert!(
+        cancel.is_some() && cancel < end,
+        "handled before the wait ended: {c:?}"
+    );
     assert_eq!(
         zones(&c),
         vec![None],
@@ -430,7 +444,8 @@ fn the_users_left_down_marks_the_drag_pasteboard() {
     r.handle(input(1, button(true)));
     assert_eq!(
         take(&calls),
-        vec![LEFT_DOWN, Call::Pressed, Call::Zone(Some(Side::Left))]
+        vec![Call::Pressed, LEFT_DOWN, Call::Zone(Some(Side::Left))],
+        "the baseline is read before the down is posted"
     );
     r.handle(input(1, button(false)));
     r.handle(input(
@@ -530,4 +545,106 @@ fn an_offer_on_the_strip_is_evidence_enough() {
         take(&calls),
         vec![Call::Motion(-9, 0), Call::CatchPushOut, Call::ReleaseAll]
     );
+}
+
+#[test]
+fn other_buttons_held_at_a_push_out_are_a_wall() {
+    for other in [
+        MouseButton::Right,
+        MouseButton::Middle,
+        MouseButton::Back,
+        MouseButton::Forward,
+    ] {
+        let (mut r, calls, _) = dragging_near_the_edge(Some(9));
+        r.handle(input(
+            1,
+            Input::Button {
+                button: other,
+                down: true,
+            },
+        ));
+        take(&calls);
+        assert_eq!(push(&mut r), vec![], "{other:?}");
+        let c = take(&calls);
+        assert_eq!(
+            c,
+            vec![Call::Motion(-9, 0)],
+            "{other:?}: no catcher, no release"
+        );
+        assert_eq!(r.zone, None, "{other:?}: no strip");
+    }
+}
+
+#[test]
+fn every_button_but_left_counts_as_another() {
+    use super::super::catch::{BUTTONS, not_left};
+    let others: Vec<MouseButton> = BUTTONS.into_iter().filter(|&b| not_left(b)).collect();
+    assert_eq!(
+        others,
+        [
+            MouseButton::Right,
+            MouseButton::Middle,
+            MouseButton::Back,
+            MouseButton::Forward
+        ]
+    );
+    assert!(BUTTONS.contains(&MouseButton::Left));
+}
+
+#[test]
+fn losing_accessibility_hides_the_strip() {
+    let (mut r, calls, _) = dragging_near_the_edge(None);
+    r.access.store(false, Ordering::Relaxed);
+    let out = r.handle(InjectMsg::AccessLost);
+    assert!(
+        out.iter()
+            .any(|e| matches!(e, InjectEv::SendLeave { drag: None, .. })),
+        "{out:?}"
+    );
+    let c = take(&calls);
+    assert_eq!(zones(&c), vec![None], "{c:?}");
+    assert!(!c.contains(&Call::CatchPushOut), "a bounce carries nothing");
+    assert_eq!(r.next_tick(), None, "no wait, no linger");
+}
+
+#[test]
+fn an_enter_during_the_late_wait_ends_it_cleanly() {
+    let (mut r, calls, caught) = dragging_near_the_edge(None);
+    push(&mut r);
+    take(&calls);
+    *caught.lock().unwrap() = Some(11);
+    let out = r.handle(input(1, enter(0.5)));
+    assert_eq!(out, vec![InjectEv::Controlled { sid: 1, on: true }]);
+    let c = take(&calls);
+    assert!(
+        c.contains(&Call::EndLateWait(false)),
+        "the gate closes; what it caught is withdrawn: {c:?}"
+    );
+    // The linger runs out; no leave ever comes.
+    let due = r.next_tick().unwrap();
+    assert_eq!(r.tick(due), vec![]);
+    assert_eq!(take(&calls), vec![Call::Zone(None)]);
+    assert_eq!(r.next_tick(), None);
+    assert_eq!(r.handle(InjectMsg::LateDrop { drag: 11 }), vec![]);
+}
+
+#[test]
+fn a_new_crossing_drops_the_strip_of_an_earlier_push_out() {
+    let (mut r, calls, _) = dragging_near_the_edge(Some(9));
+    push(&mut r);
+    assert!(r.next_tick().is_some(), "lingering");
+    take(&calls);
+    // The PC's drag rides in at once: no strip while it rides.
+    r.inj.pos = (300.0, 200.0);
+    r.handle(input(
+        1,
+        Input::DragOffer {
+            drag: 7,
+            items: items(1),
+        },
+    ));
+    r.handle(input(1, enter_with(7)));
+    let c = take(&calls);
+    assert_eq!(zones(&c), vec![None], "{c:?}");
+    assert_eq!(r.next_tick(), None);
 }

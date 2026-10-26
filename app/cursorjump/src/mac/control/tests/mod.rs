@@ -118,6 +118,9 @@ impl Inject for Fake {
     fn cursor(&mut self) -> (f64, f64) {
         self.pos
     }
+    fn pos(&self) -> (f64, f64) {
+        self.pos
+    }
     fn bounds(&self) -> Rectf {
         Rectf {
             x: 0.0,

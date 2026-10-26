@@ -60,8 +60,8 @@ pub enum MacAction {
     CancelDrag {
         drag: DragId,
     },
-    /// Start the wait for a late drop (R48), after the release went out;
-    /// `LateDrop` ends it.
+    /// Start the wait for a late drop (R48), just before the release goes
+    /// out; `LateDrop` ends it.
     AwaitLateDrop,
 }
 
@@ -146,9 +146,11 @@ impl MacMachine {
                 self.controlled = false;
                 self.entry = None;
                 self.leaving = Some(frac);
+                // The wait (and the catcher's late window) opens before the
+                // release goes out, so a drop at the release is taken.
                 vec![
-                    MacAction::ReleaseAllInjected,
                     MacAction::AwaitLateDrop,
+                    MacAction::ReleaseAllInjected,
                     MacAction::StopControl,
                 ]
             }
@@ -536,13 +538,13 @@ mod tests {
     }
 
     #[test]
-    fn left_held_push_out_releases_then_waits_before_leaving() {
+    fn left_held_push_out_waits_then_releases_before_leaving() {
         let mut m = entered();
         assert_eq!(
             m.on(push_out_late()),
             vec![
-                MacAction::ReleaseAllInjected,
                 MacAction::AwaitLateDrop,
+                MacAction::ReleaseAllInjected,
                 MacAction::StopControl
             ]
         );

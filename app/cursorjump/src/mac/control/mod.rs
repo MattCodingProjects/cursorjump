@@ -95,6 +95,9 @@ pub trait Inject {
     fn entry_frac(&self) -> f32;
     /// Where the cursor is now, in global points (origin top left).
     fn cursor(&mut self) -> (f64, f64);
+    /// Where the last motion or warp put the cursor, without asking the
+    /// system again (global points).
+    fn pos(&self) -> (f64, f64);
     /// The main display's bounds, in global points.
     fn bounds(&self) -> Rectf;
     /// A dragged event of the held button 1 pt off the cursor (`nudge`) or
@@ -186,6 +189,9 @@ impl Inject for Injector {
     }
     fn cursor(&mut self) -> (f64, f64) {
         Injector::cursor(self)
+    }
+    fn pos(&self) -> (f64, f64) {
+        Injector::pos(self)
     }
     fn bounds(&self) -> Rectf {
         Injector::bounds(self)
@@ -571,6 +577,12 @@ impl<I: Inject, D: DragPort, C: CatchPort> Router<I, D, C> {
         let held = self.ride.is_some_and(|r| r.hold.is_some());
         match input {
             Input::Enter { edge, frac, drag } => {
+                // A new crossing: the strip of an earlier push-out must
+                // not show during it (a ride). A late wait still running
+                // keeps it, for that drag to end on; the Enter ends it.
+                if self.late_until.is_none() {
+                    self.linger = None;
+                }
                 // The cached state: asking the system costs milliseconds.
                 if self.access.load(Ordering::Relaxed) {
                     return self.feed(sid, MacEvent::Enter { edge, frac, drag });
@@ -619,15 +631,17 @@ impl<I: Inject, D: DragPort, C: CatchPort> Router<I, D, C> {
             }
             Input::Button { button, down } => {
                 if controlled || (!down && self.inj.button_held(button)) {
+                    if button == MouseButton::Left && down && controlled {
+                        // For R48a: did a drag begin since this press? The
+                        // baseline comes first, as an app may start its drag
+                        // on the down itself.
+                        if let Some(c) = self.catcher.as_mut() {
+                            c.pressed();
+                        }
+                    }
                     self.inj.button(button, down);
                     if button == MouseButton::Left {
                         self.left_is_users = down;
-                        if down && controlled {
-                            // For R48a: did a drag begin since this press?
-                            if let Some(c) = self.catcher.as_mut() {
-                                c.pressed();
-                            }
-                        }
                     }
                 }
                 Vec::new()
@@ -706,10 +720,15 @@ impl<I: Inject, D: DragPort, C: CatchPort> Router<I, D, C> {
                     self.abort_drag(drag);
                     cancelled = true;
                 }
-                // It ends with the strip's linger, set at the push-out.
+                // Before the release goes out, so a drop at the release is
+                // taken. It ends with the strip's linger, set at the
+                // push-out.
                 MacAction::AwaitLateDrop => {
                     let until = self.linger.map(|(until, _)| until);
                     self.late_until = until.or_else(|| Some(Instant::now() + self.late_wait));
+                    if let Some(c) = self.catcher.as_mut() {
+                        c.await_late();
+                    }
                 }
             }
         }
