@@ -1,5 +1,30 @@
 # CursorJump — Handoff
 
+## Phase 2 (file drag-and-drop): PC side done, Mac side next
+
+Last updated: 2026-10-26, on the PC. Branch **`phase2`** is green in CI on Windows and macOS. It is not merged, and nothing from it is installed yet.
+
+- **Spec:** `docs/superpowers/specs/2026-10-25-file-drag-and-drop-design.md`
+- **Plan:** `docs/superpowers/plans/2026-10-25-file-drag-and-drop.md`
+- **Spike findings:** `docs/superpowers/progress/dnd-spike.md`
+- **Ledger:** `docs/superpowers/progress/phase2-dnd-ledger.md`. It holds every ruling (R1–R43), the per-task notes, and the hands-on list. Read it first.
+- **Done on the PC:**
+  - Task 1a (spike).
+  - Tasks 2–13, plus Task 11b (dragged web links are downloaded). Each task went through an implementer, a reviewer and fix rounds.
+- **Next, on the Mac:**
+  1. Start a Mac session and seed the SDD ledger from `phase2-dnd-ledger.md`.
+  2. Run Task 1b, the Mac spike for A1–A3 and A7 (file promises, a lazy file-url, NSDraggingSession from a posted press, the Mac catcher panel).
+  3. Run Tasks 14–17 (Mac pill, source, catcher, wiring).
+  4. On the Mac, run `cargo test -p cursorjump common::transfer -- --nocapture` and confirm there are no "skipped:" lines.
+  5. Ledger notes to carry into those tasks:
+     - The Task 17 bounce path must feed the real drag and suppress BeginDrag/CancelDrag.
+     - The Mac injector must count the PC-held left button from BeginDrag on.
+     - Reuse `common::link_fetch` for Discord/web links.
+- **Then:** Task 18, acceptance with the user on both machines. This includes the hands-on smoke tests already built on the PC (pill, catcher, incoming drag; see the ledger's "Hands-on list"). After that, the final whole-branch review, then merge.
+- **Protocol is v3.** Install both machines together, and only once phase 2 is finished. A v2 build and a v3 build won't connect to each other.
+
+---
+
 Last updated: 2026-10-19 (end of session 3, on the Mac). **Phase 1 is complete and merged to `main`.**
 
 ## What this is

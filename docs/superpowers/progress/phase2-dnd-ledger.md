@@ -181,3 +181,27 @@ Task 12: fix round 2 (R39 split) DONE 3376898 (203 pass; CI 40275016004 green). 
 Task 12: re-review rounds 1–2 — anti-cheat ✅, all items ✅; new Important: early CancelIncoming lost before cj-dnd-in registers the drag (regression) → round 3 sent.
 Task 12: fix round 3 DONE 73d0c8e (206 pass; CI 40276400720 green) — controller reviewed the small diff directly (cancel_live in InState::on_command + WM_NULL nudge; tests pinned by revert).
 Task 12: complete (d98b30b, 3905f1a, 3376898, 73d0c8e). Hands-on smoke pending (see list).
+Task 11b: brief written by controller (task-11b-brief.md: common/link_fetch.rs + catcher wiring; http/https only, ≤5 redirects, 2 GiB cap, host-only logging, own thread, cancel when watch closed); dispatched to impl-task11 (opus), BASE 9f403e7
+Task 11b: implementer DONE 112ea65 (217 pass; CI 40277700008 green). ureq 3.5 + rustls(ring) + webpki-roots, single rustls in tree. Concerns: no private-address filtering (link is user-dragged, bytes go only to own Mac); webpki-roots not OS store.
+Task 11b: review APPROVED (spec ✅, no Critical/Important).
+Ruling R40: no SSRF filtering on dragged links — why: blind cookieless GET, bytes go only to the user's own Mac, needs the user's drag gesture, LAN/NAS image drags are real use cases; proper filtering needs per-hop post-DNS checks ureq can't hook — cost if wrong: a dragged link can trigger a side-effecting GET on an unauthenticated LAN device (a page can already do that by navigation).
+Ruling R41: link fetch uses the OS trust store (ureq platform-verifier), not webpki-roots — why: home Windows AV HTTPS scanning installs its own root; webpki-roots would make every link drag "Unreadable" there — cost if wrong: a few more crates per OS.
+Acceptance additions (T18): a Discord CDN image with a signed ?ex= query; a large linked file (Mac waits for a late-resolving Pending source).
+Task 11b: fix round 1 sent (R41, ureq log cap, flake-proof error test, early-close test, url normalization, 5-redirect boundary, content_length()).
+Task 11b: fix round 1 DONE d245ee5 (220 pass; CI 40279145292 green; one rustls 0.23.46 on ring, platform-verifier)
+Task 11b: re-review all addressed (Minors parked: log-cap test bypasses the log bridge; _ring is an internal ureq feature, lockfile-pinned)
+Task 11b: complete (112ea65, d245ee5)
+Task 13: dispatched implementer (opus, impl-task13), BASE d245ee5
+Task 13: implementer DONE_WITH_CONCERNS 0a35fe6 (234 pass; CI 40281765613 green). New win/app/drags.rs. Calls: hourly incoming sweep (>24 h); SourceDragHome/OfferGone-while-riding also cancel the Mac side; Refuse sends DragCancel+DragFinished; ≤10 s wait for late target asks after a drop; Offer while on the Mac refused. Concerns: cj-dnd dying strands Incoming (edge walled until disconnect); failed pill keeps the 1 s game probe; DragDropped >500 ms after the catcher's release give-up cancels the ride.
+Ruling R37a: R37 amended to match the plan — incoming\* swept at startup AND hourly, only entries older than 24 h, never a live drag's dir — why: plan text; the 24 h age is what protects late uploads — cost if wrong: none.
+Task 13: review NEEDS FIXES (Important: Riding::Incoming walls the edge for a whole Explorer copy; no recovery if cj-dnd dies). Calls 1–5 accepted.
+Ruling R42: the PC's Riding::Incoming ends at the drop (first Fetch → PcEvent::DragGone), not at IncomingEnded; Drags::disconnected sends CancelIncoming for live InDrags — why: otherwise the edge stays walled for the whole Explorer receive (minutes on Wi-Fi), defeating R39 — cost if wrong: none (DragGone idempotent; disconnect still fails replies).
+Ruling R43: cj-dnd death recovery — a failed StartIncoming forward emits IncomingEnded{dropped:false}; a drag_tick watchdog ends an InDrag with no IncomingEnded, no unanswered replies and the left button up ≥3 s — why: stuck-drag anti-goal — cost if wrong: a 3 s delay before a dead thread's drag is cleared.
+Task 13: fix round 1 sent (R42, R43, M1–M8).
+Task 13: fix round 1 DONE 334bc77 (245 pass; CI 40284051561 green). Extra: OutModes holds an early Cancel in a refuse flag until Park(true); disconnected cancels live incoming drags even with no link.
+Task 13: re-review round 1 — all 11 ✅, exactly-once ✅, anti-cheat ✅. Minors (watchdog false positives on late first ask / Explorer post-copy; late DragCancel turns Done into Failed; swapped buttons) → round 2 sent: positive DoDragDrop-running liveness atomic + unwind guard.
+Task 13: fix round 2 DONE 3fe3774 (247 pass; CI 40285650388 green). Parked: swapped mouse buttons (whole input path uses the physical left button; a consistent remap is a polish item).
+Task 13: re-review round 2 all addressed (Minors parked: unwind guard reports dropped:false even after fetches; no test of a fresh StartIncoming after an unwind).
+Task 13: complete (0a35fe6, 334bc77, 3fe3774).
+PC SIDE COMPLETE (Tasks 1a, 2–13, 11b). Next: the Mac session — Task 1b spike (A1–A3, A7), then Tasks 14–17; then Task 18 acceptance with the user; then the final whole-branch review (fable) and finishing-a-development-branch.
+Parked/polish backlog: swapped mouse buttons across the drag path; uniquify sanitize collisions inside a received folder; full Unicode case folding (ß/SS); Task 18 checks listed in notes (M7 return-while-held after a refused ride; 300-tiny-file smoothness; Discord CDN signed link; large linked file; drag image hidden while parked; drag keeps following after the shield hides; commands during Explorer's Drop — R39 PROBE).
