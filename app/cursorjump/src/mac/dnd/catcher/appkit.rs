@@ -29,6 +29,9 @@ use super::{Dragged, Facts, Promise, Reading, STRIP_ALPHA, Shared, strip_frame};
 use crate::mac::dnd::{flush_core_animation, guarded};
 use crate::mac::inject::Rectf;
 
+/// A promised file of this type is a folder.
+const FOLDER_UTT: &str = "public.folder";
+
 /// The strip, made once; only ever touched on the main thread.
 struct Strip {
     panel: Retained<StripPanel>,
@@ -339,8 +342,19 @@ fn read_dragged(pb: &NSPasteboard) -> Vec<Dragged> {
             let facts = Facts::of(&path);
             out.push(Dragged::File { path, facts });
         } else if let Some(receiver) = receiver {
-            let names = receivers.get(receiver).and_then(|r| file_names(r));
-            out.push(Dragged::Promise { receiver, names });
+            let recv = receivers.get(receiver);
+            let names = recv.and_then(|r| file_names(r));
+            let dirs = recv.map_or_else(Vec::new, |r| {
+                r.fileTypes()
+                    .iter()
+                    .map(|t| t.to_string() == FOLDER_UTT)
+                    .collect()
+            });
+            out.push(Dragged::Promise {
+                receiver,
+                names,
+                dirs,
+            });
         }
     }
     if next_receiver != receivers.len() {

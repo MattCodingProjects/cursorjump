@@ -134,14 +134,14 @@ pub fn run_smoke(mode: CatcherSmoke) -> anyhow::Result<()> {
 /// Shows the strip and keeps the late window open, so any drop is taken.
 fn manual(mut catcher: Catcher, late: &crossbeam_channel::Receiver<DragId>, offers: &Offers) {
     catcher.zone(Some(Side::Left));
-    catcher.push_out();
+    catcher.await_late();
     info!("smoke: drag files onto the strip at the main display's left edge (2 minutes)");
     let end = Instant::now() + Duration::from_secs(120);
     while let Ok(drag) = late.recv_deadline(end) {
         let caught = catcher.end_late_wait(true);
         info!(drag, ?caught, "smoke: the drop was taken");
         report(drag, offers);
-        catcher.push_out();
+        catcher.await_late();
     }
     catcher.end_late_wait(false);
     catcher.zone(None);

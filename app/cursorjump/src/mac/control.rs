@@ -34,11 +34,14 @@
 //!   `CATCH_ZONE_PT` (48 pt) of the entry edge.
 //! - A push-out then (`CatchPort::push_out`) carries the strip's drag:
 //!   the release goes out and drops it there, and the `Leave` carries it.
-//!   With no drag there yet, the release goes out all the same, and the
-//!   `Leave` waits up to [`LATE_DRAG_WAIT`] for a drag that starts late
-//!   to drop on the strip (`InjectMsg::LateDrop`, R48). The wait is a
-//!   deadline of the thread's loop, never a sleep: input keeps flowing
-//!   (and is dropped, the PC no longer controlling this Mac).
+//! - With no drag there yet, the edge is a wall (a window drag, a text
+//!   selection), unless a drag began since the press that the strip
+//!   hasn't seen (`CatchPort::drag_began`: the drag pasteboard changed,
+//!   R48a). Then the release goes out, and the `Leave` waits up to
+//!   [`LATE_DRAG_WAIT`] for that drag to drop on the strip
+//!   (`InjectMsg::LateDrop`, R48). The wait is a deadline of the thread's
+//!   loop, never a sleep: input keeps flowing (and is dropped, the PC no
+//!   longer controlling this Mac).
 //! - After either, the strip stays up for [`LATE_DRAG_WAIT`], so a late
 //!   drag always ends on it.
 //! - Without a catcher, holding a button at the edge is a wall, as before.
@@ -146,11 +149,19 @@ pub trait CatchPort {
     /// Some(edge) shows the strip along that edge; None hides it. Called
     /// only when that changes.
     fn zone(&mut self, show: Option<Side>);
+    /// The user's left button went down here: remember the drag
+    /// pasteboard's state, for `drag_began`.
+    fn pressed(&mut self);
+    /// Whether a drag began since `pressed` (R48a): the drag pasteboard
+    /// changed, though the strip may not have seen the drag yet.
+    fn drag_began(&mut self) -> bool;
     /// A push-out with only the left button held is about to post the
-    /// release, over the strip. Returns the strip's drag, whose drop there
-    /// is then taken; or None, and then a drag that drops on the strip
-    /// before `end_late_wait` is taken (R48).
+    /// release, over the strip: the strip's drag, whose drop there is then
+    /// taken; None if there is none.
     fn push_out(&mut self) -> Option<DragId>;
+    /// Opens the late window (R48): a drag that drops on the strip before
+    /// `end_late_wait` is taken.
+    fn await_late(&mut self);
     /// The late wait is over: the drag that dropped on the strip during
     /// it, if any; a later drop is refused. `carry`: whether a `Leave`
     /// carries that drag; if not, its offer is withdrawn.
@@ -164,7 +175,16 @@ impl CatchPort for NoCatcher {
     fn zone(&mut self, _show: Option<Side>) {
         match *self {}
     }
+    fn pressed(&mut self) {
+        match *self {}
+    }
+    fn drag_began(&mut self) -> bool {
+        match *self {}
+    }
     fn push_out(&mut self) -> Option<DragId> {
+        match *self {}
+    }
+    fn await_late(&mut self) {
         match *self {}
     }
     fn end_late_wait(&mut self, _carry: bool) -> Option<DragId> {
@@ -674,6 +694,12 @@ impl<I: Inject, D: DragPort, C: CatchPort> Router<I, D, C> {
                     self.inj.button(button, down);
                     if button == MouseButton::Left {
                         self.left_is_users = down;
+                        if down && controlled {
+                            // For R48a: did a drag begin since this press?
+                            if let Some(c) = self.catcher.as_mut() {
+                                c.pressed();
+                            }
+                        }
                     }
                 }
                 Vec::new()
@@ -695,26 +721,33 @@ impl<I: Inject, D: DragPort, C: CatchPort> Router<I, D, C> {
 
     /// The cursor pushes out through the entry edge at `frac`. With only
     /// the user's left button held and a catcher here, the release goes
-    /// out over the strip: carrying the strip's drag, or waiting for a
-    /// late one (R48).
+    /// out over the strip carrying the strip's drag; or, with none there
+    /// yet, only if a drag began since the press (R48a), and then the
+    /// leave waits for a late drop. Otherwise the edge is a wall.
     fn push_out(&mut self, sid: u64, frac: f32) -> Vec<InjectEv> {
         let buttons_held = self.inj.buttons_held();
         let catching = self.catcher.is_some() && self.users_left_alone();
-        let Some(edge) = self.machine.entry_edge().filter(|_| catching) else {
-            let offer = None;
-            return self.feed(
-                sid,
-                MacEvent::PushOut {
-                    frac,
-                    buttons_held,
-                    offer,
-                },
-            );
+        let edge = self.machine.entry_edge().filter(|_| catching);
+        let wall = MacEvent::PushOut {
+            frac,
+            buttons_held,
+            offer: None,
         };
+        let (Some(edge), Some(c)) = (edge, self.catcher.as_mut()) else {
+            return self.feed(sid, wall);
+        };
+        let offer = c.push_out();
+        let late = offer.is_none() && c.drag_began();
+        if offer.is_none() && !late {
+            // A window drag or a text selection: it stays on the Mac.
+            return self.feed(sid, wall);
+        }
+        if late {
+            c.await_late();
+        }
         // Up before the release goes out, and a while after it.
         self.linger = Some((Instant::now() + self.late_wait, edge));
         self.update_zone(Instant::now());
-        let offer = self.catcher.as_mut().and_then(|c| c.push_out());
         if let Some(drag) = offer {
             info!(drag, "pushing out with the strip's drag");
             return self.feed(
@@ -728,7 +761,8 @@ impl<I: Inject, D: DragPort, C: CatchPort> Router<I, D, C> {
         }
         info!(
             ms = self.late_wait.as_millis() as u64,
-            "pushing out with the left button held: waiting for a late drag"
+            "pushing out with the left button held: a drag began that the strip hasn't seen; \
+             releasing and waiting for it"
         );
         self.feed(sid, MacEvent::PushOutLate { frac })
     }
@@ -1078,7 +1112,9 @@ pub(super) mod tests {
         CancelSource(DragId),
         // The catcher's calls.
         Zone(Option<Side>),
+        Pressed,
         CatchPushOut,
+        AwaitLate,
         EndLateWait(bool),
     }
 
@@ -2371,15 +2407,26 @@ pub(super) mod tests {
         offer: Option<DragId>,
         /// What dropped during the late wait: what `end_late_wait` gives.
         caught: Arc<Mutex<Option<DragId>>>,
+        /// What `drag_began` says: the drag pasteboard changed (R48a).
+        began: bool,
     }
 
     impl CatchPort for FakeCatcher {
         fn zone(&mut self, show: Option<Side>) {
             self.calls.lock().unwrap().push(Call::Zone(show));
         }
+        fn pressed(&mut self) {
+            self.calls.lock().unwrap().push(Call::Pressed);
+        }
+        fn drag_began(&mut self) -> bool {
+            self.began
+        }
         fn push_out(&mut self) -> Option<DragId> {
             self.calls.lock().unwrap().push(Call::CatchPushOut);
             self.offer
+        }
+        fn await_late(&mut self) {
+            self.calls.lock().unwrap().push(Call::AwaitLate);
         }
         fn end_late_wait(&mut self, carry: bool) -> Option<DragId> {
             self.calls.lock().unwrap().push(Call::EndLateWait(carry));
@@ -2393,9 +2440,15 @@ pub(super) mod tests {
     type CatchSetup = (Catching, Arc<Mutex<Vec<Call>>>, Arc<Mutex<Option<DragId>>>);
 
     /// Session 1 begun with a fake drag source and catcher; the cursor is
-    /// near the left edge and pushes out at 0.3. Returns the catcher's
-    /// `caught` slot.
+    /// near the left edge and pushes out at 0.3. A drag began since the
+    /// press (R48a). Returns the catcher's `caught` slot.
     fn begun_catching(offer: Option<DragId>) -> CatchSetup {
+        begun_catching_with(offer, true)
+    }
+
+    /// Like `begun_catching`; `began`: whether a drag began since the
+    /// press (the drag pasteboard changed).
+    fn begun_catching_with(offer: Option<DragId>, began: bool) -> CatchSetup {
         let (mut fake, calls) = Fake::new();
         fake.push_out = Some(0.3);
         fake.pos = (10.0, 200.0);
@@ -2404,6 +2457,7 @@ pub(super) mod tests {
             calls: calls.clone(),
             offer,
             caught: caught.clone(),
+            began,
         };
         let drags = FakeDrags::new(&calls);
         let mut r =
@@ -2415,7 +2469,11 @@ pub(super) mod tests {
     /// Controlled, with the user's left button down near the left edge:
     /// the strip is up; the calls so far are taken.
     fn dragging_near_the_edge(offer: Option<DragId>) -> CatchSetup {
-        let (mut r, calls, caught) = begun_catching(offer);
+        dragging_near_the_edge_with(offer, true)
+    }
+
+    fn dragging_near_the_edge_with(offer: Option<DragId>, began: bool) -> CatchSetup {
+        let (mut r, calls, caught) = begun_catching_with(offer, began);
         r.handle(input(1, enter(0.5)));
         r.handle(input(1, button(true)));
         assert_eq!(take(&calls).last(), Some(&Call::Zone(Some(Side::Left))));
@@ -2588,7 +2646,12 @@ pub(super) mod tests {
         );
         assert_eq!(
             take(&calls),
-            vec![Call::Motion(-9, 0), Call::CatchPushOut, Call::ReleaseAll],
+            vec![
+                Call::Motion(-9, 0),
+                Call::CatchPushOut,
+                Call::AwaitLate,
+                Call::ReleaseAll
+            ],
             "the release went out over the strip"
         );
         let due = r.next_tick().unwrap();
@@ -2683,7 +2746,12 @@ pub(super) mod tests {
         let c = take(&calls);
         assert_eq!(
             c,
-            vec![Call::Motion(-9, 0), Call::CatchPushOut, Call::ReleaseAll],
+            vec![
+                Call::Motion(-9, 0),
+                Call::CatchPushOut,
+                Call::AwaitLate,
+                Call::ReleaseAll
+            ],
             "nothing injected after the release"
         );
         assert!(r.next_tick().is_some(), "the leave is still due");
@@ -2743,5 +2811,118 @@ pub(super) mod tests {
         assert_eq!(r.handle(input(1, Input::Motion { dx: -9, dy: 0 })), vec![]);
         assert_eq!(take(&calls), vec![Call::Motion(-9, 0)]);
         assert_eq!(r.next_tick(), None);
+    }
+
+    #[test]
+    fn the_users_left_down_marks_the_drag_pasteboard() {
+        let (mut r, calls, _) = begun_catching(None);
+        r.inj.push_out = None;
+        r.handle(input(1, button(true)));
+        assert_eq!(take(&calls), vec![], "not controlled: nothing pressed");
+        r.handle(input(1, enter(0.5)));
+        take(&calls);
+        r.handle(input(1, button(true)));
+        assert_eq!(
+            take(&calls),
+            vec![LEFT_DOWN, Call::Pressed, Call::Zone(Some(Side::Left))]
+        );
+        r.handle(input(1, button(false)));
+        r.handle(input(
+            1,
+            Input::Button {
+                button: MouseButton::Right,
+                down: true,
+            },
+        ));
+        assert!(!take(&calls).contains(&Call::Pressed), "only the left one");
+    }
+
+    #[test]
+    fn left_held_push_out_without_drag_evidence_stays_a_wall() {
+        // A window drag or a text selection reaching the edge: no drag
+        // pasteboard change since the press.
+        let (mut r, calls, _) = dragging_near_the_edge_with(None, false);
+        assert_eq!(push(&mut r), vec![]);
+        assert_eq!(
+            take(&calls),
+            vec![Call::Motion(-9, 0), Call::CatchPushOut],
+            "no release, no late window"
+        );
+        assert_eq!(r.next_tick(), None, "no wait and no linger");
+        assert!(r.machine.controlled(), "still on the Mac");
+        assert!(r.inj.button_held(MouseButton::Left));
+        // The strip stays up while the drag goes on at the edge, and the
+        // drag carries on as before.
+        assert_eq!(r.zone, Some(Side::Left));
+        r.handle(input(1, button(false)));
+        assert_eq!(take(&calls), vec![LEFT_UP, Call::Zone(None)]);
+    }
+
+    #[test]
+    fn left_held_push_out_with_drag_evidence_waits_for_a_late_drop() {
+        let (mut r, calls, caught) = dragging_near_the_edge_with(None, true);
+        assert_eq!(
+            push(&mut r),
+            vec![InjectEv::Controlled { sid: 1, on: false }]
+        );
+        assert_eq!(
+            take(&calls),
+            vec![
+                Call::Motion(-9, 0),
+                Call::CatchPushOut,
+                Call::AwaitLate,
+                Call::ReleaseAll
+            ]
+        );
+        assert!(r.next_tick().is_some());
+        *caught.lock().unwrap() = Some(12);
+        assert_eq!(
+            r.handle(InjectMsg::LateDrop { drag: 12 }),
+            vec![InjectEv::SendLeave {
+                sid: 1,
+                frac: 0.3,
+                drag: Some(12)
+            }]
+        );
+    }
+
+    #[test]
+    fn drag_evidence_without_a_perform_in_time_leaves_without_a_drag() {
+        let (mut r, calls, _) = dragging_near_the_edge_with(None, true);
+        push(&mut r);
+        take(&calls);
+        let due = r.next_tick().unwrap();
+        assert_eq!(
+            r.tick(due),
+            vec![InjectEv::SendLeave {
+                sid: 1,
+                frac: 0.3,
+                drag: None
+            }]
+        );
+        assert_eq!(
+            take(&calls),
+            vec![Call::EndLateWait(true), Call::Zone(None)]
+        );
+    }
+
+    #[test]
+    fn an_offer_on_the_strip_is_evidence_enough() {
+        let (mut r, calls, _) = dragging_near_the_edge_with(Some(9), false);
+        assert_eq!(
+            push(&mut r),
+            vec![
+                InjectEv::SendLeave {
+                    sid: 1,
+                    frac: 0.3,
+                    drag: Some(9)
+                },
+                InjectEv::Controlled { sid: 1, on: false }
+            ]
+        );
+        assert_eq!(
+            take(&calls),
+            vec![Call::Motion(-9, 0), Call::CatchPushOut, Call::ReleaseAll]
+        );
     }
 }

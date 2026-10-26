@@ -13,11 +13,14 @@
 //!   source gives them before the drop (Chrome gives nil: name "").
 //! - `draggingExited:` emits `OfferGone`, unless a push-out carries it.
 //! - A push-out with only the left button held ([`CatchPort::push_out`],
-//!   just before cj-inject posts the release) either carries the strip's
-//!   drag (the release drops it there) or, with none there yet, opens the
-//!   late window (R48): a drag that starts only at the release (Chrome,
-//!   WhatsApp, under posted input) and drops on the strip before
-//!   [`CatchPort::end_late_wait`] is caught (`LateDrop`).
+//!   just before cj-inject posts the release) carries the strip's drag
+//!   (the release drops it there). With none there yet, it is a wall,
+//!   unless the drag pasteboard changed since the press
+//!   ([`CatchPort::drag_began`], R48a): a drag began that the strip hasn't
+//!   seen, such as Chrome's, which under posted input follows only from
+//!   the release. Then cj-inject posts the release and opens the late
+//!   window ([`CatchPort::await_late`]): a drag that drops on the strip
+//!   before [`CatchPort::end_late_wait`] is caught (`LateDrop`).
 //! - `performDragOperation:` takes only those two drops; any other drop on
 //!   the strip is refused (NO), so the drag ends without dropping. A taken
 //!   drop receives its promises into
@@ -39,8 +42,10 @@ use std::time::Duration;
 
 use cj_core::dnd::{DragId, DragItem, FailReason, ItemKind};
 use cj_core::proto::Side;
+use objc2::rc::autoreleasepool;
+use objc2_app_kit::{NSPasteboard, NSPasteboardNameDrag};
 use tokio::sync::watch;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::{MacDndEv, cache_dir, on_main};
 use crate::common::dnd_link::{Source, fresh_drag_id};
@@ -103,6 +108,18 @@ fn strip_frame(main: Rectf, edge: Side) -> Rectf {
     }
 }
 
+/// The drag pasteboard's change count: it moves when a drag session sets
+/// up its items, even one that doesn't follow posted input yet (spike run
+/// 19). NSPasteboard is not main-thread-only (the clipboard watcher reads
+/// the general one off-main too): a cheap call to the pasteboard server.
+fn drag_pasteboard_count() -> isize {
+    autoreleasepool(|_| {
+        // SAFETY: a static AppKit string.
+        let name = unsafe { NSPasteboardNameDrag };
+        NSPasteboard::pasteboardWithName(name).changeCount()
+    })
+}
+
 /// `~/Library/Caches/CursorJump/outgoing`: each caught drag's received
 /// promises are here, under its id (Task 17 sweeps it).
 pub fn outgoing_dir() -> PathBuf {
@@ -136,10 +153,12 @@ enum Dragged {
     File { path: PathBuf, facts: Option<Facts> },
     /// A file promise: `receiver` is its index among the pasteboard's
     /// promise receivers; `names` are the files it promises, None when
-    /// the source doesn't say before the drop.
+    /// the source doesn't say before the drop; `dirs`, one per promised
+    /// file type, whether it is `public.folder`.
     Promise {
         receiver: usize,
         names: Option<Vec<String>>,
+        dirs: Vec<bool>,
     },
 }
 
@@ -203,18 +222,34 @@ fn build_offer(dragged: Vec<Dragged>) -> Built {
                 });
                 b.sources.push(Source::Ready(path));
             }
-            Dragged::Promise { receiver, names } => {
+            Dragged::Promise {
+                receiver,
+                names,
+                dirs,
+            } => {
                 let names = names
                     .filter(|n| !n.is_empty())
                     .unwrap_or_else(|| vec![String::new()]);
+                let n = names.len();
+                // A type per file, or one type for them all.
+                let is_dir = |i: usize| match dirs.len() {
+                    len if len == n => dirs[i],
+                    1 => dirs[0],
+                    _ => false,
+                };
                 let files = names
                     .into_iter()
-                    .map(|name| {
+                    .enumerate()
+                    .map(|(i, name)| {
                         let (tx, rx) = watch::channel(None);
                         let item = b.items.len();
                         b.items.push(DragItem {
                             name: name.clone(),
-                            kind: ItemKind::File,
+                            kind: if is_dir(i) {
+                                ItemKind::Dir
+                            } else {
+                                ItemKind::File
+                            },
                             size: None,
                         });
                         b.sources.push(Source::Pending(rx));
@@ -321,10 +356,18 @@ struct Shared {
     /// The strip's drag, 0 for none: `Catcher::offer` reads it on any thread.
     offer: AtomicU64,
     state: Mutex<State>,
+    /// Reads the drag pasteboard's change count.
+    drag_count: Box<dyn Fn() -> isize + Send + Sync>,
+    /// The drag pasteboard's change count at the user's left-down.
+    count_at_press: Mutex<Option<isize>>,
 }
 
 impl Shared {
-    fn new(events: impl Fn(MacDndEv) + Send + Sync + 'static, root: PathBuf) -> Shared {
+    fn new(
+        events: impl Fn(MacDndEv) + Send + Sync + 'static,
+        root: PathBuf,
+        drag_count: impl Fn() -> isize + Send + Sync + 'static,
+    ) -> Shared {
         Shared {
             events: Box::new(events),
             root,
@@ -333,6 +376,8 @@ impl Shared {
                 gate: Gate::Closed,
                 catch: None,
             }),
+            drag_count: Box::new(drag_count),
+            count_at_press: Mutex::new(None),
         }
     }
 
@@ -439,16 +484,34 @@ impl Shared {
     /// See [`CatchPort::push_out`].
     fn push_out(&self) -> Option<DragId> {
         let mut st = self.lock();
-        match st.catch.as_ref().map(|c| c.drag) {
-            Some(drag) => {
-                st.gate = Gate::Carried(drag);
-                Some(drag)
-            }
-            None => {
-                st.gate = Gate::Open;
-                None
-            }
-        }
+        let drag = st.catch.as_ref().map(|c| c.drag)?;
+        st.gate = Gate::Carried(drag);
+        Some(drag)
+    }
+
+    /// See [`CatchPort::await_late`].
+    fn await_late(&self) {
+        self.lock().gate = Gate::Open;
+    }
+
+    /// See [`CatchPort::pressed`].
+    fn pressed(&self) {
+        let count = (self.drag_count)();
+        *self
+            .count_at_press
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(count);
+    }
+
+    /// See [`CatchPort::drag_began`]: false without a press.
+    fn drag_began(&self) -> bool {
+        let at_press = *self
+            .count_at_press
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let now = (self.drag_count)();
+        debug!(?at_press, now, "the drag pasteboard's change count");
+        at_press.is_some_and(|c| c != now)
     }
 
     /// See [`CatchPort::end_late_wait`].
@@ -486,7 +549,7 @@ impl Catcher {
     /// `events` gets the catcher's events, on any thread (the main thread
     /// and the promise queue); it must not block, nor call the catcher.
     pub fn new(events: impl Fn(MacDndEv) + Send + Sync + 'static) -> Catcher {
-        let shared = Arc::new(Shared::new(events, outgoing_dir()));
+        let shared = Arc::new(Shared::new(events, outgoing_dir(), drag_pasteboard_count));
         // Made and drawn once, now, so that showing it is instant.
         let made = shared.clone();
         on_main(move |mtm| appkit::make(mtm, &made));
@@ -510,8 +573,17 @@ impl CatchPort for Catcher {
     fn zone(&mut self, show: Option<Side>) {
         Catcher::zone(self, show);
     }
+    fn pressed(&mut self) {
+        self.shared.pressed();
+    }
+    fn drag_began(&mut self) -> bool {
+        self.shared.drag_began()
+    }
     fn push_out(&mut self) -> Option<DragId> {
         self.shared.push_out()
+    }
+    fn await_late(&mut self) {
+        self.shared.await_late();
     }
     fn end_late_wait(&mut self, carry: bool) -> Option<DragId> {
         self.shared.end_late_wait(carry)
@@ -521,6 +593,7 @@ impl CatchPort for Catcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicIsize;
 
     const MBP: Rectf = Rectf {
         x: 0.0,
@@ -570,9 +643,14 @@ mod tests {
     }
 
     fn promise(receiver: usize, names: Option<&[&str]>) -> Dragged {
+        promise_of(receiver, names, &[])
+    }
+
+    fn promise_of(receiver: usize, names: Option<&[&str]>, dirs: &[bool]) -> Dragged {
         Dragged::Promise {
             receiver,
             names: names.map(|n| n.iter().map(|s| s.to_string()).collect()),
+            dirs: dirs.to_vec(),
         }
     }
 
@@ -660,6 +738,14 @@ mod tests {
 
     /// A catcher's shared state that records its events.
     fn shared() -> (Shared, Arc<Mutex<Vec<String>>>) {
+        let (s, log, _) = shared_counting();
+        (s, log)
+    }
+
+    /// Also returns the fake drag pasteboard's change count.
+    fn shared_counting() -> (Shared, Arc<Mutex<Vec<String>>>, Arc<AtomicIsize>) {
+        let count = Arc::new(AtomicIsize::new(40));
+        let c = count.clone();
         let log = Arc::new(Mutex::new(Vec::new()));
         let l = log.clone();
         let s = Shared::new(
@@ -673,8 +759,9 @@ mod tests {
                 l.lock().unwrap().push(line);
             },
             "/out".into(),
+            move || c.load(Ordering::SeqCst),
         );
-        (s, log)
+        (s, log, count)
     }
 
     fn events(log: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
@@ -745,9 +832,45 @@ mod tests {
     }
 
     #[test]
+    fn a_push_out_without_an_offer_opens_nothing_by_itself() {
+        let (s, log) = shared();
+        assert_eq!(s.push_out(), None, "nothing on the strip");
+        s.entered(4, photo()).unwrap();
+        assert!(s.perform(4).is_none(), "a wall: no late window");
+        assert_eq!(events(&log), ["Offer(1)", "OfferGone"]);
+    }
+
+    #[test]
+    fn a_drag_began_when_the_drag_pasteboard_changed_since_the_press() {
+        let (s, _, count) = shared_counting();
+        assert!(!s.drag_began(), "no press yet");
+        s.pressed();
+        assert!(!s.drag_began(), "a window drag or a text selection");
+        count.fetch_add(1, Ordering::SeqCst);
+        assert!(s.drag_began(), "a drag session set up its items");
+        s.pressed();
+        assert!(!s.drag_began(), "the next press starts afresh");
+    }
+
+    #[test]
+    fn promised_folders_are_dirs() {
+        let b = build_offer(vec![
+            promise_of(0, Some(&["Photos"]), &[true]),
+            promise_of(1, Some(&["a", "b"]), &[false, true]),
+            promise_of(2, None, &[true]),
+            promise_of(3, Some(&["c", "d"]), &[true]),
+            promise_of(4, Some(&["e", "f"]), &[true, false, true]),
+        ]);
+        let kinds: Vec<ItemKind> = b.items.iter().map(|i| i.kind).collect();
+        use ItemKind::{Dir, File};
+        assert_eq!(kinds, [Dir, File, Dir, Dir, Dir, Dir, File, File]);
+    }
+
+    #[test]
     fn a_late_drop_within_the_wait_is_caught() {
         let (s, log) = shared();
         assert_eq!(s.push_out(), None, "nothing on the strip yet");
+        s.await_late();
         let drag = s.entered(4, photo()).unwrap();
         assert_eq!(s.perform(4).map(|(d, _)| d), Some(drag));
         assert_eq!(events(&log), ["Offer(1)", "LateDrop"]);
@@ -759,7 +882,7 @@ mod tests {
     #[test]
     fn a_late_drop_after_the_wait_is_refused() {
         let (s, log) = shared();
-        s.push_out();
+        s.await_late();
         assert_eq!(s.end_late_wait(true), None);
         s.entered(4, photo()).unwrap();
         assert!(s.perform(4).is_none());
@@ -769,7 +892,7 @@ mod tests {
     #[test]
     fn a_caught_drag_no_leave_carries_is_withdrawn() {
         let (s, log) = shared();
-        s.push_out();
+        s.await_late();
         let drag = s.entered(4, photo()).unwrap();
         s.perform(4).unwrap();
         events(&log);
