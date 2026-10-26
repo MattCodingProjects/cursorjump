@@ -32,11 +32,13 @@ use windows::Win32::System::Ole::{
 };
 use windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS;
 use windows::Win32::UI::Shell::{
-    CFSTR_FILECONTENTS, CFSTR_FILEDESCRIPTORW, CFSTR_INETURLW, DragQueryFileW, FD_ATTRIBUTES,
-    FD_FILESIZE, FILEDESCRIPTORW, HDROP, IDropTargetHelper,
+    CFSTR_DROPDESCRIPTION, CFSTR_FILECONTENTS, CFSTR_FILEDESCRIPTORW, CFSTR_INETURLW,
+    DROPDESCRIPTION, DROPIMAGETYPE, DragQueryFileW, FD_ATTRIBUTES, FD_FILESIZE, FILEDESCRIPTORW,
+    HDROP, IDropTargetHelper,
 };
 use windows::core::{HSTRING, Ref, implement};
 
+use super::source::{hglobal_from, hglobal_medium};
 use super::{OutState, WinDndEv, with_out};
 use crate::common::dnd_link::Source;
 use crate::common::link_fetch::{LINK_MAX_BYTES, LinkError, fetch_link, shortcut_url, url_host};
@@ -165,6 +167,7 @@ struct Formats {
     contents: u16,
     url: u16,
     self_fmt: u16,
+    description: u16,
 }
 
 fn formats() -> &'static Formats {
@@ -176,10 +179,44 @@ fn formats() -> &'static Formats {
             descriptor: reg(CFSTR_FILEDESCRIPTORW),
             contents: reg(CFSTR_FILECONTENTS),
             url: reg(CFSTR_INETURLW),
+            description: reg(CFSTR_DROPDESCRIPTION),
             // SAFETY: as above; the HSTRING outlives the call.
             self_fmt: unsafe { RegisterClipboardFormatW(&HSTRING::from(SELF_FORMAT)) } as u16,
         }
     })
+}
+
+/// Set the drop description on a drag's data object, as a drop target may
+/// (the shell's drag image shows it under the image; with one set, a
+/// source using the drag image manager shows a plain arrow cursor instead
+/// of OLE's copy cursor). `DROPIMAGE_NOIMAGE` with no text: no badge and
+/// no words. `DROPIMAGE_INVALID`: none set, so the defaults come back.
+pub(super) fn set_drop_description(
+    data: &IDataObject,
+    kind: DROPIMAGETYPE,
+) -> windows::core::Result<()> {
+    let desc = DROPDESCRIPTION {
+        r#type: kind,
+        ..Default::default()
+    };
+    // SAFETY: a plain repr(C) struct viewed as bytes.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            (&desc as *const DROPDESCRIPTION).cast::<u8>(),
+            size_of::<DROPDESCRIPTION>(),
+        )
+    };
+    let h = hglobal_from(bytes)?;
+    let f = formatetc(formats().description, TYMED_HGLOBAL, -1);
+    // SAFETY: with fRelease the data object owns the block once it says
+    // yes; on a refusal it is still ours, freed below.
+    unsafe {
+        let r = data.SetData(&f, &hglobal_medium(h), true);
+        if r.is_err() {
+            let _ = windows::Win32::Foundation::GlobalFree(Some(h));
+        }
+        r
+    }
 }
 
 /// [`SELF_FORMAT`], registered.
@@ -698,7 +735,7 @@ impl IDropTarget_Impl for Target_Impl {
         let data = pdataobj.ok().ok();
         // Read before taking the state: GetData may pump messages.
         let offered = data.and_then(read_offer);
-        let effect = with_out(|s| s.enter(offered, allowed)).unwrap_or(DROPEFFECT_NONE);
+        let effect = with_out(|s| s.enter(offered, allowed, data)).unwrap_or(DROPEFFECT_NONE);
         // SAFETY: as above.
         unsafe { *pdweffect = effect };
         if let (Some(h), Some(data)) = (helper(), data) {
@@ -716,12 +753,19 @@ impl IDropTarget_Impl for Target_Impl {
     ) -> windows::core::Result<()> {
         // SAFETY: OLE passes a valid in/out effect pointer.
         let allowed = unsafe { *pdweffect };
-        let effect = with_out(|s| s.over(allowed)).unwrap_or(DROPEFFECT_NONE);
+        let (effect, held) =
+            with_out(|s| (s.over(allowed), s.image_held())).unwrap_or((DROPEFFECT_NONE, false));
         // SAFETY: as above.
         unsafe { *pdweffect = effect };
         if let Some(h) = helper() {
-            // SAFETY: plain helper call.
-            let _ = unsafe { h.DragOver(&POINT { x: pt.x, y: pt.y }, effect) };
+            // While the image is held hidden the helper isn't told of the
+            // move (that could show it again); the hiding is asked again.
+            // SAFETY: plain helper calls.
+            let _ = if held {
+                unsafe { h.Show(false) }
+            } else {
+                unsafe { h.DragOver(&POINT { x: pt.x, y: pt.y }, effect) }
+            };
         }
         Ok(())
     }

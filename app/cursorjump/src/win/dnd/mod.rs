@@ -66,7 +66,7 @@ mod source;
 use std::cell::{Cell, RefCell};
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
@@ -83,7 +83,7 @@ use windows::Win32::Foundation::{
 use windows::Win32::Graphics::Gdi::{
     BLACK_BRUSH, GetStockObject, HBRUSH, MONITOR_DEFAULTTONEAREST, MonitorFromPoint,
 };
-use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
+use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, IDataObject};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Ole::{
     DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_NONE, IDropTarget, OleInitialize, OleUninitialize,
@@ -91,7 +91,9 @@ use windows::Win32::System::Ole::{
 };
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
-use windows::Win32::UI::Shell::{CLSID_DragDropHelper, IDropTargetHelper};
+use windows::Win32::UI::Shell::{
+    CLSID_DragDropHelper, DROPIMAGE_INVALID, DROPIMAGE_NOIMAGE, IDropTargetHelper,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, HWND_TOPMOST,
     IDC_ARROW, KillTimer, LWA_ALPHA, LoadCursorW, MA_NOACTIVATE, MSG, PostMessageW,
@@ -828,6 +830,98 @@ impl Win {
     }
 }
 
+/// How the catcher hides the drag while it rides on the Mac, so no frozen
+/// file image, "+ Copy" badge or copy cursor sits at the PC's park point.
+/// Explorer draws its image as a layered window that the shell's drag image
+/// manager moves itself, which `IDropTargetHelper::Show(false)` alone was
+/// seen not to hide. Nothing here touches another process's windows: a
+/// drop target may tell the helper to hide the image, and may set a drop
+/// description on the data object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImageMode {
+    /// Leave the image alone (for comparison).
+    Show,
+    /// `Show(false)`, asked again on every `DragOver`, and the helper not
+    /// told of moves while it rides (which could show the image again).
+    NoDesc,
+    /// As `NoDesc`, plus a drop description with no image and no text: no
+    /// badge, and the source's plain arrow cursor instead of OLE's copy
+    /// cursor. The arrow is one of the system cursors phase 1 blanks while
+    /// the cursor is on the Mac.
+    DescNoImage,
+}
+
+/// The app always uses `DescNoImage`; the smoke can pick another.
+static IMAGE_MODE: AtomicU8 = AtomicU8::new(ImageMode::DescNoImage as u8);
+
+impl ImageMode {
+    fn current() -> ImageMode {
+        match IMAGE_MODE.load(Ordering::Relaxed) {
+            0 => ImageMode::Show,
+            1 => ImageMode::NoDesc,
+            _ => ImageMode::DescNoImage,
+        }
+    }
+}
+
+/// A change to the drag image, made once the state is no longer borrowed:
+/// `SetData` is a call into the source's process, which pumps this
+/// thread's messages, and a `DragOver` arriving meanwhile must find the
+/// state free (or it would answer NONE).
+struct ImageJob {
+    hide: bool,
+    mode: ImageMode,
+    helper: Option<IDropTargetHelper>,
+    data: Option<IDataObject>,
+}
+
+impl ImageJob {
+    fn run(self) {
+        let ImageJob {
+            hide,
+            mode,
+            helper,
+            data,
+        } = self;
+        if mode == ImageMode::Show {
+            return;
+        }
+        if mode == ImageMode::DescNoImage
+            && let Some(data) = &data
+        {
+            let kind = if hide {
+                DROPIMAGE_NOIMAGE
+            } else {
+                DROPIMAGE_INVALID
+            };
+            let r = catcher::set_drop_description(data, kind);
+            info!(hidden = hide, result = ?r, "catcher: drop description");
+        }
+        let Some(h) = helper else {
+            return;
+        };
+        if hide
+            && mode == ImageMode::DescNoImage
+            && let Some(at) = cursor_pos()
+        {
+            // The image manager reads the description on a DragOver.
+            // SAFETY: plain helper call on this thread.
+            let _ = unsafe { h.DragOver(&POINT { x: at.0, y: at.1 }, DROPEFFECT_COPY) };
+        }
+        // SAFETY: plain helper call on this thread.
+        let r = unsafe { h.Show(!hide) };
+        info!(hidden = hide, ?mode, result = ?r, "catcher: drag image (IDropTargetHelper::Show)");
+    }
+}
+
+fn cursor_pos() -> Option<(i32, i32)> {
+    let mut pt = POINT::default();
+    // SAFETY: valid out-pointer to a stack local.
+    unsafe { windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut pt) }
+        .ok()
+        .map(|()| (pt.x, pt.y))
+}
+
 /// cj-dnd-out's state.
 struct OutState {
     shared: Arc<DndShared>,
@@ -839,8 +933,12 @@ struct OutState {
     modes: OutModes,
     /// The offer's virtual items, written out in `Drop`.
     pending: Vec<Pending>,
-    /// Whether `IDropTargetHelper::Show(false)` is in force.
+    /// The offer's data object, for its drop description.
+    data: Option<IDataObject>,
+    /// Whether the drag image is hidden (see `ImageMode`).
     image_hidden: bool,
+    /// Made by `set_image_hidden`, run by `with_out` once the state is free.
+    image_job: Option<ImageJob>,
     stuck_timer: bool,
     /// Since when the left button has been up with the catcher over the screen.
     up_since: Option<Instant>,
@@ -862,10 +960,15 @@ thread_local! {
 /// Run `f` on cj-dnd-out's state. `None` on another thread, or if the state
 /// is already borrowed: a call made while it is busy gets default handling.
 fn with_out<R>(f: impl FnOnce(&mut OutState) -> R) -> Option<R> {
-    OUT.with(|cell| {
+    let r = OUT.with(|cell| {
         let mut guard = cell.try_borrow_mut().ok()?;
         guard.as_mut().map(f)
-    })
+    })?;
+    // Outside the borrow, so the state is free while they run.
+    while let Some(job) = OUT.with(|cell| cell.try_borrow_mut().ok()?.as_mut()?.image_job.take()) {
+        job.run();
+    }
+    Some(r)
 }
 
 /// Run this thread's queued commands. While its state is busy (a modal
@@ -1010,7 +1113,9 @@ impl OutState {
             helper: None,
             modes: OutModes::default(),
             pending: Vec::new(),
+            data: None,
             image_hidden: false,
+            image_job: None,
             stuck_timer: false,
             up_since: None,
         };
@@ -1087,6 +1192,10 @@ impl OutState {
         }
         self.set_image_hidden(self.modes.image_hidden());
         self.set_stuck_timer(parked);
+        // Kept until here, so an unhide just made can clear its description.
+        if self.shared.offer.load(Ordering::Acquire) == 0 {
+            self.data = None;
+        }
     }
 
     /// The shield (cj-dnd-in) goes while the catcher covers the screen, and
@@ -1114,11 +1223,17 @@ impl OutState {
             return;
         }
         self.image_hidden = hide;
-        if let Some(h) = &self.helper {
-            // SAFETY: plain helper call on this thread.
-            let r = unsafe { h.Show(!hide) };
-            info!(hidden = hide, result = ?r, "catcher: drag image (IDropTargetHelper::Show)");
-        }
+        self.image_job = Some(ImageJob {
+            hide,
+            mode: ImageMode::current(),
+            helper: self.helper.clone(),
+            data: self.data.clone(),
+        });
+    }
+
+    /// The image is held hidden: `DragOver` doesn't tell the helper of moves.
+    fn image_held(&self) -> bool {
+        self.image_hidden && ImageMode::current() != ImageMode::Show
     }
 
     fn set_stuck_timer(&mut self, on: bool) {
@@ -1165,7 +1280,12 @@ impl OutState {
 
     // ------------------------------------------------ IDropTarget decisions
 
-    fn enter(&mut self, offered: Option<Offered>, allowed: DROPEFFECT) -> DROPEFFECT {
+    fn enter(
+        &mut self,
+        offered: Option<Offered>,
+        allowed: DROPEFFECT,
+        data: Option<&IDataObject>,
+    ) -> DROPEFFECT {
         let copy = allowed.0 & DROPEFFECT_COPY.0 != 0;
         if offered.is_some() && !copy {
             debug!("catcher: the source doesn't allow a copy; refused");
@@ -1180,6 +1300,7 @@ impl OutState {
         let (items, sources, pending) = into_offer(offered);
         info!(drag, ?items, "catcher: offer");
         self.pending = pending;
+        self.data = data.cloned();
         self.shared.offer.store(drag, Ordering::Release);
         self.emit(WinDndEv::Offer {
             drag,
@@ -2051,6 +2172,66 @@ mod tests {
         );
     }
 
+    /// Top-level windows whose class names a drag image, and whether each
+    /// is visible. Read only: nothing is done to them.
+    fn drag_windows() -> Vec<String> {
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            EnumWindows, GetClassNameW, GetWindowRect, IsWindowVisible,
+        };
+        use windows::core::BOOL;
+        unsafe extern "system" fn each(hwnd: HWND, out: LPARAM) -> BOOL {
+            // SAFETY: `out` is the Vec passed to EnumWindows below, which
+            // outlives the synchronous enumeration; the rest are plain
+            // read-only queries.
+            unsafe {
+                let out = &mut *(out.0 as *mut Vec<String>);
+                let mut class = [0u16; 64];
+                let n = GetClassNameW(hwnd, &mut class) as usize;
+                let class = String::from_utf16_lossy(&class[..n]);
+                if class.contains("Drag") {
+                    let mut r = RECT::default();
+                    let _ = GetWindowRect(hwnd, &mut r);
+                    out.push(format!(
+                        "{class} visible={} at ({}, {}) {}x{}",
+                        IsWindowVisible(hwnd).as_bool(),
+                        r.left,
+                        r.top,
+                        r.right - r.left,
+                        r.bottom - r.top
+                    ));
+                }
+            }
+            true.into()
+        }
+        let mut out: Vec<String> = Vec::new();
+        // SAFETY: the callback only touches `out` through the pointer passed.
+        let _ = unsafe { EnumWindows(Some(each), LPARAM(&mut out as *mut Vec<String> as isize)) };
+        out
+    }
+
+    #[test]
+    fn the_smokes_window_and_cursor_reports_run() {
+        // Read-only; with no drag going on there are usually no drag windows.
+        let windows = drag_windows();
+        assert!(windows.iter().all(|w| w.contains("Drag")), "{windows:?}");
+        let _ = cursor_is_arrow();
+    }
+
+    /// Whether the cursor shown now is the system arrow.
+    fn cursor_is_arrow() -> bool {
+        use windows::Win32::UI::WindowsAndMessaging::{CURSORINFO, GetCursorInfo};
+        let mut info = CURSORINFO {
+            cbSize: size_of::<CURSORINFO>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: plain read-only queries.
+        unsafe {
+            GetCursorInfo(&mut info).is_ok()
+                && LoadCursorW(None, IDC_ARROW).is_ok_and(|arrow| arrow == info.hCursor)
+        }
+    }
+
     /// cj-dnd alone (the app isn't running), with a session marked up and
     /// the strip shown at the right edge of the primary monitor for the
     /// whole run. Drag files from Explorer (or a zip, Discord, an Outlook
@@ -2068,6 +2249,13 @@ mod tests {
     /// - `home`: parks, then sends it home after 1 s: the drag goes on locally.
     ///
     /// `CJ_SMOKE_SECS` (default 60) sets how long it runs.
+    ///
+    /// `CJ_SMOKE_IMAGE` picks how a riding drag's image is hidden (see
+    /// `ImageMode`): `show` (not at all), `nodesc`, or `desc-noimage` (the
+    /// default, as in the app). Every second while parked it prints, read
+    /// only, the shell's drag windows (class names with "Drag" in them, such
+    /// as SysDragImage) and whether each is visible, and whether the cursor
+    /// is the plain arrow (which the app blanks while on the Mac).
     #[test]
     #[ignore = "needs a person to drag files"]
     fn smoke_catcher_logs_offer() {
@@ -2086,6 +2274,12 @@ mod tests {
             )
         };
         let mode = std::env::var("CJ_SMOKE_MODE").unwrap_or_default();
+        let image = match std::env::var("CJ_SMOKE_IMAGE").as_deref() {
+            Ok("show") => ImageMode::Show,
+            Ok("nodesc") => ImageMode::NoDesc,
+            _ => ImageMode::DescNoImage,
+        };
+        IMAGE_MODE.store(image as u8, Ordering::Relaxed);
         let secs = std::env::var("CJ_SMOKE_SECS")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -2100,13 +2294,26 @@ mod tests {
         let send = |cmd: DndCmd| cmds.send(cmd).expect("dnd thread alive");
         send(DndCmd::CatcherZone(true));
         eprintln!(
-            "smoke: mode {:?}, {secs} s; drag files to the right edge of the primary monitor",
+            "smoke: mode {:?}, image {image:?}, {secs} s; drag files to the right edge of the primary monitor",
             if mode.is_empty() { "offers" } else { &mode }
         );
         let deadline = Instant::now() + Duration::from_secs(secs);
         let mut sources: HashMap<DragId, Vec<Source>> = HashMap::new();
         let mut later: Option<(Instant, DndCmd)> = None;
+        let mut next_report = Instant::now();
         while Instant::now() < deadline {
+            if shared.parked.load(Ordering::Acquire) && Instant::now() >= next_report {
+                next_report = Instant::now() + Duration::from_secs(1);
+                eprintln!(
+                    "smoke: parked, image {image:?}; cursor is {}; drag windows: {:?}",
+                    if cursor_is_arrow() {
+                        "the arrow"
+                    } else {
+                        "not the arrow"
+                    },
+                    drag_windows()
+                );
+            }
             if let Some((at, _)) = &later
                 && Instant::now() >= *at
                 && let Some((_, cmd)) = later.take()

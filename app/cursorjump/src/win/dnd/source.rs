@@ -541,7 +541,7 @@ fn remove_all(base: &Path, slots: &[Slot]) {
 
 // ---------------------------------------------------------------- media
 
-fn hglobal_from(bytes: &[u8]) -> windows::core::Result<HGLOBAL> {
+pub(super) fn hglobal_from(bytes: &[u8]) -> windows::core::Result<HGLOBAL> {
     // SAFETY: a fresh movable block, locked only for the copy.
     unsafe {
         let h = GlobalAlloc(GMEM_MOVEABLE, bytes.len().max(1))?;
@@ -557,7 +557,7 @@ fn hglobal_from(bytes: &[u8]) -> windows::core::Result<HGLOBAL> {
     }
 }
 
-fn hglobal_medium(h: HGLOBAL) -> STGMEDIUM {
+pub(super) fn hglobal_medium(h: HGLOBAL) -> STGMEDIUM {
     STGMEDIUM {
         tymed: TYMED_HGLOBAL.0 as u32,
         u: STGMEDIUM_0 { hGlobal: h },
@@ -1406,6 +1406,56 @@ mod tests {
         incoming.ended(false);
         assert!(!tmp.path().join("11").exists());
         assert_eq!(incoming.hdrop_paths(), Err(E_FAIL));
+    }
+
+    #[test]
+    fn the_catchers_drop_description_is_what_the_shell_reads() {
+        use windows::Win32::System::Com::{DVASPECT_CONTENT, TYMED_HGLOBAL};
+        use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
+        use windows::Win32::UI::Shell::{
+            CFSTR_DROPDESCRIPTION, DROPDESCRIPTION, DROPIMAGE_INVALID, DROPIMAGE_NOIMAGE,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let incoming = Incoming::create(
+            13,
+            tmp.path().join("13"),
+            &[item("a.txt", ItemKind::File)],
+            emitter().0,
+        )
+        .unwrap();
+        // Our own data object keeps any SetData, as a shell one does.
+        let data: IDataObject = DataObject::new(incoming).into();
+        let read = || {
+            // SAFETY: registering a name; then plain COM calls on our own
+            // object, the medium read while it is held and released after.
+            unsafe {
+                let f = FORMATETC {
+                    cfFormat: RegisterClipboardFormatW(CFSTR_DROPDESCRIPTION) as u16,
+                    ptd: std::ptr::null_mut(),
+                    dwAspect: DVASPECT_CONTENT.0,
+                    lindex: -1,
+                    tymed: TYMED_HGLOBAL.0 as u32,
+                };
+                let mut m = data.GetData(&f).unwrap();
+                let h = m.u.hGlobal;
+                assert_eq!(GlobalSize(h), size_of::<DROPDESCRIPTION>());
+                let p = GlobalLock(h).cast::<DROPDESCRIPTION>();
+                let d = std::ptr::read_unaligned(p);
+                let _ = GlobalUnlock(h);
+                windows::Win32::System::Ole::ReleaseStgMedium(&mut m);
+                d
+            }
+        };
+        super::super::catcher::set_drop_description(&data, DROPIMAGE_NOIMAGE).unwrap();
+        // Packed: copy the fields out before looking at them.
+        let d = read();
+        let (kind, message, insert) = (d.r#type, d.szMessage, d.szInsert);
+        assert_eq!(kind, DROPIMAGE_NOIMAGE);
+        assert!(message.iter().all(|&c| c == 0), "no words");
+        assert!(insert.iter().all(|&c| c == 0));
+        super::super::catcher::set_drop_description(&data, DROPIMAGE_INVALID).unwrap();
+        let kind = read().r#type;
+        assert_eq!(kind, DROPIMAGE_INVALID);
     }
 
     #[test]
