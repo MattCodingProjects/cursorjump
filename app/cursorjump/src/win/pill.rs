@@ -19,7 +19,8 @@
 //!   no timeout at all when nothing is showing or due.
 //! - While held (a game has the mouse) the board shows nothing, so every
 //!   window is destroyed at once; they come back on release.
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
@@ -35,9 +36,9 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLACK_BRUSH, BLENDFUNCTION,
-    CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetMonitorInfoW,
-    GetStockObject, HBITMAP, HBRUSH, HDC, HGDIOBJ, MONITOR_DEFAULTTONEAREST, MONITORINFO,
-    MonitorFromPoint, SelectObject,
+    CreateCompatibleDC, CreateDIBSection, CreateRoundRectRgn, DIB_RGB_COLORS, DeleteDC,
+    DeleteObject, GetMonitorInfoW, GetStockObject, HBITMAP, HBRUSH, HDC, HGDIOBJ,
+    MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint, SelectObject, SetWindowRgn,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{
@@ -49,11 +50,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, Tr
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, IDC_ARROW, LWA_ALPHA,
     LoadCursorW, MA_NOACTIVATE, MSG, MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx, PM_NOREMOVE,
-    PM_REMOVE, PeekMessageW, PostThreadMessageW, QS_ALLINPUT, RegisterClassExW, SW_HIDE,
-    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SetLayeredWindowAttributes,
-    SetWindowPos, ShowWindow, ULW_ALPHA, UpdateLayeredWindow, WINDOW_EX_STYLE, WM_APP,
-    WM_LBUTTONDOWN, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_QUIT, WNDCLASSEXW, WS_EX_LAYERED,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    PM_REMOVE, PeekMessageW, PostThreadMessageW, QS_ALLINPUT, RegisterClassExW, SPI_SETWORKAREA,
+    SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW,
+    SetLayeredWindowAttributes, SetWindowPos, ShowWindow, ULW_ALPHA, UpdateLayeredWindow,
+    WINDOW_EX_STYLE, WM_APP, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_LBUTTONDOWN, WM_MOUSEACTIVATE,
+    WM_MOUSEMOVE, WM_QUIT, WM_SETTINGCHANGE, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::{PCWSTR, w};
 
@@ -90,8 +92,13 @@ pub enum PillCmd {
     Held(bool),
 }
 
-/// Start the pill thread. `on_cancel` runs on it when a running pill's ✕ is
-/// clicked. Dropping every `Sender` stops the thread and closes its windows.
+/// Start the pill thread. Dropping every `Sender` stops the thread and
+/// closes its windows.
+///
+/// `on_cancel` runs on the pill thread, inside its window procedure, when a
+/// running pill's ✕ is clicked. It must not block (the pills freeze until it
+/// returns) and must not hold a clone of the returned `Sender` (the thread
+/// would then never stop). A panic in it is caught and logged.
 pub fn spawn_pill_thread(
     on_cancel: impl Fn(DragId) + Send + 'static,
 ) -> Result<mpsc::Sender<PillCmd>> {
@@ -126,9 +133,11 @@ fn relay(from: mpsc::Receiver<PillCmd>, to: mpsc::Sender<PillCmd>, pending: &Ato
         if to.send(cmd).is_err() {
             return; // The pill thread is gone.
         }
-        if !pending.swap(true, Ordering::AcqRel) && !wake(tid) {
+        // SeqCst against the thread's swap: either it sees this command in its
+        // drain, or this swap sees its `false` and posts a wake.
+        if !pending.swap(true, Ordering::SeqCst) && !wake(tid) {
             // The next command (or frame) picks this one up.
-            pending.store(false, Ordering::Release);
+            pending.store(false, Ordering::SeqCst);
         }
     }
     drop(to);
@@ -207,6 +216,14 @@ impl Dib {
         }
         // SAFETY: both are live and ours; `Drop` selects `old` back.
         let old = unsafe { SelectObject(dc, bitmap.into()) };
+        if old.is_invalid() {
+            // SAFETY: both were created above; the bitmap is not selected.
+            unsafe {
+                let _ = DeleteDC(dc);
+                let _ = DeleteObject(bitmap.into());
+            }
+            return Err(anyhow!("SelectObject failed"));
+        }
         Ok(Dib {
             dc,
             bitmap,
@@ -247,6 +264,8 @@ struct PillWin {
     shown: Option<Shown>,
     /// Where the input window is, or `None` while it is hidden.
     input_at: Option<(i32, i32, i32, i32)>,
+    /// The size the input window's capsule region was made for.
+    region: Option<(i32, i32)>,
     /// A failed draw is logged once per pill.
     warned: bool,
 }
@@ -271,6 +290,7 @@ impl PillWin {
             hover: false,
             shown: None,
             input_at: None,
+            region: None,
             warned: false,
         };
         // Alpha 1: never seen, but it takes the mouse over the body. On
@@ -341,6 +361,11 @@ impl PillWin {
         if input_at != self.input_at {
             match input_at {
                 Some((x, y, w, h)) => {
+                    // Clipped before it is shown, so it never takes a corner click.
+                    if self.region != Some((w, h)) {
+                        set_capsule_region(self.input, w, h)?;
+                        self.region = Some((w, h));
+                    }
                     // SAFETY: moves and shows our own window without activating it.
                     unsafe {
                         SetWindowPos(
@@ -376,6 +401,23 @@ impl Drop for PillWin {
             let _ = DestroyWindow(self.paint);
         }
     }
+}
+
+/// Clip a `w` x `h` input window to the pill's capsule (corner radius h / 2),
+/// so the corners outside the outline take no clicks.
+fn set_capsule_region(hwnd: HWND, w: i32, h: i32) -> Result<()> {
+    // SAFETY: a new region, which the system owns once SetWindowRgn takes it.
+    unsafe {
+        let rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, h, h);
+        if rgn.is_invalid() {
+            return Err(anyhow!("CreateRoundRectRgn failed"));
+        }
+        if SetWindowRgn(hwnd, Some(rgn), true) == 0 {
+            let _ = DeleteObject(rgn.into());
+            return Err(anyhow!("SetWindowRgn failed"));
+        }
+    }
+    Ok(())
 }
 
 fn create_window(hinst: HINSTANCE, ex: WINDOW_EX_STYLE) -> windows::core::Result<HWND> {
@@ -464,6 +506,12 @@ struct State {
     /// In no particular order; matched to the views by drag.
     wins: Vec<PillWin>,
     held: bool,
+    schedule: Schedule,
+}
+
+/// When the windows are next redrawn.
+#[derive(Debug, Default)]
+struct Schedule {
     /// Something changed that the windows don't show yet.
     dirty: bool,
     last_draw: Option<Instant>,
@@ -472,8 +520,25 @@ struct State {
     next_frame: Option<Instant>,
 }
 
+impl Schedule {
+    /// The windows now show `board` as of `now`.
+    fn drawn(&mut self, board: &PillBoard, now: Instant) {
+        self.dirty = false;
+        self.last_draw = Some(now);
+        self.next_frame = board.next_frame(now);
+    }
+
+    /// When the next redraw is due; `None` sleeps until a message comes.
+    fn due(&self, now: Instant) -> Option<Instant> {
+        redraw_at(now, self.dirty, self.next_frame, self.last_draw)
+    }
+}
+
 thread_local! {
     static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
+    /// Set by the window procedure when monitors, DPI or the work area
+    /// change; the loop then redraws, which moves every pill.
+    static LAYOUT_STALE: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Run `f` on the thread state. `None` if it is absent or already borrowed:
@@ -510,9 +575,7 @@ fn run(
             anchors: Vec::new(),
             wins: Vec::new(),
             held: false,
-            dirty: false,
-            last_draw: None,
-            next_frame: None,
+            schedule: Schedule::default(),
         })
     });
     // SAFETY: plain FFI call.
@@ -536,10 +599,15 @@ fn message_loop(cmds: &mpsc::Receiver<PillCmd>, pending: &AtomicBool) {
             }
             if msg.hwnd.is_invalid() && msg.message == WM_APP {
                 // Cleared before the drain below, so a later command posts again.
-                pending.store(false, Ordering::Release);
+                // A swap, not a store: it is ordered against the relay's swap.
+                pending.swap(false, Ordering::SeqCst);
                 continue;
             }
+            // SAFETY: `msg` was just filled in by PeekMessageW on this thread.
             unsafe { DispatchMessageW(&msg) };
+        }
+        if LAYOUT_STALE.take() {
+            with_state(|s| s.schedule.dirty = true);
         }
         // Drained on every wake, so a failed wake only delays a command.
         loop {
@@ -552,7 +620,7 @@ fn message_loop(cmds: &mpsc::Receiver<PillCmd>, pending: &AtomicBool) {
             }
         }
         let now = Instant::now();
-        let due = with_state(|s| redraw_at(now, s.dirty, s.next_frame, s.last_draw)).flatten();
+        let due = with_state(|s| s.schedule.due(now)).flatten();
         if due.is_some_and(|t| t <= now) {
             with_state(|s| s.redraw(now));
             continue;
@@ -640,13 +708,11 @@ impl State {
                 }
             }
         }
-        self.dirty = true;
+        self.schedule.dirty = true;
     }
 
     fn redraw(&mut self, now: Instant) {
-        self.dirty = false;
-        self.last_draw = Some(now);
-        self.next_frame = self.board.next_frame(now);
+        self.schedule.drawn(&self.board, now);
         let views = self.board.views(now);
         let on_board = |drag: DragId| views.iter().any(|v| v.drag == drag);
         // A drag not yet shown, or hidden while held, keeps its anchor.
@@ -712,7 +778,7 @@ impl State {
             }
         }
         win.hover = hover;
-        self.dirty = true;
+        self.schedule.dirty = true;
     }
 
     /// A click at `at` in the input window: only a drawn ✕ acts.
@@ -725,14 +791,19 @@ impl State {
         };
         let (view, hit) = (
             &shown.view,
-            close_hit(&shown.view, win.hover, shown.scale, at),
+            // As drawn: a ✕ that hover was about to show isn't there yet.
+            close_hit(&shown.view, shown.hover, shown.scale, at),
         );
         let (drag, running, failed) = (view.drag, view.running, view.failed);
         if hit && running {
-            (self.on_cancel)(drag);
+            // Never unwind out of the window procedure.
+            let cancel = &self.on_cancel;
+            if std::panic::catch_unwind(AssertUnwindSafe(|| cancel(drag))).is_err() {
+                warn!("pill: on_cancel panicked for drag {drag}");
+            }
         } else if hit && failed {
             self.board.dismiss(drag);
-            self.dirty = true;
+            self.schedule.dirty = true;
         }
         self.on_hover(input, true);
     }
@@ -750,6 +821,10 @@ unsafe extern "system" fn pill_proc(
             with_state(|s| s.on_hover(hwnd, msg == WM_MOUSEMOVE));
             return LRESULT(0);
         }
+        // Sent to top-level windows; the work area or DPI under a pill may
+        // have moved. Default handling follows.
+        WM_DISPLAYCHANGE | WM_DPICHANGED => LAYOUT_STALE.set(true),
+        WM_SETTINGCHANGE if wparam.0 == SPI_SETWORKAREA.0 as usize => LAYOUT_STALE.set(true),
         WM_LBUTTONDOWN => {
             // The client coordinates, as signed 16-bit halves.
             let at = (lparam.0 as i16 as i32, (lparam.0 >> 16) as i16 as i32);
@@ -836,6 +911,9 @@ mod tests {
     use super::*;
     use cj_core::dnd::ItemKind;
     use cj_core::pill::PillIcon;
+    use windows::Win32::UI::HiDpi::{
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
+    };
     use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
 
     const WORK: Rect = Rect {
@@ -981,7 +1059,7 @@ mod tests {
     }
 
     #[test]
-    fn an_animating_board_is_redrawn_once_its_frame_is_past() {
+    fn an_animating_board_is_redrawn_every_frame() {
         let ms = Duration::from_millis;
         let t0 = Instant::now();
         let mut board = PillBoard::new(Peer::Mac, Peer::Pc);
@@ -992,13 +1070,23 @@ mod tests {
         };
         board.start(1, &[item], t0);
         board.progress(1, 1_000, Some(10_000_000), t0 + ms(600));
-        // `redraw` keeps the frame the board gave at the draw.
-        let drawn = t0 + ms(600);
-        let kept = board.next_frame(drawn);
-        let woke = drawn + ms(40);
-        assert!(redraw_at(woke, false, kept, Some(drawn)).is_some_and(|t| t <= woke));
+        // What the loop does: a command marks it dirty, then it sleeps until
+        // `due` and redraws whenever `due` has come.
+        let mut schedule = Schedule {
+            dirty: true,
+            ..Schedule::default()
+        };
+        let mut now = t0 + ms(600);
+        for frame in 0..10 {
+            let due = schedule.due(now).expect("animating");
+            assert!(due <= now, "frame {frame} not due at its wake");
+            schedule.drawn(&board, now);
+            let next = schedule.due(now).expect("animating");
+            assert_eq!(next, now + MIN_FRAME, "frame {frame}");
+            now = next;
+        }
         // Asked again at the wake, the frame is always ahead: it would never come.
-        assert!(board.next_frame(woke).is_some_and(|t| t > woke));
+        assert!(board.next_frame(now).is_some_and(|t| t > now));
     }
 
     #[test]
@@ -1041,6 +1129,11 @@ mod tests {
     fn smoke_pill_runs_5s() {
         // Shows a failed draw, which is only logged.
         let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        // As the app does in `init_process` (without its cursor reset and
+        // panic hook). Fails harmlessly if the manifest already set it.
+        // SAFETY: plain FFI call, before any window exists.
+        let _ =
+            unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
         let ms = Duration::from_millis;
         let mut cursor = POINT::default();
         // SAFETY: reads the cursor position.
