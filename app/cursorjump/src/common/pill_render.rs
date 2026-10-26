@@ -18,8 +18,9 @@ use ab_glyph::{Font, FontRef, GlyphId, PxScale, ScaleFont, point};
 use cj_core::pill::{PillIcon, PillView};
 use tiny_skia::{
     Color, FillRule, GradientStop, LineCap, LineJoin, LinearGradient, Mask, Paint, Path,
-    PathBuilder, Pixmap, Point, Rect, SpreadMode, Stroke, Transform,
+    PathBuilder, Pixmap, Point, Rect, Shader, SpreadMode, Stroke, Transform,
 };
+use unicode_normalization::UnicodeNormalization;
 
 /// Body size, gap between stacked pills and gap below the bottom one, in
 /// logical px.
@@ -125,6 +126,18 @@ static FONTS: LazyLock<Fonts> = LazyLock::new(|| Fonts {
         .expect("embedded Inter SemiBold parses"),
 });
 
+/// The widest "dd%" at an em of 1 px. Inter's digits aren't tabular here,
+/// so the percent's slot keeps this width (times the size) and the name's
+/// cut doesn't hop as the digits change.
+static WIDEST_PERCENT: LazyLock<f32> = LazyLock::new(|| {
+    ('0'..='9')
+        .map(|d| text_width(&FONTS.regular, 1.0, &format!("{d}{d}%")))
+        .fold(0.0, f32::max)
+});
+
+/// Drawn for each run of chars the fonts have no glyph for.
+const MISSING: char = '□';
+
 /// The body's size in pixmap px. The pixmap adds `SHADOW_PAD` on each side.
 pub fn pill_px(scale: f32) -> (u32, u32) {
     let scale = sane(scale);
@@ -154,6 +167,12 @@ pub fn close_rect(scale: f32) -> Rect {
     .expect("a non-empty square")
 }
 
+/// Whether the pill shows its ✕, which a click there acts on: a running
+/// pill's on hover (it cancels) and a failed one's always (it dismisses).
+pub fn close_shown(view: &PillView, hover: bool) -> bool {
+    view.failed || (hover && view.running)
+}
+
 /// What is drawn right of the name.
 enum Right<'a> {
     Close,
@@ -163,9 +182,9 @@ enum Right<'a> {
 }
 
 impl Right<'_> {
-    /// The ✕ (on hover or failure) replaces the ✓ or percent.
+    /// The ✕, when shown, replaces the percent.
     fn of(view: &PillView, hover: bool) -> Right<'_> {
-        if hover || view.failed {
+        if close_shown(view, hover) {
             Right::Close
         } else if view.check_scale > 0.0 {
             Right::Check(view.check_scale)
@@ -177,18 +196,14 @@ impl Right<'_> {
     }
 
     /// The room it takes, in pixmap px. The ✓ keeps its full width as it
-    /// pops, and a percent keeps the widest "nn%"'s: Inter's digits aren't
-    /// tabular here, so the name's cut would hop as they change.
+    /// pops, and a percent at least `WIDEST_PERCENT`'s.
     fn width(&self, l: Layout) -> f32 {
         let size = l.len(NAME_SIZE);
         match self {
             Right::Close => l.len(CLOSE_W),
             Right::Check(_) => l.len(CHECK_W),
             Right::Percent(text) => {
-                let widest = ('0'..='9')
-                    .map(|d| text_width(&FONTS.regular, size, &format!("{d}{d}%")))
-                    .fold(0.0, f32::max);
-                text_width(&FONTS.regular, size, text).max(widest)
+                text_width(&FONTS.regular, size, text).max(*WIDEST_PERCENT * size)
             }
             Right::Nothing => 0.0,
         }
@@ -206,7 +221,8 @@ pub fn render(view: &PillView, scale: f32, backdrop: Backdrop, hover: bool) -> P
     let (name_x, name_right) = name_box(view, l.scale, hover);
     let size = l.len(NAME_SIZE);
     let baseline = l.at(NAME_BASELINE);
-    let name = ellipsize(&FONTS.semibold, size, &view.name, name_right - name_x);
+    let name = displayable(&FONTS.semibold, &view.name);
+    let name = ellipsize(&FONTS.semibold, size, &name, name_right - name_x);
     draw_text(&mut pm, &FONTS.semibold, size, &name, name_x, baseline, 1.0);
     let (mark_x, mark_y) = (l.at(META_RIGHT), l.at(MARK_Y));
     match right {
@@ -221,7 +237,8 @@ pub fn render(view: &PillView, scale: f32, backdrop: Backdrop, hover: bool) -> P
 
     draw_bar(&mut pm, l, view);
     let size = l.len(SUB_SIZE);
-    let sub = ellipsize(&FONTS.regular, size, &view.sub, l.len(META_RIGHT - META_X));
+    let sub = displayable(&FONTS.regular, &view.sub);
+    let sub = ellipsize(&FONTS.regular, size, &sub, l.len(META_RIGHT - META_X));
     let (x, y) = (l.at(META_X), l.at(SUB_BASELINE));
     draw_text(&mut pm, &FONTS.regular, size, &sub, x, y, 0.55);
 
@@ -482,8 +499,13 @@ fn draw_bar(pm: &mut Pixmap, l: Layout, view: &PillView) {
                 return;
             };
             // The sheen's tiles slide two widths per period, as in the mockup.
+            let phase = if view.sheen_phase.is_finite() {
+                view.sheen_phase.rem_euclid(1.0)
+            } else {
+                0.0
+            };
             let tile = l.len(SHEEN_W);
-            let from = x + tile * (2.0 * view.sheen_phase - 1.0);
+            let from = x + tile * (2.0 * phase - 1.0);
             let grey = Color::from_rgba8(0xD9, 0xD9, 0xD9, 0xFF);
             let stops = vec![
                 GradientStop::new(0.0, grey),
@@ -497,7 +519,7 @@ fn draw_bar(pm: &mut Pixmap, l: Layout, view: &PillView) {
                 SpreadMode::Repeat,
                 id,
             )
-            .expect("a horizontal gradient");
+            .unwrap_or(Shader::SolidColor(Color::WHITE));
             let paint = Paint {
                 shader,
                 anti_alias: true,
@@ -614,6 +636,40 @@ fn text_width(font: &FontRef, px: f32, text: &str) -> f32 {
     glyph_run(font, px, text).1
 }
 
+/// `text` in NFC, without default-ignorable chars (zero-width ones,
+/// variation selectors, tags, skin tones), and with each run of chars
+/// `font` has no glyph for as one `MISSING`.
+fn displayable<'a>(font: &FontRef, text: &'a str) -> Cow<'a, str> {
+    let ignorable = |c: char| {
+        matches!(
+            c,
+            '\u{200B}'..='\u{200F}'
+                | '\u{FE00}'..='\u{FE0F}'
+                | '\u{E0020}'..='\u{E007F}'
+                | '\u{1F3FB}'..='\u{1F3FF}'
+        )
+    };
+    let missing = |c: char| font.glyph_id(c) == GlyphId(0);
+    let clean = text.chars().all(|c| !ignorable(c) && !missing(c));
+    if clean && unicode_normalization::is_nfc(text) {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut in_run = false;
+    for c in text.nfc().filter(|&c| !ignorable(c)) {
+        if missing(c) {
+            if !in_run {
+                out.push(MISSING);
+            }
+            in_run = true;
+        } else {
+            out.push(c);
+            in_run = false;
+        }
+    }
+    Cow::Owned(out)
+}
+
 /// `text` if it fits in `max` px, else as much of it as fits before an "…".
 fn ellipsize<'a>(font: &FontRef, px: f32, text: &'a str, max: f32) -> Cow<'a, str> {
     let (run, width) = glyph_run(font, px, text);
@@ -648,13 +704,13 @@ fn draw_text(pm: &mut Pixmap, font: &FontRef, px: f32, text: &str, x: f32, y: f3
         };
         let min = outline.px_bounds().min;
         outline.draw(|gx, gy, coverage| {
-            let (px, py) = (min.x as i32 + gx as i32, min.y as i32 + gy as i32);
-            if px < 0 || py < 0 || px >= w || py >= h {
+            let (tx, ty) = (min.x as i32 + gx as i32, min.y as i32 + gy as i32);
+            if tx < 0 || ty < 0 || tx >= w || ty >= h {
                 return;
             }
             // Source-over, premultiplied.
             let a = (coverage * alpha).clamp(0.0, 1.0);
-            let i = (py * w + px) as usize * 4;
+            let i = (ty * w + tx) as usize * 4;
             for (d, s) in data[i..i + 4].iter_mut().zip([INK[0], INK[1], INK[2], 255]) {
                 *d = (f32::from(s) * a + f32::from(*d) * (1.0 - a)).round() as u8;
             }
@@ -814,12 +870,29 @@ mod tests {
             sub: "Copy failed — Mac disconnected".into(),
             ..folder()
         };
+        let done = PillView {
+            right: String::new(),
+            sub: "From PC · 5.0 GB".into(),
+            fraction: Some(1.0),
+            check_scale: 1.0,
+            running: false,
+            ..running()
+        };
+        let cancelled = PillView {
+            right: String::new(),
+            sub: "Cancelled".into(),
+            fraction: None,
+            running: false,
+            ..running()
+        };
+        assert!(!close_shown(&folder(), false) && close_shown(&folder(), true));
+        assert!(close_shown(&failed, false) && close_shown(&failed, true));
+        for v in [&done, &cancelled] {
+            assert!(!close_shown(v, false) && !close_shown(v, true), "{}", v.sub);
+        }
         for scale in [1.0, 2.0] {
             let r = close_rect(scale);
-            let (w, h) = (
-                render(&folder(), scale, Backdrop::Blurred, false).width(),
-                render(&folder(), scale, Backdrop::Blurred, false).height(),
-            );
+            let (w, h) = pixmap_px(scale);
             assert!(r.left() >= 0.0 && r.top() >= 0.0);
             assert!(r.right() <= w as f32 && r.bottom() <= h as f32);
             let (cx, cy) = (r.x() + r.width() / 2.0, r.y() + r.height() / 2.0);
@@ -840,7 +913,120 @@ mod tests {
             };
             assert!(with(&running(), true) == with(&blank, true), "@{scale}");
             assert!(with(&running(), false) != with(&blank, false), "@{scale}");
+
+            // Hovering a done pill keeps its ✓, and a cancelled one shows
+            // nothing more.
+            for v in [&done, &cancelled] {
+                assert!(with(v, true) == with(v, false), "@{scale} {}", v.sub);
+            }
+            let check = render(&done, scale, Backdrop::Opaque, false);
+            let x = l_at(scale, META_RIGHT - CHECK_W / 2.0);
+            assert!(brightest(&check, x, l_at(scale, MARK_Y)) > 150, "@{scale}");
         }
+    }
+
+    fn l_at(scale: f32, v: f32) -> f32 {
+        Layout::new(scale).at(v)
+    }
+
+    #[test]
+    fn track_only_while_running() {
+        let failed = PillView {
+            failed: true,
+            running: false,
+            sub: "Copy failed — Mac disconnected".into(),
+            ..folder()
+        };
+        let cancelled = PillView {
+            running: false,
+            sub: "Cancelled".into(),
+            ..folder()
+        };
+        for scale in [1.0, 2.0] {
+            let l = Layout::new(scale);
+            let y = l.at(BAR_Y + BAR_H / 2.0);
+            let (x0, x1) = (l.at(META_X) as u32, l.at(META_RIGHT) as u32);
+            let body = |pm: &Pixmap| px(pm, l.at(PAD_X / 2.0), l.at(PILL_H / 2.0));
+            // Running with no fraction: a thin track the bar's whole width.
+            let pm = render(&folder(), scale, Backdrop::Blurred, false);
+            let base = body(&pm)[0];
+            for x in x0 + 2..x1 - 2 {
+                let r = px(&pm, x as f32, y)[0];
+                assert!(r > base + 20, "@{scale} x {x}: {r} vs {base}");
+            }
+            // Failed or cancelled: the bar row is bare body.
+            for v in [&failed, &cancelled] {
+                let pm = render(v, scale, Backdrop::Blurred, false);
+                for x in x0..x1 {
+                    assert_eq!(px(&pm, x as f32, y), body(&pm), "@{scale} {} x {x}", v.sub);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn missing_glyphs_become_one_box() {
+        for (name, want) in [
+            ("🎉 party.jpg", "□ party.jpg"),
+            ("👨\u{200D}👩\u{200D}👧 family.png", "□ family.png"),
+            ("👍🏽 ok", "□ ok"),
+            ("e\u{301}te\u{200B}.txt", "\u{e9}te.txt"),
+            ("plain.txt", "plain.txt"),
+        ] {
+            for font in [&FONTS.semibold, &FONTS.regular] {
+                let shown = displayable(font, name);
+                assert_eq!(shown, want, "{name:?}");
+                assert_eq!(
+                    shown.matches(MISSING).count(),
+                    usize::from(want.contains(MISSING))
+                );
+                let (run, _) = glyph_run(font, NAME_SIZE, &shown);
+                assert!(run.iter().all(|&(id, _)| id != GlyphId(0)), "{name:?}");
+            }
+            let v = PillView {
+                name: name.into(),
+                sub: format!("Copy failed — “{name}” changed while copying"),
+                ..running()
+            };
+            render(&v, 2.0, Backdrop::Blurred, true);
+        }
+    }
+
+    #[test]
+    fn broken_numbers_dont_panic() {
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 1e30, -0.25] {
+            for v in [
+                PillView {
+                    sheen_phase: bad,
+                    ..running()
+                },
+                PillView {
+                    fraction: Some(bad),
+                    ..running()
+                },
+                PillView {
+                    check_scale: bad,
+                    right: String::new(),
+                    running: false,
+                    ..running()
+                },
+                PillView {
+                    opacity: bad,
+                    ..running()
+                },
+            ] {
+                for scale in [bad, 1.0, 2.0] {
+                    render(&v, scale, Backdrop::Opaque, false);
+                }
+            }
+        }
+        // A broken phase draws the bar as phase 0 does.
+        let nan = PillView {
+            sheen_phase: f32::NAN,
+            ..running()
+        };
+        let zero = render(&running(), 1.0, Backdrop::Blurred, false);
+        assert!(render(&nan, 1.0, Backdrop::Blurred, false).data() == zero.data());
     }
 
     #[test]
@@ -945,6 +1131,14 @@ mod tests {
                 sub: "From PC · 1.7 of 2.0 GB · a few seconds left".into(),
                 fraction: Some(0.87),
                 sheen_phase: 0.7,
+                ..running()
+            },
+            PillView {
+                icon: PillIcon::Image,
+                name: "🎉 party 👨\u{200D}👩\u{200D}👧.jpg".into(),
+                right: "63%".into(),
+                sub: "From PC · 12 of 19 MB · 5 s left".into(),
+                fraction: Some(0.63),
                 ..running()
             },
             PillView {
