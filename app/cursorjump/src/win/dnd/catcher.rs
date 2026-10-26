@@ -197,7 +197,12 @@ fn formats() -> &'static Formats {
     })
 }
 
-fn formatetc(cf: u16, tymed: TYMED, lindex: i32) -> FORMATETC {
+/// [`SELF_FORMAT`], registered.
+pub(super) fn self_format() -> u16 {
+    formats().self_fmt
+}
+
+pub(super) fn formatetc(cf: u16, tymed: TYMED, lindex: i32) -> FORMATETC {
     FORMATETC {
         cfFormat: cf,
         ptd: std::ptr::null_mut(),
@@ -208,7 +213,7 @@ fn formatetc(cf: u16, tymed: TYMED, lindex: i32) -> FORMATETC {
 }
 
 /// Released on drop.
-struct Medium(STGMEDIUM);
+pub(super) struct Medium(pub(super) STGMEDIUM);
 
 impl Drop for Medium {
     fn drop(&mut self) {
