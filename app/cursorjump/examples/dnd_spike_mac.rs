@@ -1721,7 +1721,11 @@ mod mac {
         // CJ_NOPOST=1: post nothing; another process drives the drag (F1:
         // does a session follow events posted by a different process?).
         if std::env::var_os("CJ_NOPOST").is_some() {
-            log!("CJ_NOPOST: panel at S ({:.1}, {:.1}); waiting for another process's events", s.0, s.1);
+            log!(
+                "CJ_NOPOST: panel at S ({:.1}, {:.1}); waiting for another process's events",
+                s.0,
+                s.1
+            );
             for i in 0..40 {
                 sleep_ms(250);
                 if i % 4 == 0 {
