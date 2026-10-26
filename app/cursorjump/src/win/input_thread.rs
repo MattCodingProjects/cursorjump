@@ -57,7 +57,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::w;
 
 use super::cursor::{hide_system_cursors, restore_system_cursors};
-use super::dnd::{DndCmd, DndPort, in_catch_zone, ours_under};
+use super::dnd::{DndCmd, DndPort, EntryStep, entry_steps, in_catch_zone, ours_under};
 use super::monitors::{edge_monitor, monitors, rect_from};
 use super::probe::probe_game;
 
@@ -86,6 +86,10 @@ const DESKTOP_TIMER: usize = 1;
 const PARK_POLL: Duration = Duration::from_millis(50);
 /// The input window's timer id for the park-point check.
 const PARK_TIMER: usize = 2;
+/// While the shield is wanted but our window isn't under the park point, it
+/// is asked for again this often (a `Shield(true)` refused for want of a
+/// session, or a window that went missing).
+const SHIELD_REASSERT: Duration = Duration::from_secs(1);
 /// Longest wait for the catcher to cover the screen before parking with a drag.
 const PARK_WAIT: Duration = Duration::from_millis(100);
 /// While the strip's other conditions hold, a game check is reused this long.
@@ -270,8 +274,9 @@ struct MacStay {
     /// The foreground window at the last park check: a pass-through needs
     /// it unchanged (R31).
     park_fg: isize,
-    /// What the shield was last told.
+    /// What the shield was last told, and when.
     shield_shown: bool,
+    shield_sent_at: Option<Instant>,
 }
 
 impl MacStay {
@@ -286,6 +291,7 @@ impl MacStay {
             left_held_at_entry: false,
             park_fg: 0,
             shield_shown: false,
+            shield_sent_at: None,
         }
     }
 
@@ -516,25 +522,36 @@ impl State {
         };
         let (fg, covered) = foreground_covering(&edge);
         stay.park_fg = fg;
-        if stay.shield_shown == covered {
-            stay.shield_shown = !covered;
-            info!(shield = !covered, "park point: shield");
-            dnd.send(DndCmd::Shield(!covered));
-        }
+        let want = !covered && dnd.shared.session_up.load(Ordering::Acquire);
         let ours = !covered && ours_under(&dnd.shared, stay.center);
+        let now = Instant::now();
+        // cj-dnd refuses `Shield(true)` without a session (Task 13 sets
+        // `session_up` before any crossing), so a wanted shield that isn't
+        // there is asked for again now and then.
+        let missing = want
+            && !ours
+            && stay
+                .shield_sent_at
+                .is_none_or(|at| now.saturating_duration_since(at) >= SHIELD_REASSERT);
+        if want != stay.shield_shown || missing {
+            if want != stay.shield_shown {
+                info!(shield = want, "park point: shield");
+            }
+            stay.shield_shown = want;
+            stay.shield_sent_at = Some(now);
+            dnd.send(DndCmd::Shield(want));
+        }
         let was = dnd.shared.under_park_is_ours.swap(ours, Ordering::AcqRel);
         if ours != was {
             debug!(ours, "park point: our window under it changed");
         }
     }
 
-    /// Before parking with a drag: the catcher must already cover the park
-    /// point, or the drag would leave it for whatever window is there.
-    fn cover_park_point(&self) {
+    /// After `Park(true)`: wait (bounded) until the catcher covers the screen.
+    fn await_parked(&self) {
         let Some(dnd) = &self.dnd else {
             return;
         };
-        dnd.send(DndCmd::Park(true));
         let until = Instant::now() + PARK_WAIT;
         while !dnd.shared.parked.load(Ordering::Acquire) {
             if Instant::now() >= until {
@@ -564,17 +581,19 @@ impl State {
         // Hide first and park before the hooks exist so the cursor never flashes
         // or jumps; park again in case it moved while the hooks were installed.
         let left_held_at_entry = is_down(VK_LBUTTON.0);
-        if self.zone {
-            self.zone = false;
-            self.send_dnd(DndCmd::CatcherZone(false));
-        }
         let before = cursor_pos();
         hide_system_cursors();
-        if drag.is_some() {
-            self.cover_park_point();
-        }
         let target = rect_center(&edge);
-        park_cursor(target);
+        // With a drag, the catcher covers the screen before the strip goes
+        // or the cursor moves (`entry_steps`).
+        let zone_shown = std::mem::take(&mut self.zone);
+        for step in entry_steps(drag.is_some(), zone_shown) {
+            match step {
+                EntryStep::Send(cmd) => self.send_dnd(cmd),
+                EntryStep::AwaitParked => self.await_parked(),
+                EntryStep::ParkCursor => park_cursor(target),
+            }
+        }
         let hooks = match install_hooks() {
             Ok(h) => h,
             Err(e) => {
@@ -839,11 +858,13 @@ impl State {
             .as_ref()
             .is_some_and(|d| d.shared.under_park_is_ours.load(Ordering::Acquire));
         let injected = info.flags & LLMHF_INJECTED != 0;
+        let left = !injected && (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP);
         let pass = Pass {
             over_ours,
-            // A cheap, hook-safe read: a window that came to the front since
-            // the last park check may cover the park point.
-            fg_match: over_ours && foreground() == stay.park_fg,
+            // A cheap, hook-safe read, made only for a real left button that
+            // could pass: a window that came to the front since the last
+            // park check may cover the park point.
+            fg_match: left && over_ours && foreground() == stay.park_fg,
             down_passed: stay.left_passed,
             held_at_entry: stay.left_held_at_entry,
         };
@@ -1145,7 +1166,10 @@ struct Pass {
 ///   down), or under the same conditions when the button was already down
 ///   at the crossing (a riding drag's release, which ends it on the
 ///   catcher). If a foreign window is in front by then, that release is
-///   swallowed and the PC's OS drag carries on once the cursor is back.
+///   swallowed and the PC's OS drag carries on once the cursor is back;
+///   until then, a later Mac click that passes (once our window is in
+///   front again) ends that drag on the catcher with its release, as a
+///   drop.
 ///
 /// Injected events pass untouched and are never forwarded. The hook only
 /// ever swallows less than phase 1; it never makes input up.

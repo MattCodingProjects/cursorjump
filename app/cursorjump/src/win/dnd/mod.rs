@@ -95,7 +95,7 @@ const LAST_WAKE_STEP: Duration = Duration::from_millis(10);
 const LAST_WAKE_LIMIT: Duration = Duration::from_secs(1);
 
 /// App and input thread → cj-dnd.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum DndCmd {
     /// Show (true) or hide the edge strip. The input thread sends it while on
     /// the PC: true only while the left button alone is held within
@@ -120,6 +120,34 @@ pub enum DndCmd {
     Home { drag: DragId },
     /// The Mac edge may have moved.
     ApplyConfig(Config),
+}
+
+/// One step of the input thread's crossing to the Mac, as far as cj-dnd
+/// is concerned.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EntryStep {
+    Send(DndCmd),
+    /// Wait until [`DndShared::parked`] (bounded).
+    AwaitParked,
+    /// Move the cursor to the park point. A drag's source hit-tests there.
+    ParkCursor,
+}
+
+/// The order of a crossing: with a drag, the catcher covers the screen
+/// before anything hides the strip or moves the cursor, so the drag never
+/// sees a moment without the catcher under it (OLE would send `DragLeave`
+/// and the ride would be lost). `zone_shown`: the strip was last shown.
+pub fn entry_steps(drag: bool, zone_shown: bool) -> Vec<EntryStep> {
+    let mut steps = Vec::with_capacity(4);
+    if drag {
+        steps.push(EntryStep::Send(DndCmd::Park(true)));
+        steps.push(EntryStep::AwaitParked);
+    }
+    if zone_shown {
+        steps.push(EntryStep::Send(DndCmd::CatcherZone(false)));
+    }
+    steps.push(EntryStep::ParkCursor);
+    steps
 }
 
 /// cj-dnd → app.
@@ -152,8 +180,9 @@ pub struct DndShared {
     pub under_park_is_ours: AtomicBool,
     /// The catcher covers the virtual screen.
     pub parked: AtomicBool,
-    /// A session with the Mac is up (the app sets it). Without one there is
-    /// no strip, no offer, no shield and no park.
+    /// A session with the Mac is up. Without one there is no strip, no
+    /// offer, no shield and no park. The app (Task 13) sets it on link up,
+    /// before any crossing, and clears it on link down.
     pub session_up: AtomicBool,
     catcher: AtomicIsize,
     shield: AtomicIsize,
@@ -420,6 +449,11 @@ impl Modes {
         }
         self.unpark();
         self.release(true)
+    }
+
+    /// Whether a release now would be taken (see `take_drop`).
+    fn takes_drop(&self) -> bool {
+        self.offer.is_some() && self.parked && !self.reject
     }
 
     /// The release landed on the catcher. Taken only while riding and not
@@ -1116,6 +1150,100 @@ mod tests {
             })
         );
         assert_eq!(m.placement(), place(CatcherAt::Hidden, false));
+    }
+
+    /// Runs a crossing's steps against the modes of a catcher holding a
+    /// drag on the strip; returns every placement up to the cursor's park.
+    fn placements_until_parked(steps: &[EntryStep]) -> Vec<Placement> {
+        let mut m = Modes::default();
+        cmd(&mut m, DndCmd::CatcherZone(true));
+        m.enter(Some(7));
+        let mut seen = vec![m.placement()];
+        for step in steps {
+            match step {
+                EntryStep::Send(c) => {
+                    assert_eq!(cmd(&mut m, c.clone()), None, "{c:?} let the offer go");
+                    seen.push(m.placement());
+                }
+                EntryStep::AwaitParked => assert!(m.parked, "awaited before Park(true)"),
+                EntryStep::ParkCursor => return seen,
+            }
+        }
+        panic!("the cursor was never parked");
+    }
+
+    #[test]
+    fn a_crossing_with_a_drag_never_leaves_it_without_the_catcher() {
+        let steps = entry_steps(true, true);
+        assert_eq!(
+            steps,
+            [
+                EntryStep::Send(DndCmd::Park(true)),
+                EntryStep::AwaitParked,
+                EntryStep::Send(DndCmd::CatcherZone(false)),
+                EntryStep::ParkCursor,
+            ]
+        );
+        let seen = placements_until_parked(&steps);
+        assert!(
+            seen.iter().all(|p| p.catcher != CatcherAt::Hidden),
+            "{seen:?}"
+        );
+        assert_eq!(seen.last().unwrap().catcher, CatcherAt::Screen);
+        // The other order would pass through Hidden: what the steps rule out.
+        let wrong = [
+            EntryStep::Send(DndCmd::CatcherZone(false)),
+            EntryStep::Send(DndCmd::Park(true)),
+            EntryStep::ParkCursor,
+        ];
+        assert!(
+            placements_until_parked(&wrong)
+                .iter()
+                .any(|p| p.catcher == CatcherAt::Hidden)
+        );
+        // And no step order from `entry_steps` hides the strip first.
+        for zone in [false, true] {
+            let steps = entry_steps(true, zone);
+            let park = steps.iter().position(|s| *s == EntryStep::AwaitParked);
+            let hide = steps
+                .iter()
+                .position(|s| *s == EntryStep::Send(DndCmd::CatcherZone(false)));
+            assert!(park.is_some());
+            assert!(hide.is_none_or(|h| Some(h) > park), "{steps:?}");
+        }
+    }
+
+    #[test]
+    fn a_crossing_without_a_drag_just_hides_the_strip() {
+        assert_eq!(
+            entry_steps(false, true),
+            [
+                EntryStep::Send(DndCmd::CatcherZone(false)),
+                EntryStep::ParkCursor
+            ]
+        );
+        assert_eq!(entry_steps(false, false), [EntryStep::ParkCursor]);
+        assert_eq!(
+            entry_steps(true, false),
+            [
+                EntryStep::Send(DndCmd::Park(true)),
+                EntryStep::AwaitParked,
+                EntryStep::ParkCursor
+            ]
+        );
+    }
+
+    #[test]
+    fn takes_drop_matches_take_drop() {
+        let mut m = Modes::default();
+        assert!(!m.takes_drop());
+        m.enter(Some(7));
+        assert!(!m.takes_drop(), "on the strip");
+        cmd(&mut m, DndCmd::Park(true));
+        assert!(m.takes_drop());
+        assert_eq!(m.clone().take_drop(), Ok(7));
+        cmd(&mut m, DndCmd::Cancel { drag: 7 });
+        assert!(!m.takes_drop());
     }
 
     #[test]

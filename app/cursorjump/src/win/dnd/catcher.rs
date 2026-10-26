@@ -694,12 +694,20 @@ impl IDropTarget_Impl for Target_Impl {
         pdweffect: *mut DROPEFFECT,
     ) -> windows::core::Result<()> {
         let data = pdataobj.ok().ok();
-        let taken = with_state(State::take_drop).flatten();
-        let effect = taken.as_ref().map_or(DROPEFFECT_NONE, |_| DROPEFFECT_COPY);
+        let takes = with_state(|s| s.modes.takes_drop()).unwrap_or(false);
+        let effect = if takes {
+            DROPEFFECT_COPY
+        } else {
+            DROPEFFECT_NONE
+        };
+        // Before unparking: the image ends here, hidden, and never flashes
+        // back at the park point.
         if let (Some(h), Some(data)) = (helper(), data) {
             // SAFETY: plain helper call with the live data object.
             let _ = unsafe { h.Drop(data, &POINT { x: pt.x, y: pt.y }, effect) };
         }
+        let taken = with_state(State::take_drop).flatten();
+        let effect = taken.as_ref().map_or(DROPEFFECT_NONE, |_| DROPEFFECT_COPY);
         if let Some((drag, pending)) = taken {
             // The catcher is already off the screen. Outside the state: the
             // reads are cross-process calls, which pump this thread's
