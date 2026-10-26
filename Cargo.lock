@@ -560,6 +560,7 @@ dependencies = [
  "cj-core",
  "cj-net",
  "crossbeam-channel",
+ "dispatch2",
  "eframe",
  "embed-manifest",
  "image",
@@ -2188,6 +2189,7 @@ dependencies = [
  "block2 0.6.2",
  "objc2 0.6.5",
  "objc2-core-foundation",
+ "objc2-core-graphics",
  "objc2-foundation 0.3.2",
  "objc2-uniform-type-identifiers 0.3.2",
 ]

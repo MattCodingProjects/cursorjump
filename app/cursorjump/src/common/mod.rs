@@ -19,10 +19,10 @@ pub mod dnd_link;
 )]
 pub mod link_fetch;
 #[cfg_attr(
-    all(not(test), not(windows)),
+    all(not(test), not(windows), not(debug_assertions)),
     expect(
         dead_code,
-        reason = "the Mac's pill windows draw with it in a later task"
+        reason = "release Mac builds draw pills once Task 17 wires them in (debug builds draw them in --smoke-pill)"
     )
 )]
 pub mod pill_render;

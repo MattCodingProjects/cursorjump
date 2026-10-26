@@ -28,6 +28,12 @@ const FLAGS: [&str; 5] = [
     "--disable-autostart",
 ];
 
+/// Hidden options of debug builds, for a person to look at a piece of the app.
+#[cfg(all(target_os = "macos", debug_assertions))]
+const DEBUG_FLAGS: [&str; 1] = ["--smoke-pill"];
+#[cfg(not(all(target_os = "macos", debug_assertions)))]
+const DEBUG_FLAGS: [&str; 0] = [];
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let has = |flag: &str| args.iter().any(|a| a == flag);
@@ -41,6 +47,16 @@ fn main() {
              --enable-autostart, --disable-autostart (none starts CursorJump)."
         ));
         std::process::exit(2);
+    }
+
+    // The pills on a scripted board for ~10 s (mac/pill.rs `run_smoke`).
+    #[cfg(all(target_os = "macos", debug_assertions))]
+    if has("--smoke-pill") {
+        if let Err(e) = mac::pill::run_smoke() {
+            error!("{e:#}");
+            std::process::exit(1);
+        }
+        return;
     }
 
     if has("--diagnose") {
@@ -79,7 +95,7 @@ fn main() {
 fn unknown_flag(args: &[String]) -> Option<&str> {
     args.iter()
         .map(String::as_str)
-        .find(|a| a.starts_with("--") && !FLAGS.contains(a))
+        .find(|a| a.starts_with("--") && !FLAGS.contains(a) && !DEBUG_FLAGS.contains(a))
 }
 
 /// Logs an error; release builds, which have no console, also show it in a box.
@@ -252,6 +268,9 @@ mod tests {
     #[test]
     fn unknown_flag_is_reported() {
         assert_eq!(unknown_flag(&args(&["--setting"])), Some("--setting"));
+        // Only debug Mac builds know the pill smoke.
+        let smoke = unknown_flag(&args(&["--smoke-pill"])).is_none();
+        assert_eq!(smoke, cfg!(all(target_os = "macos", debug_assertions)));
         assert_eq!(
             unknown_flag(&args(&["--enable-autostart", "--bogus"])),
             Some("--bogus")

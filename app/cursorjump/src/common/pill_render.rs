@@ -41,6 +41,10 @@ pub enum Backdrop {
     )]
     Blurred,
     /// Nothing: a layered window can't blur what's behind it (Windows).
+    #[cfg_attr(
+        all(not(windows), not(test), debug_assertions),
+        expect(dead_code, reason = "only the PC's pills are opaque")
+    )]
     Opaque,
 }
 
