@@ -145,15 +145,20 @@ impl Shared {
             // Stamped under the lock, so the times follow the queue's order.
             queue.push((cmd, Instant::now()));
         }
-        // SeqCst against the drain's swap: either it takes this command, or
-        // this swap sees its `false` and queues another drain.
+        self.wake();
+    }
+
+    /// Queue a drain unless one is already queued.
+    fn wake(self: &Arc<Self>) {
+        // SeqCst against the drain's swap: either it takes the queued
+        // commands, or this swap sees its `false` and queues another drain.
         if !self.pending.swap(true, Ordering::SeqCst) {
             let this = self.clone();
             on_main(move |mtm| this.drain(mtm));
         }
     }
 
-    fn drain(&self, mtm: MainThreadMarker) {
+    fn drain(self: &Arc<Self>, mtm: MainThreadMarker) {
         // Cleared before taking the queue, so a later command queues again.
         self.pending.swap(false, Ordering::SeqCst);
         let cmds = std::mem::take(&mut *self.queue.lock().unwrap_or_else(PoisonError::into_inner));
@@ -161,14 +166,23 @@ impl Shared {
             let state = State::new(mtm, self.id, self.on_cancel.clone());
             HOSTS.with(|h| h.borrow_mut().insert(self.id, Rc::new(RefCell::new(state))));
         }
-        let applied = with_host(self.id, |s| {
-            for (cmd, at) in cmds {
-                s.on_command(cmd, at);
-            }
-        });
-        if applied.is_none() {
-            warn!("pill: commands dropped, the board was busy");
+        let host = HOSTS.with(|h| h.borrow().get(&self.id).cloned());
+        let Some(Ok(mut state)) = host.as_ref().map(|h| h.try_borrow_mut()) else {
+            // Busy (not expected at the top of a main-queue block): never
+            // drop them, a lost `Finish` would leave a pill running forever.
+            // Back in front of anything sent since, and drained again later.
+            let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
+            let later = std::mem::replace(&mut *queue, cmds);
+            queue.extend(later);
+            drop(queue);
+            warn!("pill: the board was busy; commands requeued");
+            self.wake();
+            return;
+        };
+        for (cmd, at) in cmds {
+            state.on_command(cmd, at);
         }
+        drop(state);
         pump(self.id);
     }
 }
@@ -191,10 +205,11 @@ fn pump(id: u64) {
         return;
     };
     let Ok(when) = DispatchTime::try_from(at.saturating_duration_since(now)) else {
+        warn!("pill: no timer for a redraw {:?} away", at - now);
         return;
     };
-    let _ = DispatchQueue::main().after(when, move || {
-        let fired = catch_unwind(|| {
+    let armed = DispatchQueue::main().after(when, move || {
+        guarded("redraw timer", || {
             with_host(id, |s| {
                 if s.timer == Some(at) {
                     s.timer = None;
@@ -202,10 +217,19 @@ fn pump(id: u64) {
             });
             pump(id);
         });
-        if fired.is_err() {
-            warn!("pill: redraw panicked");
-        }
     });
+    // Only an armed timer counts: `tick` arms no other before it.
+    if armed.is_ok() {
+        with_host(id, |s| s.timer = Some(at));
+    }
+}
+
+/// Run `f`, catching and logging a panic: for code AppKit or GCD calls,
+/// which must not be unwound into.
+fn guarded(what: &str, f: impl FnOnce()) {
+    if catch_unwind(AssertUnwindSafe(f)).is_err() {
+        warn!("pill: {what} panicked");
+    }
 }
 
 /// A screen, as the pills see it.
@@ -360,9 +384,11 @@ struct State {
 impl State {
     fn new(mtm: MainThreadMarker, id: u64, on_cancel: OnCancel) -> State {
         let block = RcBlock::new(move |_: NonNull<NSNotification>| {
-            if with_host(id, |s| s.schedule.dirty = true).is_some() {
-                pump(id);
-            }
+            guarded("screen change", || {
+                if with_host(id, |s| s.schedule.dirty = true).is_some() {
+                    pump(id);
+                }
+            });
         });
         // SAFETY: a static AppKit name; the block is copied by the center and
         // run on the main queue; the observer is removed on drop.
@@ -409,7 +435,7 @@ impl State {
     }
 
     /// Redraw if due; then the time to arm a timer for, unless one already
-    /// fires by then.
+    /// fires by then. The caller records it in `timer` once armed.
     fn tick(&mut self, now: Instant) -> Option<Instant> {
         if self.schedule.due(now).is_some_and(|t| t <= now) {
             self.redraw(now);
@@ -418,7 +444,6 @@ impl State {
         if self.timer.is_some_and(|t| t <= due) {
             return None;
         }
-        self.timer = Some(due);
         Some(due)
     }
 
@@ -831,17 +856,19 @@ define_class!(
                 self.bounds().size.height - p.y
             };
             let InputIvars { host, drag } = *self.ivars();
-            on_click(host, drag, (p.x, y));
+            guarded("click", || on_click(host, drag, (p.x, y)));
         }
 
         #[unsafe(method(mouseEntered:))]
         fn mouse_entered(&self, _event: &NSEvent) {
-            on_hover(self.ivars().host, self.ivars().drag, true);
+            let InputIvars { host, drag } = *self.ivars();
+            guarded("hover", || on_hover(host, drag, true));
         }
 
         #[unsafe(method(mouseExited:))]
         fn mouse_exited(&self, _event: &NSEvent) {
-            on_hover(self.ivars().host, self.ivars().drag, false);
+            let InputIvars { host, drag } = *self.ivars();
+            guarded("hover", || on_hover(host, drag, false));
         }
     }
 );
@@ -886,9 +913,10 @@ impl InputView {
 /// - hovering a running pill shows its ✕; clicking it logs and cancels;
 /// - no pill ever takes focus from the frontmost app.
 ///
-/// The plan's `smoke_pill_runs_5s` is this run: a bin crate's unit tests
-/// don't get `CARGO_BIN_EXE_cursorjump`, and libtest never runs a test on
-/// the process's main thread, which AppKit needs.
+/// The plan's `smoke_pill_runs_5s` (`tests/smoke_pill.rs`, `#[ignore]`d)
+/// runs this as its own process, which has its own main thread: libtest
+/// never runs a test on the process's main thread, which AppKit needs.
+/// `cargo test -p cursorjump --test smoke_pill -- --ignored`.
 #[cfg(debug_assertions)]
 pub fn run_smoke() -> Result<()> {
     use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
@@ -1243,15 +1271,18 @@ mod tests {
 
     #[test]
     fn cg_image_reads_the_pixmap_as_rgba_premultiplied() {
-        // Opaque red, then green at half alpha (premultiplied).
-        let px = [255, 0, 0, 255, 0, 128, 0, 128];
+        // Opaque orange, then blue at half alpha (premultiplied): no pixel
+        // reads the same with its bytes reversed or its alpha moved first.
+        let px = [255, 128, 0, 255, 0, 0, 128, 128];
         let mut pm = Pixmap::new(2, 1).expect("a pixmap");
         pm.data_mut().copy_from_slice(&px);
         let cg = cg_image(&pm).expect("an image");
-        // Drawn into a bitmap of the same layout, it comes back unchanged.
+        // Read back in a layout of its own, fixed here: X, R, G, B bytes
+        // (alpha skipped, 32-bit big-endian), drawn over black.
         let mut out = [0u8; 8];
+        // SAFETY: a static CoreGraphics name.
         let space = CGColorSpace::with_name(Some(unsafe { kCGColorSpaceSRGB })).expect("sRGB");
-        let info = CGImageAlphaInfo::PremultipliedLast.0 | CGImageByteOrderInfo::OrderDefault.0;
+        let xrgb = CGImageAlphaInfo::NoneSkipFirst.0 | CGImageByteOrderInfo::Order32Big.0;
         // SAFETY: `out` holds the 2 x 1 4-byte pixels and outlives the context.
         let ctx = unsafe {
             objc2_core_graphics::CGBitmapContextCreate(
@@ -1261,7 +1292,7 @@ mod tests {
                 8,
                 8,
                 Some(&space),
-                info,
+                xrgb,
             )
         }
         .expect("a bitmap context");
@@ -1271,8 +1302,11 @@ mod tests {
         );
         objc2_core_graphics::CGContext::draw_image(Some(&ctx), all, Some(&cg));
         drop(ctx);
-        for (got, want) in out.iter().zip(px) {
-            assert!(got.abs_diff(want) <= 1, "{out:?} != {px:?}");
+        let rgb = [&out[1..4], &out[5..8]];
+        let want: [[u8; 3]; 2] = [[255, 128, 0], [0, 0, 128]];
+        for (got, want) in rgb.iter().zip(want) {
+            let close = got.iter().zip(want).all(|(g, w)| g.abs_diff(w) <= 1);
+            assert!(close, "XRGB {out:?}: wanted RGB {want:?}");
         }
     }
 }
