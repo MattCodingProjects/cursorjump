@@ -18,7 +18,7 @@ use anyhow::{Context, Result, bail};
 use cj_core::dnd::{DragId, DragItem, FailReason, ItemKind, safe_rel_path, sanitize_component};
 use cj_core::layout::{Rect, Side};
 use tokio::sync::watch;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 use windows::Win32::Foundation::{HWND, POINT, POINTL, S_OK};
 use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
 use windows::Win32::System::Com::{
@@ -37,7 +37,7 @@ use windows::Win32::UI::Shell::{
 };
 use windows::core::{HSTRING, Ref, implement};
 
-use super::{State, with_state};
+use super::{State, WinDndEv, with_state};
 use crate::common::dnd_link::Source;
 
 /// How near the Mac edge (physical px) a held left button shows the strip.
@@ -227,10 +227,11 @@ fn offers(data: &IDataObject, f: &FORMATETC) -> bool {
     (unsafe { data.QueryGetData(f) }) == S_OK
 }
 
-/// An HGLOBAL medium's bytes, at most `limit` of them.
-fn hglobal_bytes(m: &Medium, limit: Option<u64>) -> Vec<u8> {
+/// An HGLOBAL medium's bytes, at most `limit` of them (the descriptor's
+/// size: `GlobalSize` may round the block up past the data).
+fn hglobal_bytes(m: &Medium, limit: Option<u64>) -> Result<Vec<u8>> {
     if m.0.tymed != TYMED_HGLOBAL.0 as u32 {
-        return Vec::new();
+        bail!("not an HGLOBAL (tymed {})", m.0.tymed);
     }
     // SAFETY: tymed says the union holds an HGLOBAL; it is locked for the
     // copy and its size comes from GlobalSize.
@@ -238,16 +239,15 @@ fn hglobal_bytes(m: &Medium, limit: Option<u64>) -> Vec<u8> {
         let h = m.0.u.hGlobal;
         let p = GlobalLock(h);
         if p.is_null() {
-            return Vec::new();
+            return Err(windows::core::Error::from_thread()).context("GlobalLock");
         }
         let mut n = GlobalSize(h);
         if let Some(limit) = limit {
-            // GlobalSize may round the block up past the data.
             n = n.min(usize::try_from(limit).unwrap_or(usize::MAX));
         }
         let v = std::slice::from_raw_parts(p.cast::<u8>(), n).to_vec();
         let _ = GlobalUnlock(h);
-        v
+        Ok(v)
     }
 }
 
@@ -288,7 +288,13 @@ fn descriptors(data: &IDataObject) -> Vec<(String, bool, Option<u64>)> {
     else {
         return Vec::new();
     };
-    parse_descriptors(&hglobal_bytes(&m, None))
+    match hglobal_bytes(&m, None) {
+        Ok(bytes) => parse_descriptors(&bytes),
+        Err(e) => {
+            debug!("catcher: descriptor unreadable: {e:#}");
+            Vec::new()
+        }
+    }
 }
 
 /// A FILEGROUPDESCRIPTORW: a u32 count, then that many FILEDESCRIPTORWs.
@@ -324,7 +330,7 @@ fn offered_url(data: &IDataObject) -> Option<String> {
     if !offers(data, &f) {
         return None;
     }
-    let bytes = hglobal_bytes(&get(data, &f).ok()?, None);
+    let bytes = hglobal_bytes(&get(data, &f).ok()?, None).ok()?;
     let units: Vec<u16> = bytes
         .as_chunks::<2>()
         .0
@@ -501,7 +507,8 @@ pub(super) fn spool(drag: DragId, data: &IDataObject, pending: Vec<Pending>) {
             }
             (Ok(_), Spool::Link { index, link_url }) => {
                 let url = read_link(data, *index).or_else(|| link_url.clone());
-                info!(drag, item = p.item, ?url, "catcher: web link");
+                let url = url.as_deref().map(url_for_log);
+                debug!(drag, item = p.item, ?url, "catcher: web link");
                 // Task 11b: download the link's target and resolve with its path.
                 Err(unreadable())
             }
@@ -565,7 +572,7 @@ fn read_contents(data: &IDataObject, lindex: u32, size: Option<u64>, to: &Path) 
 
 fn write_medium(m: &Medium, size: Option<u64>, out: &mut File) -> Result<u64> {
     if m.0.tymed == TYMED_HGLOBAL.0 as u32 {
-        let bytes = hglobal_bytes(m, size);
+        let bytes = hglobal_bytes(m, size)?;
         out.write_all(&bytes)?;
         return Ok(bytes.len() as u64);
     }
@@ -589,14 +596,32 @@ fn write_medium(m: &Medium, size: Option<u64>, out: &mut File) -> Result<u64> {
         }
         out.write_all(&buf[..got as usize])?;
         total += got as u64;
+        if total > stream_limit(size) {
+            bail!("the stream ran past {} bytes", stream_limit(size));
+        }
     }
+}
+
+/// Most a stream may run past the size its descriptor gave.
+const STREAM_SLACK: u64 = 1 << 20;
+/// Most a stream of unknown size may hold: 16 GiB, past any attachment or
+/// archive entry a person would drag, so a runaway source can't fill the disk.
+const UNSIZED_STREAM_CAP: u64 = 16 << 30;
+
+fn stream_limit(size: Option<u64>) -> u64 {
+    size.map_or(UNSIZED_STREAM_CAP, |s| s.saturating_add(STREAM_SLACK))
+}
+
+/// A link for the log: no query or fragment (they may carry tokens).
+fn url_for_log(url: &str) -> &str {
+    url.split(['?', '#']).next().unwrap_or_default()
 }
 
 /// A web link's target, from its shortcut file's contents.
 fn read_link(data: &IDataObject, lindex: u32) -> Option<String> {
     let f = formatetc(formats().contents, TYMED_HGLOBAL, lindex as i32);
     let m = get(data, &f).ok()?;
-    shortcut_url(&String::from_utf8_lossy(&hglobal_bytes(&m, None)))
+    shortcut_url(&String::from_utf8_lossy(&hglobal_bytes(&m, None).ok()?))
 }
 
 // ---------------------------------------------------------------- IDropTarget
@@ -676,15 +701,16 @@ impl IDropTarget_Impl for Target_Impl {
             let _ = unsafe { h.Drop(data, &POINT { x: pt.x, y: pt.y }, effect) };
         }
         if let Some((drag, pending)) = taken {
-            // Outside the state: the reads are cross-process calls, which
-            // pump this thread's messages while they wait.
+            // The catcher is already off the screen. Outside the state: the
+            // reads are cross-process calls, which pump this thread's
+            // messages (and so its commands) while they wait.
             match data {
                 Some(data) => spool(drag, data, pending),
                 None => pending
                     .into_iter()
                     .for_each(|p| p.resolve(Err(FailReason::Cancelled))),
             }
-            with_state(|s| s.dropped(drag));
+            with_state(|s| s.emit(WinDndEv::Spooled { drag }));
         }
         // Never MOVE: the source keeps its files.
         // SAFETY: OLE passes a valid in/out effect pointer.
@@ -866,6 +892,23 @@ mod tests {
         };
         assert_eq!(entries[0].parts, ["doc.txt"]);
         assert_eq!(entries[0].size, Some(3));
+    }
+
+    #[test]
+    fn streams_are_bounded_by_their_size_or_a_cap() {
+        assert_eq!(stream_limit(Some(10)), 10 + (1 << 20));
+        assert_eq!(stream_limit(Some(u64::MAX)), u64::MAX);
+        assert_eq!(stream_limit(None), 16 << 30);
+    }
+
+    #[test]
+    fn logged_urls_lose_their_query() {
+        assert_eq!(
+            url_for_log("https://cdn.example/a/image.png?ex=1&hm=secret#x"),
+            "https://cdn.example/a/image.png"
+        );
+        assert_eq!(url_for_log("https://x/y#frag"), "https://x/y");
+        assert_eq!(url_for_log("https://x/y"), "https://x/y");
     }
 
     #[test]

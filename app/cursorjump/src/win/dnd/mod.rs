@@ -11,19 +11,24 @@
 //!   on the Mac (`Park`), so that the user's real release, which the input
 //!   hook then lets through, lands on it and ends the drag with `Drop`.
 //! - The shield is 64×64 logical px around the park point while the cursor
-//!   is on the Mac. The input hook lets real left presses through only while
-//!   one of these windows lies under the park point
-//!   ([`DndShared::under_park_is_ours`]), so this thread then holds the
-//!   press's capture, which `DoDragDrop` needs for a drag from the Mac.
-//!   It ignores the clicks it gets.
+//!   is on the Mac and nothing rides (a riding catcher already covers the
+//!   park point, and the shield above it would take the drag off it). The
+//!   input hook lets a real left press through only while one of these
+//!   windows lies under the park point ([`DndShared::under_park_is_ours`]),
+//!   so the press goes to a cj-dnd window while the button is physically
+//!   down: what `DoDragDrop` on this thread needs (it takes the capture
+//!   itself) for a drag from the Mac. The shield ignores the clicks it gets.
 //!
 //! Neither window shows while a game holds the mouse: the strip needs the
 //! input thread's game check, and the shield needs the cursor on the Mac,
-//! where it can't cross while a game holds it.
+//! where it can't cross while a game holds it, and no foreground window
+//! covering the edge monitor. Neither shows without a session
+//! ([`DndShared::session_up`]).
 //!
-//! Commands are relayed by "cj-dnd-cmd", which wakes the thread with a
-//! thread message; they are drained after every message, so a wake lost to
-//! a COM modal loop only delays one.
+//! Commands are relayed by "cj-dnd-cmd", which posts `WM_APP` to the
+//! catcher window. Modal loops (COM calls, `DoDragDrop`) dispatch window
+//! messages, so commands keep flowing inside them; they are also drained
+//! after every message the main loop dispatches.
 mod catcher;
 
 use std::cell::RefCell;
@@ -38,7 +43,8 @@ use cj_core::dnd::{DragId, DragItem, FailReason};
 use cj_core::layout::{Rect, Side};
 use tracing::{debug, error, info, warn};
 use windows::Win32::Foundation::{
-    COLORREF, ERROR_CLASS_ALREADY_EXISTS, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM,
+    COLORREF, ERROR_CLASS_ALREADY_EXISTS, ERROR_INVALID_WINDOW_HANDLE, HINSTANCE, HWND, LPARAM,
+    LRESULT, POINT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
     BLACK_BRUSH, GetStockObject, HBRUSH, MONITOR_DEFAULTTONEAREST, MonitorFromPoint,
@@ -49,14 +55,13 @@ use windows::Win32::System::Ole::{
     DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_NONE, IDropTarget, OleInitialize, OleUninitialize,
     RegisterDragDrop, RevokeDragDrop,
 };
-use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
 use windows::Win32::UI::Shell::{CLSID_DragDropHelper, IDropTargetHelper};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW,
-    HWND_TOPMOST, IDC_ARROW, KillTimer, LWA_ALPHA, LoadCursorW, MA_NOACTIVATE, MSG,
-    PostThreadMessageW, RegisterClassExW, SW_HIDE, SWP_NOACTIVATE, SWP_SHOWWINDOW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, HWND_TOPMOST,
+    IDC_ARROW, KillTimer, LWA_ALPHA, LoadCursorW, MA_NOACTIVATE, MSG, PostMessageW,
+    PostQuitMessage, RegisterClassExW, SW_HIDE, SWP_NOACTIVATE, SWP_SHOWWINDOW,
     SetLayeredWindowAttributes, SetTimer, SetWindowPos, ShowWindow, WM_APP, WM_DISPLAYCHANGE,
     WM_DPICHANGED, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK,
     WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP,
@@ -76,29 +81,35 @@ use crate::common::dnd_link::Source;
 const CLASS: PCWSTR = w!("CursorJumpCatcher");
 /// The shield's side, logical px.
 const SHIELD_PX: f32 = 64.0;
-/// While the catcher covers the screen and the cursor is on the PC, how
-/// often it checks that a drag still holds the left button.
+/// While the catcher covers the screen, how often it checks that a drag
+/// still holds the left button.
 const STUCK_POLL: Duration = Duration::from_millis(250);
 /// Left button up this long with the catcher still over the screen: no drag
 /// can end on it any more, so it goes.
 const STUCK_AFTER: Duration = Duration::from_millis(500);
 /// The catcher's timer id for the stuck check.
 const STUCK_TIMER: usize = 1;
+/// The relay's last wake (the one that stops the thread) is retried this
+/// often, for up to `LAST_WAKE_LIMIT`.
+const LAST_WAKE_STEP: Duration = Duration::from_millis(10);
+const LAST_WAKE_LIMIT: Duration = Duration::from_secs(1);
 
 /// App and input thread → cj-dnd.
 #[derive(Debug, Clone)]
 pub enum DndCmd {
     /// Show (true) or hide the edge strip. The input thread sends it while on
     /// the PC: true only while the left button alone is held within
-    /// `CATCH_ZONE_PX` of the Mac edge and no game holds the mouse.
+    /// `CATCH_ZONE_PX` of the Mac edge, a session is up and no game holds
+    /// the mouse. It sends false on entering the Mac.
     CatcherZone(bool),
     /// true: grow the catcher over the virtual screen and accept the drop.
     /// The input thread sends it on entering the Mac with a drag, before it
-    /// parks the cursor, and waits for [`DndShared::parked`]. false: shrink
-    /// it back to the strip, or hide it.
+    /// parks the cursor, and waits for [`DndShared::parked`]. Refused
+    /// without a session. false: shrink it back to the strip, or hide it.
     Park(bool),
-    /// The shield around the park point. The input thread sends true after
-    /// parking the cursor on the Mac and false on its return.
+    /// The shield around the park point. The input thread sends true while
+    /// on the Mac and no foreground window covers the edge monitor, false
+    /// otherwise and on its return. true is refused without a session.
     Shield(bool),
     /// A forced return while `drag` rides: refuse the drop (`DragOver` says
     /// NONE) and stay over the screen until the user's real release ends the
@@ -134,13 +145,16 @@ pub struct DndShared {
     pub offer: AtomicU64,
     /// The physical left button, from Raw Input.
     pub left_down: AtomicBool,
-    /// `WindowFromPoint(park point)` is the shield or the catcher. Kept by
-    /// the input thread while on the Mac (after parking, every 250 ms and on
-    /// display changes), and by cj-dnd right after it moves a window, so
-    /// the hook never asks Windows itself.
+    /// `WindowFromPoint(park point)` is the shield or the catcher, and no
+    /// foreground window covers the edge monitor. Kept by the input thread
+    /// while on the Mac (after parking, every 50 ms and on display
+    /// changes), so the hook never asks Windows itself.
     pub under_park_is_ours: AtomicBool,
     /// The catcher covers the virtual screen.
     pub parked: AtomicBool,
+    /// A session with the Mac is up (the app sets it). Without one there is
+    /// no strip, no offer, no shield and no park.
+    pub session_up: AtomicBool,
     catcher: AtomicIsize,
     shield: AtomicIsize,
 }
@@ -187,19 +201,19 @@ pub fn spawn_dnd_thread(
 ) -> Result<mpsc::Sender<DndCmd>> {
     let (cmd_tx, cmd_rx) = mpsc::channel::<DndCmd>();
     let (relay_tx, relay_rx) = mpsc::channel::<DndCmd>();
-    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<u32>>(1);
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<isize>>(1);
     std::thread::Builder::new()
         .name("cj-dnd".into())
         .spawn(move || run(cfg, shared, Box::new(events), relay_rx, ready_tx))
         .context("spawn dnd thread")?;
-    // The thread reports its id once its windows (and so its queue) exist.
-    let tid = ready_rx.recv().context("dnd thread exited at start")??;
+    // The thread reports its catcher window once it exists.
+    let catcher = ready_rx.recv().context("dnd thread exited at start")??;
     std::thread::Builder::new()
         .name("cj-dnd-cmd".into())
-        .spawn(move || relay(cmd_rx, relay_tx, tid))
+        .spawn(move || relay(cmd_rx, relay_tx, catcher))
         .inspect_err(|_| {
             // The relay's sender is gone: let the thread see it and stop.
-            wake(tid);
+            last_wake(catcher);
         })
         .context("spawn dnd command relay")?;
     Ok(cmd_tx)
@@ -207,25 +221,39 @@ pub fn spawn_dnd_thread(
 
 /// Forwards commands and wakes cj-dnd; once every sender is gone, drops its
 /// own so the thread stops.
-fn relay(from: mpsc::Receiver<DndCmd>, to: mpsc::Sender<DndCmd>, tid: u32) {
+fn relay(from: mpsc::Receiver<DndCmd>, to: mpsc::Sender<DndCmd>, catcher: isize) {
     for cmd in from {
         if to.send(cmd).is_err() {
             return; // The dnd thread is gone.
         }
-        wake(tid);
+        if let Err(e) = wake(catcher) {
+            // The next wake, or the next message, drains it.
+            warn!("dnd thread wake failed: {e}");
+        }
     }
     drop(to);
-    wake(tid);
+    last_wake(catcher);
 }
 
-fn wake(tid: u32) -> bool {
-    // SAFETY: plain FFI call; a thread that is gone just makes it fail.
-    match unsafe { PostThreadMessageW(tid, WM_APP, WPARAM(0), LPARAM(0)) } {
-        Ok(()) => true,
-        Err(e) => {
-            warn!("dnd thread wake failed: {e}");
-            false
+fn wake(catcher: isize) -> windows::core::Result<()> {
+    let hwnd = HWND(catcher as *mut _);
+    // SAFETY: plain FFI call; a window that is gone just makes it fail.
+    unsafe { PostMessageW(Some(hwnd), WM_APP, WPARAM(0), LPARAM(0)) }
+}
+
+/// The wake that lets the thread see the relay is gone: retried, so the
+/// thread never waits for a message that isn't coming.
+fn last_wake(catcher: isize) {
+    let started = Instant::now();
+    while let Err(e) = wake(catcher) {
+        if e.code() == ERROR_INVALID_WINDOW_HANDLE.to_hresult() {
+            return; // The thread has already gone.
         }
+        if started.elapsed() >= LAST_WAKE_LIMIT {
+            error!("dnd thread: last wake failed for {LAST_WAKE_LIMIT:?}: {e}");
+            return;
+        }
+        std::thread::sleep(LAST_WAKE_STEP);
     }
 }
 
@@ -254,12 +282,6 @@ fn scale_at((x, y): (i32, i32)) -> f32 {
     }
 }
 
-fn cursor_pos() -> Option<(i32, i32)> {
-    let mut pt = POINT::default();
-    // SAFETY: valid out-pointer to a stack local.
-    unsafe { GetCursorPos(&mut pt) }.ok().map(|()| (pt.x, pt.y))
-}
-
 fn left_button_down() -> bool {
     // SAFETY: GetAsyncKeyState has no preconditions.
     (unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } as u16) & 0x8000 != 0
@@ -272,6 +294,152 @@ fn fresh_drag_id() -> DragId {
         if id != 0 {
             return id;
         }
+    }
+}
+
+/// Where the catcher is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CatcherAt {
+    Hidden,
+    Strip,
+    Screen,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Placement {
+    catcher: CatcherAt,
+    shield: bool,
+}
+
+/// An offer the modes let go of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Released {
+    drag: DragId,
+    /// The app doesn't know yet: emit `OfferGone`.
+    tell: bool,
+}
+
+/// The catcher's modes and the drag it holds, apart from the windows and
+/// the data (pure, so it can be tested).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct Modes {
+    zone: bool,
+    parked: bool,
+    /// While parked: refuse the drop (after `Cancel`).
+    reject: bool,
+    shield_on: bool,
+    offer: Option<DragId>,
+}
+
+impl Modes {
+    fn placement(&self) -> Placement {
+        let catcher = if self.parked {
+            CatcherAt::Screen
+        } else if self.zone {
+            CatcherAt::Strip
+        } else {
+            CatcherAt::Hidden
+        };
+        Placement {
+            catcher,
+            // A riding catcher covers the park point: the shield above it
+            // would take the drag off the drop target.
+            shield: self.shield_on && !self.parked,
+        }
+    }
+
+    /// While the drag rides on the Mac its image would sit at the park point.
+    fn image_hidden(&self) -> bool {
+        self.parked && !self.reject
+    }
+
+    fn unpark(&mut self) {
+        self.parked = false;
+        self.reject = false;
+    }
+
+    fn release(&mut self, tell: bool) -> Option<Released> {
+        self.offer.take().map(|drag| Released { drag, tell })
+    }
+
+    fn command(&mut self, cmd: &DndCmd, session_up: bool) -> Option<Released> {
+        match *cmd {
+            DndCmd::CatcherZone(on) => self.zone = on,
+            DndCmd::Park(true) | DndCmd::Shield(true) if !session_up => {
+                debug!(?cmd, "dnd: refused without a session");
+            }
+            DndCmd::Park(true) => {
+                self.parked = true;
+                self.reject = false;
+            }
+            DndCmd::Park(false) => self.unpark(),
+            DndCmd::Shield(on) => self.shield_on = on,
+            DndCmd::Cancel { drag } => {
+                if self.parked && self.offer == Some(drag) {
+                    info!(drag, "catcher: cancelled while riding; refusing the drop");
+                    self.reject = true;
+                    return self.release(false);
+                }
+                debug!(drag, "catcher: Cancel for a drag it doesn't hold");
+            }
+            DndCmd::Home { drag } => {
+                if self.reject {
+                    debug!(drag, "catcher: Home while refusing a cancelled drag");
+                    return None;
+                }
+                self.unpark();
+                if self.offer == Some(drag) {
+                    return self.release(false);
+                }
+            }
+            DndCmd::ApplyConfig(_) => {}
+        }
+        None
+    }
+
+    /// A drag arrived: `fresh` is its new id if it may be offered (files, a
+    /// copy allowed, a session up). Returns whether it is taken, and a stale
+    /// offer let go of.
+    fn enter(&mut self, fresh: Option<DragId>) -> (bool, Option<Released>) {
+        if self.reject {
+            return (false, None);
+        }
+        let stale = self.release(true);
+        self.offer = fresh;
+        (fresh.is_some(), stale)
+    }
+
+    fn over(&self) -> bool {
+        self.offer.is_some() && !self.reject
+    }
+
+    /// The drag left, or ended without a drop.
+    fn leave(&mut self) -> Option<Released> {
+        if self.parked && !self.reject {
+            info!("catcher: the drag ended while riding, without a drop");
+        }
+        self.unpark();
+        self.release(true)
+    }
+
+    /// The release landed on the catcher. Taken only while riding and not
+    /// refusing; it unparks at once, so the catcher never covers the PC
+    /// while the items are written out. Otherwise it is a leave.
+    fn take_drop(&mut self) -> Result<DragId, Option<Released>> {
+        match self.offer {
+            Some(drag) if self.parked && !self.reject => {
+                self.unpark();
+                self.offer = None;
+                Ok(drag)
+            }
+            _ => Err(self.leave()),
+        }
+    }
+
+    /// Over the screen with the button up for a while: no drag can end on it.
+    fn stuck(&mut self) -> Option<Released> {
+        self.unpark();
+        self.release(true)
     }
 }
 
@@ -323,13 +491,6 @@ impl Win {
     }
 }
 
-/// The drag the catcher holds.
-struct Offer {
-    drag: DragId,
-    /// Its virtual items, written out in `Drop`.
-    pending: Vec<Pending>,
-}
-
 struct State {
     shared: Arc<DndShared>,
     events: Box<dyn Fn(WinDndEv) + Send>,
@@ -338,21 +499,19 @@ struct State {
     catcher: Win,
     shield: Win,
     helper: Option<IDropTargetHelper>,
-    zone: bool,
-    parked: bool,
-    /// While parked: refuse the drop (after `Cancel`).
-    reject: bool,
-    shield_on: bool,
-    offer: Option<Offer>,
+    modes: Modes,
+    /// The offer's virtual items, written out in `Drop`.
+    pending: Vec<Pending>,
     /// Whether `IDropTargetHelper::Show(false)` is in force.
     image_hidden: bool,
     stuck_timer: bool,
-    /// Since when the left button has been up with the catcher stuck over the screen.
+    /// Since when the left button has been up with the catcher over the screen.
     up_since: Option<Instant>,
 }
 
 thread_local! {
     static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
+    static CMDS: RefCell<Option<mpsc::Receiver<DndCmd>>> = const { RefCell::new(None) };
 }
 
 /// Run `f` on the thread state. `None` if it is absent or already borrowed:
@@ -364,12 +523,36 @@ fn with_state<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> {
     })
 }
 
+/// Run the queued commands. While the state is busy (a modal loop inside
+/// one of its calls) they wait for the next drain. Once every sender is
+/// gone, the message loop is told to quit.
+fn drain_commands() {
+    loop {
+        if STATE.with(|cell| cell.try_borrow_mut().is_err()) {
+            return;
+        }
+        let next = CMDS.with(|cell| cell.borrow().as_ref().map(mpsc::Receiver::try_recv));
+        match next {
+            Some(Ok(cmd)) => {
+                with_state(|s| s.on_command(cmd));
+            }
+            Some(Err(mpsc::TryRecvError::Empty)) | None => return,
+            Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                CMDS.with(|cell| cell.borrow_mut().take());
+                // SAFETY: plain FFI call on this thread.
+                unsafe { PostQuitMessage(0) };
+                return;
+            }
+        }
+    }
+}
+
 fn run(
     cfg: Config,
     shared: Arc<DndShared>,
     events: Box<dyn Fn(WinDndEv) + Send>,
     cmds: mpsc::Receiver<DndCmd>,
-    ready: mpsc::SyncSender<Result<u32>>,
+    ready: mpsc::SyncSender<Result<isize>>,
 ) {
     // SAFETY: OLE (an STA) on this thread for its whole life; paired below.
     if let Err(e) = unsafe { OleInitialize(None) } {
@@ -378,11 +561,13 @@ fn run(
     }
     match State::new(cfg, shared, events) {
         Ok(state) => {
+            let catcher = state.catcher.hwnd.0 as isize;
             STATE.with(|cell| *cell.borrow_mut() = Some(state));
-            // SAFETY: plain FFI call.
-            if ready.send(Ok(unsafe { GetCurrentThreadId() })).is_ok() {
-                message_loop(&cmds);
+            CMDS.with(|cell| *cell.borrow_mut() = Some(cmds));
+            if ready.send(Ok(catcher)).is_ok() {
+                message_loop();
             }
+            CMDS.with(|cell| cell.borrow_mut().take());
             // Dropping the state revokes the target and destroys the windows.
             STATE.with(|cell| cell.borrow_mut().take());
         }
@@ -395,27 +580,14 @@ fn run(
     info!("dnd thread: stopped");
 }
 
-fn message_loop(cmds: &mpsc::Receiver<DndCmd>) {
+fn message_loop() {
     let mut msg = MSG::default();
-    loop {
-        // 0 = WM_QUIT, -1 = error.
-        // SAFETY: standard message pump on the thread that owns the windows.
-        if unsafe { GetMessageW(&mut msg, None, 0, 0) }.0 <= 0 {
-            return;
-        }
-        if !(msg.hwnd.is_invalid() && msg.message == WM_APP) {
-            // SAFETY: `msg` was just filled in by GetMessageW on this thread.
-            unsafe { DispatchMessageW(&msg) };
-        }
-        loop {
-            match cmds.try_recv() {
-                Ok(cmd) => {
-                    with_state(|s| s.on_command(cmd));
-                }
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => return,
-            }
-        }
+    // 0 = WM_QUIT, -1 = error.
+    // SAFETY: standard message pump on the thread that owns the windows.
+    while unsafe { GetMessageW(&mut msg, None, 0, 0) }.0 > 0 {
+        // SAFETY: `msg` was just filled in by GetMessageW on this thread.
+        unsafe { DispatchMessageW(&msg) };
+        drain_commands();
     }
 }
 
@@ -497,11 +669,8 @@ impl State {
             catcher: Win::new(catcher),
             shield: Win::new(shield),
             helper: None,
-            zone: false,
-            parked: false,
-            reject: false,
-            shield_on: false,
-            offer: None,
+            modes: Modes::default(),
+            pending: Vec::new(),
             image_hidden: false,
             stuck_timer: false,
             up_since: None,
@@ -514,14 +683,9 @@ impl State {
             unsafe { CoCreateInstance(&CLSID_DragDropHelper, None, CLSCTX_INPROC_SERVER) }
                 .inspect_err(|e| warn!("dnd: no IDropTargetHelper: {e}"))
                 .ok();
-        state
-            .shared
-            .catcher
-            .store(catcher.0 as isize, Ordering::Release);
-        state
-            .shared
-            .shield
-            .store(shield.0 as isize, Ordering::Release);
+        let shared = &state.shared;
+        shared.catcher.store(catcher.0 as isize, Ordering::Release);
+        shared.shield.store(shield.0 as isize, Ordering::Release);
         info!(edge = ?state.edge, side = ?state.side, "dnd thread: ready");
         Ok(state)
     }
@@ -532,63 +696,33 @@ impl State {
         }
     }
 
+    fn session_up(&self) -> bool {
+        self.shared.session_up.load(Ordering::Acquire)
+    }
+
     fn on_command(&mut self, cmd: DndCmd) {
         debug!(?cmd, "dnd: command");
-        match cmd {
-            DndCmd::CatcherZone(on) => self.zone = on,
-            DndCmd::Park(true) => {
-                self.parked = true;
-                self.reject = false;
-            }
-            DndCmd::Park(false) => self.unpark(),
-            DndCmd::Shield(on) => self.shield_on = on,
-            DndCmd::Cancel { drag } => {
-                if self.parked && self.holds(drag) {
-                    info!(drag, "catcher: cancelled while riding; refusing the drop");
-                    self.reject = true;
-                    self.forget_offer();
-                } else {
-                    debug!(drag, "catcher: Cancel for a drag it doesn't hold");
-                }
-            }
-            DndCmd::Home { drag } => {
-                if self.reject {
-                    debug!(
-                        drag,
-                        "catcher: Home while refusing a cancelled drag; ignored"
-                    );
-                } else {
-                    self.unpark();
-                    if self.holds(drag) {
-                        self.forget_offer();
-                    }
-                }
-            }
-            DndCmd::ApplyConfig(cfg) => {
-                self.side = cfg.mac_side;
-                self.refresh_edge();
-            }
+        let released = self.modes.command(&cmd, self.session_up());
+        self.settle(released);
+        if let DndCmd::ApplyConfig(cfg) = cmd {
+            self.side = cfg.mac_side;
+            self.refresh_edge();
         }
         self.apply();
     }
 
-    fn holds(&self, drag: DragId) -> bool {
-        self.offer.as_ref().is_some_and(|o| o.drag == drag)
-    }
-
-    fn unpark(&mut self) {
-        self.parked = false;
-        self.reject = false;
-    }
-
-    /// Drop the offer; its pending items fail `Cancelled`.
-    fn forget_offer(&mut self) -> Option<DragId> {
-        let offer = self.offer.take()?;
+    /// An offer the modes let go of: its pending items fail `Cancelled`.
+    fn settle(&mut self, released: Option<Released>) {
+        let Some(Released { drag, tell }) = released else {
+            return;
+        };
         self.shared.offer.store(0, Ordering::Release);
-        for p in offer.pending {
+        for p in self.pending.drain(..) {
             p.resolve(Err(FailReason::Cancelled));
         }
-        Some(offer.drag)
+        if tell {
+            self.emit(WinDndEv::OfferGone { drag });
+        }
     }
 
     fn refresh_edge(&mut self) {
@@ -604,35 +738,26 @@ impl State {
     /// Put both windows where the modes say, and keep the drag image and
     /// the stuck check in step.
     fn apply(&mut self) {
-        let catcher = if self.parked {
-            Some(virtual_screen())
-        } else if self.zone {
-            self.edge.map(|e| strip_rect(e, self.side))
-        } else {
-            None
+        let placement = self.modes.placement();
+        let catcher = match placement.catcher {
+            CatcherAt::Hidden => None,
+            CatcherAt::Strip => self.edge.map(|e| strip_rect(e, self.side)),
+            CatcherAt::Screen => Some(virtual_screen()),
         };
         let shield = self
             .edge
-            .filter(|_| self.shield_on)
+            .filter(|_| placement.shield)
             .map(|e| rect_center(&e))
             .map(|park| shield_rect(park, scale_at(park)));
         self.catcher.place(catcher);
         self.shield.place(shield);
-        self.shared.parked.store(self.parked, Ordering::Release);
-        if self.shield_on
-            && let Some(park) = cursor_pos()
-        {
-            // The cursor is parked: this is the input thread's check, sooner.
-            let ours = ours_under(&self.shared, park);
-            self.shared
-                .under_park_is_ours
-                .store(ours, Ordering::Release);
-        }
-        self.set_image_hidden(self.parked && !self.reject);
-        self.set_stuck_timer(self.parked && !self.shield_on);
+        self.shared
+            .parked
+            .store(self.modes.parked, Ordering::Release);
+        self.set_image_hidden(self.modes.image_hidden());
+        self.set_stuck_timer(self.modes.parked);
     }
 
-    /// While the drag rides on the Mac its image would sit at the park point.
     fn set_image_hidden(&mut self, hide: bool) {
         if hide == self.image_hidden {
             return;
@@ -668,10 +793,12 @@ impl State {
         }
     }
 
-    /// Covering the screen on the PC with no button held, no drag can end on
-    /// the catcher any more (the source died, or an event went missing).
+    /// Covering the screen with no button held, no drag can end on the
+    /// catcher any more (the source died, or an event went missing). On the
+    /// Mac too: a ride's real release reaches Windows, so the button state is
+    /// right there as well.
     fn check_stuck(&mut self) {
-        if !self.parked || self.shield_on || left_button_down() {
+        if !self.modes.parked || left_button_down() {
             self.up_since = None;
             return;
         }
@@ -680,33 +807,28 @@ impl State {
             return;
         }
         warn!("catcher: over the screen with no drag holding the button; unparking");
-        self.unpark();
-        if let Some(drag) = self.forget_offer() {
-            self.emit(WinDndEv::OfferGone { drag });
-        }
+        let released = self.modes.stuck();
+        self.settle(released);
         self.apply();
     }
 
     // ------------------------------------------------ IDropTarget decisions
 
     fn enter(&mut self, offered: Option<Offered>, allowed: DROPEFFECT) -> DROPEFFECT {
-        if self.reject {
-            return DROPEFFECT_NONE;
+        let copy = allowed.0 & DROPEFFECT_COPY.0 != 0;
+        if offered.is_some() && !copy {
+            debug!("catcher: the source doesn't allow a copy; refused");
         }
-        if let Some(stale) = self.forget_offer() {
-            self.emit(WinDndEv::OfferGone { drag: stale });
-        }
-        let Some(offered) = offered else {
+        let offered = offered.filter(|_| copy && self.session_up());
+        let fresh = offered.as_ref().map(|_| fresh_drag_id());
+        let (taken, stale) = self.modes.enter(fresh);
+        self.settle(stale);
+        let (true, Some(drag), Some(offered)) = (taken, fresh, offered) else {
             return DROPEFFECT_NONE;
         };
-        if allowed.0 & DROPEFFECT_COPY.0 == 0 {
-            debug!("catcher: the source doesn't allow a copy; refused");
-            return DROPEFFECT_NONE;
-        }
-        let drag = fresh_drag_id();
         let (items, sources, pending) = into_offer(offered);
         info!(drag, ?items, "catcher: offer");
-        self.offer = Some(Offer { drag, pending });
+        self.pending = pending;
         self.shared.offer.store(drag, Ordering::Release);
         self.emit(WinDndEv::Offer {
             drag,
@@ -717,7 +839,7 @@ impl State {
     }
 
     fn over(&self, allowed: DROPEFFECT) -> DROPEFFECT {
-        if self.offer.is_some() && !self.reject && allowed.0 & DROPEFFECT_COPY.0 != 0 {
+        if self.modes.over() && allowed.0 & DROPEFFECT_COPY.0 != 0 {
             DROPEFFECT_COPY
         } else {
             DROPEFFECT_NONE
@@ -725,56 +847,38 @@ impl State {
     }
 
     fn leave(&mut self) {
-        if self.parked {
-            if !self.reject {
-                info!("catcher: the drag ended while riding, without a drop");
-            }
-            self.unpark();
-        }
-        if let Some(drag) = self.forget_offer() {
-            self.emit(WinDndEv::OfferGone { drag });
-        }
+        let released = self.modes.leave();
+        self.settle(released);
         self.apply();
     }
 
-    /// The release landed on the catcher. Accepted only while parked and
-    /// not refusing: the drag and the items to write out. On the strip (the
-    /// user let go at the edge without crossing) nothing is taken.
+    /// The release landed on the catcher. Taken only while riding: the drag
+    /// and the items to write out, with the catcher already off the screen.
     fn take_drop(&mut self) -> Option<(DragId, Vec<Pending>)> {
-        let offer = match self.offer.take() {
-            Some(offer) if self.parked && !self.reject => offer,
-            offer => {
-                self.offer = offer;
-                self.leave();
-                return None;
+        match self.modes.take_drop() {
+            Ok(drag) => {
+                self.shared.offer.store(0, Ordering::Release);
+                let pending = std::mem::take(&mut self.pending);
+                info!(drag, pending = pending.len(), "catcher: drop");
+                self.apply();
+                Some((drag, pending))
             }
-        };
-        self.shared.offer.store(0, Ordering::Release);
-        info!(
-            drag = offer.drag,
-            pending = offer.pending.len(),
-            "catcher: drop"
-        );
-        Some((offer.drag, offer.pending))
-    }
-
-    /// After `take_drop`'s items are written out.
-    fn dropped(&mut self, drag: DragId) {
-        self.unpark();
-        self.apply();
-        self.emit(WinDndEv::Spooled { drag });
+            Err(released) => {
+                self.settle(released);
+                self.apply();
+                None
+            }
+        }
     }
 }
 
 impl Drop for State {
     fn drop(&mut self) {
-        self.forget_offer();
+        let released = self.modes.release(false);
+        self.settle(released);
         self.shared.catcher.store(0, Ordering::Release);
         self.shared.shield.store(0, Ordering::Release);
         self.shared.parked.store(false, Ordering::Release);
-        self.shared
-            .under_park_is_ours
-            .store(false, Ordering::Release);
         // SAFETY: undoes RegisterDragDrop on the same thread (harmless if it
         // never happened), then destroys our own windows once.
         unsafe {
@@ -793,6 +897,10 @@ unsafe extern "system" fn catcher_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match msg {
+        WM_APP => {
+            drain_commands();
+            return LRESULT(0);
+        }
         WM_MOUSEACTIVATE => return LRESULT(MA_NOACTIVATE as isize),
         // Presses passed through by the input hook land here: nothing to do.
         WM_LBUTTONDOWN | WM_LBUTTONUP | WM_LBUTTONDBLCLK | WM_RBUTTONDOWN | WM_RBUTTONUP
@@ -816,6 +924,7 @@ unsafe extern "system" fn catcher_proc(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows::Win32::UI::WindowsAndMessaging::IsWindowVisible;
 
     #[test]
     fn shield_rect_is_centred_on_the_park_point_and_scaled() {
@@ -831,6 +940,184 @@ mod tests {
         assert_eq!(shield_rect((-540, 560), 2.0), r(-604, 496, -476, 624));
     }
 
+    fn place(catcher: CatcherAt, shield: bool) -> Placement {
+        Placement { catcher, shield }
+    }
+
+    fn cmd(m: &mut Modes, c: DndCmd) -> Option<Released> {
+        m.command(&c, true)
+    }
+
+    #[test]
+    fn placement_keeps_the_shield_off_a_riding_catcher() {
+        let mut m = Modes::default();
+        assert_eq!(m.placement(), place(CatcherAt::Hidden, false));
+        cmd(&mut m, DndCmd::CatcherZone(true));
+        assert_eq!(m.placement(), place(CatcherAt::Strip, false));
+        cmd(&mut m, DndCmd::Park(true));
+        assert_eq!(m.placement(), place(CatcherAt::Screen, false));
+        // On the Mac while riding: the catcher alone covers the park point.
+        cmd(&mut m, DndCmd::Shield(true));
+        assert_eq!(m.placement(), place(CatcherAt::Screen, false));
+        cmd(&mut m, DndCmd::CatcherZone(false));
+        assert_eq!(m.placement(), place(CatcherAt::Screen, false));
+        // The ride ends on the Mac: the shield comes back.
+        cmd(&mut m, DndCmd::Park(false));
+        assert_eq!(m.placement(), place(CatcherAt::Hidden, true));
+        cmd(&mut m, DndCmd::Shield(false));
+        assert_eq!(m.placement(), place(CatcherAt::Hidden, false));
+    }
+
+    #[test]
+    fn modes_refuse_shield_and_park_without_a_session() {
+        let mut m = Modes::default();
+        m.command(&DndCmd::Park(true), false);
+        m.command(&DndCmd::Shield(true), false);
+        m.command(&DndCmd::CatcherZone(true), false);
+        assert_eq!(m.placement(), place(CatcherAt::Strip, false));
+        assert!(!m.parked);
+    }
+
+    #[test]
+    fn modes_offer_then_leave_tells_the_app() {
+        let mut m = Modes::default();
+        cmd(&mut m, DndCmd::CatcherZone(true));
+        assert_eq!(m.enter(Some(7)), (true, None));
+        assert!(m.over());
+        // A new drag replaces a stale offer, which the app hears about.
+        assert_eq!(
+            m.enter(Some(8)),
+            (
+                true,
+                Some(Released {
+                    drag: 7,
+                    tell: true
+                })
+            )
+        );
+        assert_eq!(
+            m.leave(),
+            Some(Released {
+                drag: 8,
+                tell: true
+            })
+        );
+        assert!(!m.over());
+        // Not files (or no session): nothing offered.
+        assert_eq!(m.enter(None), (false, None));
+        assert!(!m.over());
+        assert_eq!(m.leave(), None);
+    }
+
+    #[test]
+    fn modes_drop_on_the_strip_takes_nothing() {
+        let mut m = Modes::default();
+        cmd(&mut m, DndCmd::CatcherZone(true));
+        m.enter(Some(7));
+        assert_eq!(
+            m.take_drop(),
+            Err(Some(Released {
+                drag: 7,
+                tell: true
+            }))
+        );
+        assert_eq!(m.placement(), place(CatcherAt::Strip, false));
+    }
+
+    #[test]
+    fn modes_ride_drop_unparks_before_spooling() {
+        let mut m = Modes::default();
+        cmd(&mut m, DndCmd::CatcherZone(true));
+        m.enter(Some(7));
+        cmd(&mut m, DndCmd::Park(true));
+        cmd(&mut m, DndCmd::CatcherZone(false));
+        cmd(&mut m, DndCmd::Shield(true));
+        assert!(m.image_hidden());
+        assert_eq!(m.take_drop(), Ok(7));
+        assert_eq!(m.placement(), place(CatcherAt::Hidden, true));
+        assert!(!m.image_hidden());
+        assert_eq!(m.offer, None);
+    }
+
+    #[test]
+    fn modes_ride_without_a_drop_ends_on_leave() {
+        let mut m = Modes::default();
+        m.enter(Some(7));
+        cmd(&mut m, DndCmd::Park(true));
+        assert_eq!(
+            m.leave(),
+            Some(Released {
+                drag: 7,
+                tell: true
+            })
+        );
+        assert!(!m.parked);
+    }
+
+    #[test]
+    fn modes_cancel_refuses_until_the_release() {
+        let mut m = Modes::default();
+        m.enter(Some(7));
+        // Not riding: not its business.
+        assert_eq!(cmd(&mut m, DndCmd::Cancel { drag: 7 }), None);
+        cmd(&mut m, DndCmd::Park(true));
+        assert_eq!(cmd(&mut m, DndCmd::Cancel { drag: 9 }), None);
+        assert_eq!(
+            cmd(&mut m, DndCmd::Cancel { drag: 7 }),
+            Some(Released {
+                drag: 7,
+                tell: false
+            })
+        );
+        assert_eq!(m.placement().catcher, CatcherAt::Screen);
+        assert!(!m.over());
+        assert!(!m.image_hidden(), "the user sees the drag refused");
+        // Nothing new is offered while refusing, and Home doesn't unpark.
+        assert_eq!(m.enter(Some(8)), (false, None));
+        assert_eq!(cmd(&mut m, DndCmd::Home { drag: 7 }), None);
+        assert!(m.parked);
+        // The real release: no drop, back off the screen.
+        assert_eq!(m.take_drop(), Err(None));
+        assert!(!m.parked && !m.reject);
+    }
+
+    #[test]
+    fn modes_home_unparks_and_clears_the_offer() {
+        let mut m = Modes::default();
+        m.enter(Some(7));
+        cmd(&mut m, DndCmd::Park(true));
+        assert_eq!(
+            cmd(&mut m, DndCmd::Home { drag: 7 }),
+            Some(Released {
+                drag: 7,
+                tell: false
+            })
+        );
+        assert!(!m.parked);
+        assert_eq!(m.offer, None);
+        // Home for another drag still unparks, and keeps the offer.
+        m.enter(Some(8));
+        cmd(&mut m, DndCmd::Park(true));
+        assert_eq!(cmd(&mut m, DndCmd::Home { drag: 7 }), None);
+        assert!(!m.parked);
+        assert_eq!(m.offer, Some(8));
+    }
+
+    #[test]
+    fn modes_stuck_unparks_and_tells() {
+        let mut m = Modes::default();
+        m.enter(Some(7));
+        cmd(&mut m, DndCmd::Park(true));
+        assert_eq!(
+            m.stuck(),
+            Some(Released {
+                drag: 7,
+                tell: true
+            })
+        );
+        assert_eq!(m.placement(), place(CatcherAt::Hidden, false));
+    }
+
     #[test]
     fn thread_stops_when_the_sender_is_dropped() {
         // The thread owns `events`; its channel closes once the thread ends.
@@ -843,6 +1130,19 @@ mod tests {
         })
         .expect("spawn");
         assert_ne!(shared.catcher.load(Ordering::Acquire), 0);
+        // Commands arrive through the catcher window: the strip shows.
+        let catcher = HWND(shared.catcher.load(Ordering::Acquire) as *mut _);
+        // SAFETY: plain FFI call on a window handle.
+        let visible = || unsafe { IsWindowVisible(catcher) }.as_bool();
+        cmds.send(DndCmd::CatcherZone(true)).expect("send");
+        if edge_monitor(&monitors(), Config::default().mac_side).is_some() {
+            let until = Instant::now() + Duration::from_secs(5);
+            while !visible() {
+                assert!(Instant::now() < until, "CatcherZone(true) never arrived");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        cmds.send(DndCmd::CatcherZone(false)).expect("send");
         drop(cmds);
         assert_eq!(
             rx.recv_timeout(Duration::from_secs(5)),
@@ -851,16 +1151,19 @@ mod tests {
         assert_eq!(shared.catcher.load(Ordering::Acquire), 0);
     }
 
-    /// cj-dnd alone (the app isn't running), with the strip shown at the
-    /// right edge of the primary monitor for the whole run. Drag files from
-    /// Explorer (or a zip, Discord, an Outlook attachment) to that edge: each
-    /// `Offer` is logged with its names, sizes and sources.
+    /// cj-dnd alone (the app isn't running), with a session marked up and
+    /// the strip shown at the right edge of the primary monitor for the
+    /// whole run. Drag files from Explorer (or a zip, Discord, an Outlook
+    /// attachment) to that edge: each `Offer` is logged with its names,
+    /// sizes and sources.
     ///
     /// `CJ_SMOKE_MODE`:
     /// - unset: offers only; let go anywhere and nothing is dropped.
     /// - `park`: each offer parks the catcher over the screen; let go
     ///   anywhere to see `Spooled`, what was written out, and the line
     ///   "drag image ... hidden: true" (look: did the image vanish?).
+    /// - `ride`: as `park`, then the shield is turned on as on the Mac: the
+    ///   shield must stay hidden, so letting go still gives `Spooled`.
     /// - `cancel`: parks, then cancels after 1 s: a "no" cursor until you let go.
     /// - `home`: parks, then sends it home after 1 s: the drag goes on locally.
     ///
@@ -889,6 +1192,7 @@ mod tests {
             .unwrap_or(60);
         let (ev_tx, ev_rx) = mpsc::channel::<WinDndEv>();
         let shared = Arc::new(DndShared::default());
+        shared.session_up.store(true, Ordering::Release);
         let cmds = spawn_dnd_thread(Config::default(), shared.clone(), move |ev| {
             let _ = ev_tx.send(ev);
         })
@@ -936,6 +1240,10 @@ mod tests {
                     let after = Instant::now() + Duration::from_secs(1);
                     match mode.as_str() {
                         "park" => send(DndCmd::Park(true)),
+                        "ride" => {
+                            send(DndCmd::Park(true));
+                            send(DndCmd::Shield(true));
+                        }
                         "cancel" => {
                             send(DndCmd::Park(true));
                             later = Some((after, DndCmd::Cancel { drag }));
@@ -960,6 +1268,9 @@ mod tests {
                                 eprintln!("smoke:   [{i}] -> {:?}", *rx.borrow())
                             }
                         }
+                    }
+                    if mode == "ride" {
+                        send(DndCmd::Shield(false));
                     }
                 }
             }

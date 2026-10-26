@@ -27,7 +27,7 @@ use cj_core::proto::{MouseButton, Side};
 use tracing::{debug, error, info, warn};
 use windows::Win32::Foundation::{
     ERROR_CLASS_ALREADY_EXISTS, ERROR_INVALID_THREAD_ID, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT,
-    POINT, WPARAM,
+    POINT, RECT, WPARAM,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::StationsAndDesktops::{
@@ -44,9 +44,10 @@ use windows::Win32::UI::Input::{
     RID_INPUT, RIDEV_INPUTSINK, RIM_TYPEMOUSE, RegisterRawInputDevices,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos,
-    GetMessageW, HHOOK, KBDLLHOOKSTRUCT, KillTimer, LLKHF_EXTENDED, LLKHF_INJECTED, LLMHF_INJECTED,
-    MSG, MSLLHOOKSTRUCT, PostThreadMessageW, RI_MOUSE_LEFT_BUTTON_DOWN, RI_MOUSE_LEFT_BUTTON_UP,
+    CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+    GetClassNameW, GetCursorPos, GetForegroundWindow, GetMessageW, GetShellWindow, GetWindowRect,
+    HHOOK, KBDLLHOOKSTRUCT, KillTimer, LLKHF_EXTENDED, LLKHF_INJECTED, LLMHF_INJECTED, MSG,
+    MSLLHOOKSTRUCT, PostThreadMessageW, RI_MOUSE_LEFT_BUTTON_DOWN, RI_MOUSE_LEFT_BUTTON_UP,
     RegisterClassExW, SetCursorPos, SetTimer, SetWindowsHookExW, UnhookWindowsHookEx,
     WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE, WM_APP, WM_DISPLAYCHANGE, WM_INPUT, WM_KEYDOWN,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
@@ -57,7 +58,7 @@ use windows::core::w;
 
 use super::cursor::{hide_system_cursors, restore_system_cursors};
 use super::dnd::{DndCmd, DndPort, in_catch_zone, ours_under};
-use super::monitors::{edge_monitor, monitors};
+use super::monitors::{edge_monitor, monitors, rect_from};
 use super::probe::probe_game;
 
 /// Raw motion without hook motion for this long while on the Mac means the hook is gone.
@@ -82,7 +83,7 @@ const DESKTOP_POLL: Duration = Duration::from_millis(150);
 /// The input window's timer id for the desktop check.
 const DESKTOP_TIMER: usize = 1;
 /// While on the Mac, how often the window under the park point is checked (`PARK_TIMER`).
-const PARK_POLL: Duration = Duration::from_millis(250);
+const PARK_POLL: Duration = Duration::from_millis(50);
 /// The input window's timer id for the park-point check.
 const PARK_TIMER: usize = 2;
 /// Longest wait for the catcher to cover the screen before parking with a drag.
@@ -263,6 +264,14 @@ struct MacStay {
     hook_lost_sent: bool,
     /// The last real left press was passed to Windows, so its release must be too.
     left_passed: bool,
+    /// The left button was down when the cursor crossed (a riding drag): its
+    /// release may end the drag on the catcher.
+    left_held_at_entry: bool,
+    /// The foreground window at the last park check: a pass-through needs
+    /// it unchanged (R31).
+    park_fg: isize,
+    /// What the shield was last told.
+    shield_shown: bool,
 }
 
 impl MacStay {
@@ -274,6 +283,9 @@ impl MacStay {
             last_hook_motion: now,
             hook_lost_sent: false,
             left_passed: false,
+            left_held_at_entry: false,
+            park_fg: 0,
+            shield_shown: false,
         }
     }
 
@@ -493,13 +505,23 @@ impl State {
         self.check_park();
     }
 
-    /// Whether one of our drag-and-drop windows lies under the park point,
-    /// for the mouse hook (which must not ask Windows itself).
+    /// For the mouse hook, which must not ask Windows itself: whether one of
+    /// our drag-and-drop windows lies under the park point, and the
+    /// foreground window as of now. No shield while the foreground window
+    /// covers the edge monitor (a fullscreen game or video): a topmost
+    /// window over it is what anti-cheat heuristics look for (R32).
     fn check_park(&mut self) {
-        let (Some(stay), Some(dnd)) = (&self.mac, &self.dnd) else {
+        let (Some(stay), Some(dnd), Some(edge)) = (&mut self.mac, &self.dnd, self.edge) else {
             return;
         };
-        let ours = ours_under(&dnd.shared, stay.center);
+        let (fg, covered) = foreground_covering(&edge);
+        stay.park_fg = fg;
+        if stay.shield_shown == covered {
+            stay.shield_shown = !covered;
+            info!(shield = !covered, "park point: shield");
+            dnd.send(DndCmd::Shield(!covered));
+        }
+        let ours = !covered && ours_under(&dnd.shared, stay.center);
         let was = dnd.shared.under_park_is_ours.swap(ours, Ordering::AcqRel);
         if ours != was {
             debug!(ours, "park point: our window under it changed");
@@ -541,6 +563,11 @@ impl State {
 
         // Hide first and park before the hooks exist so the cursor never flashes
         // or jumps; park again in case it moved while the hooks were installed.
+        let left_held_at_entry = is_down(VK_LBUTTON.0);
+        if self.zone {
+            self.zone = false;
+            self.send_dnd(DndCmd::CatcherZone(false));
+        }
         let before = cursor_pos();
         hide_system_cursors();
         if drag.is_some() {
@@ -568,7 +595,9 @@ impl State {
         info!(keys_held = snapshot.keys.len(), "hooks: installed");
         let center = park_and_read_back(target);
         self.scaler.reset();
-        self.mac = Some(MacStay::new(hooks, center, Instant::now()));
+        let mut stay = MacStay::new(hooks, center, Instant::now());
+        stay.left_held_at_entry = left_held_at_entry;
+        self.mac = Some(stay);
         // SAFETY: `hwnd` is this thread's window; WM_TIMER arrives in `wnd_proc`.
         let ms = DESKTOP_POLL.as_millis() as u32;
         if unsafe { SetTimer(Some(self.hwnd), DESKTOP_TIMER, ms, None) } == 0 {
@@ -578,7 +607,7 @@ impl State {
             );
         }
         if self.dnd.is_some() {
-            self.send_dnd(DndCmd::Shield(true));
+            // Shows the shield unless a fullscreen window is in front.
             self.check_park();
             // SAFETY: as above.
             let ms = PARK_POLL.as_millis() as u32;
@@ -780,7 +809,11 @@ impl State {
             let (edge, (x, y)) = (self.edge?, cursor_pos()?);
             Some(in_catch_zone(&edge, self.cfg.mac_side, x, y))
         };
-        if !is_down(VK_LBUTTON.0) || other_buttons_held() || near() != Some(true) {
+        let session = self
+            .dnd
+            .as_ref()
+            .is_some_and(|d| d.shared.session_up.load(Ordering::Acquire));
+        if !session || !is_down(VK_LBUTTON.0) || other_buttons_held() || near() != Some(true) {
             self.zone_game = None;
             return false;
         }
@@ -806,13 +839,24 @@ impl State {
             .as_ref()
             .is_some_and(|d| d.shared.under_park_is_ours.load(Ordering::Acquire));
         let injected = info.flags & LLMHF_INJECTED != 0;
-        let verdict = hook_verdict(msg, injected, over_ours, stay.left_passed);
+        let pass = Pass {
+            over_ours,
+            // A cheap, hook-safe read: a window that came to the front since
+            // the last park check may cover the park point.
+            fg_match: over_ours && foreground() == stay.park_fg,
+            down_passed: stay.left_passed,
+            held_at_entry: stay.left_held_at_entry,
+        };
+        let verdict = hook_verdict(msg, injected, pass);
         if !verdict.forward {
             return !verdict.pass;
         }
         match msg {
             WM_LBUTTONDOWN => stay.left_passed = verdict.pass,
-            WM_LBUTTONUP => stay.left_passed = false,
+            WM_LBUTTONUP => {
+                stay.left_passed = false;
+                stay.left_held_at_entry = false;
+            }
             _ => {}
         }
         let hiword = (info.mouseData >> 16) as u16;
@@ -1079,28 +1123,85 @@ struct HookVerdict {
     pass: bool,
 }
 
-/// Everything real is forwarded and swallowed, except that real left presses
-/// and releases also reach Windows while `over_ours`: one of CursorJump's own
-/// drag-and-drop windows lies under the park point
-/// (`DndShared::under_park_is_ours`). A release whose press Windows saw
-/// (`down_passed`) always reaches it, so the button never sticks down.
+/// What a real left button event may pass on.
+#[derive(Debug, Clone, Copy, Default)]
+struct Pass {
+    /// One of CursorJump's own drag-and-drop windows lies under the park
+    /// point (`DndShared::under_park_is_ours`).
+    over_ours: bool,
+    /// The foreground window is still the one the last park check saw.
+    fg_match: bool,
+    /// The last press was passed to Windows.
+    down_passed: bool,
+    /// The left button was down at the crossing (a riding drag).
+    held_at_entry: bool,
+}
+
+/// Everything real is forwarded and swallowed, except that real left
+/// buttons may also reach Windows (`CallNextHookEx`):
+/// - a press, while our window is under the park point and the foreground
+///   window hasn't changed since that was checked;
+/// - a release, after a press that was passed (so the button never sticks
+///   down), or under the same conditions when the button was already down
+///   at the crossing (a riding drag's release, which ends it on the
+///   catcher). If a foreign window is in front by then, that release is
+///   swallowed and the PC's OS drag carries on once the cursor is back.
+///
 /// Injected events pass untouched and are never forwarded. The hook only
 /// ever swallows less than phase 1; it never makes input up.
-fn hook_verdict(msg: u32, injected: bool, over_ours: bool, down_passed: bool) -> HookVerdict {
+fn hook_verdict(msg: u32, injected: bool, p: Pass) -> HookVerdict {
     if injected {
         return HookVerdict {
             forward: false,
             pass: true,
         };
     }
+    let ours = p.over_ours && p.fg_match;
     let pass = match msg {
-        WM_LBUTTONDOWN => over_ours,
-        WM_LBUTTONUP => over_ours || down_passed,
+        WM_LBUTTONDOWN => ours,
+        WM_LBUTTONUP => p.down_passed || (ours && p.held_at_entry),
         _ => false,
     };
     HookVerdict {
         forward: true,
         pass,
+    }
+}
+
+/// The foreground window, as a number (0 = none). Cheap, and safe in a hook.
+fn foreground() -> isize {
+    // SAFETY: plain FFI call.
+    unsafe { GetForegroundWindow() }.0 as isize
+}
+
+/// Whether `window` covers all of `monitor`.
+fn covers_monitor(window: &Rect, monitor: &Rect) -> bool {
+    window.left <= monitor.left
+        && window.top <= monitor.top
+        && window.right >= monitor.right
+        && window.bottom >= monitor.bottom
+}
+
+/// The foreground window, and whether it covers all of `edge` (a fullscreen
+/// or borderless game, a video). The desktop itself doesn't count.
+fn foreground_covering(edge: &Rect) -> (isize, bool) {
+    // SAFETY: plain FFI calls on window handles the system just gave us.
+    unsafe {
+        let fg = GetForegroundWindow();
+        if fg.is_invalid() || fg == GetShellWindow() {
+            return (fg.0 as isize, false);
+        }
+        let mut class = [0u16; 16];
+        let len = GetClassNameW(fg, &mut class) as usize;
+        if matches!(
+            String::from_utf16_lossy(&class[..len]).as_str(),
+            "WorkerW" | "Progman"
+        ) {
+            return (fg.0 as isize, false);
+        }
+        let mut r = RECT::default();
+        let covers = GetWindowRect(fg, &mut r).is_ok() && covers_monitor(&rect_from(r), edge);
+        (fg.0 as isize, covers)
     }
 }
 
@@ -1732,57 +1833,97 @@ mod tests {
     #[test]
     fn hook_passes_real_left_buttons_only_over_our_window() {
         let v = |forward, pass| HookVerdict { forward, pass };
-        for down_passed in [false, true] {
-            // Over our own window: real left presses and releases reach Windows too.
-            assert_eq!(
-                hook_verdict(WM_LBUTTONDOWN, false, true, down_passed),
-                v(true, true)
-            );
-            assert_eq!(
-                hook_verdict(WM_LBUTTONUP, false, true, down_passed),
-                v(true, true)
-            );
-            // Anything else is still only forwarded.
-            for msg in [
-                WM_RBUTTONDOWN,
-                WM_RBUTTONUP,
-                WM_MBUTTONDOWN,
-                WM_XBUTTONUP,
-                WM_MOUSEMOVE,
-                WM_MOUSEWHEEL,
-                WM_MOUSEHWHEEL,
-            ] {
-                assert_eq!(hook_verdict(msg, false, true, down_passed), v(true, false));
-                assert_eq!(hook_verdict(msg, false, false, down_passed), v(true, false));
-            }
-            // Injected events pass untouched and are never forwarded, as before.
-            for msg in [WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONDOWN] {
-                for over_ours in [false, true] {
-                    assert_eq!(
-                        hook_verdict(msg, true, over_ours, down_passed),
-                        v(false, true)
-                    );
+        let all = [false, true];
+        for over_ours in all {
+            for fg_match in all {
+                for down_passed in all {
+                    for held_at_entry in all {
+                        let p = Pass {
+                            over_ours,
+                            fg_match,
+                            down_passed,
+                            held_at_entry,
+                        };
+                        let ours = over_ours && fg_match;
+                        let ctx = format!("{p:?}");
+                        // A press: only onto our window, with the same window in front.
+                        assert_eq!(
+                            hook_verdict(WM_LBUTTONDOWN, false, p),
+                            v(true, ours),
+                            "{ctx}"
+                        );
+                        // A release: after a passed press, always; a ride's
+                        // release only under the same conditions as a press.
+                        assert_eq!(
+                            hook_verdict(WM_LBUTTONUP, false, p),
+                            v(true, down_passed || (ours && held_at_entry)),
+                            "{ctx}"
+                        );
+                        // Anything else is still only forwarded.
+                        for msg in [
+                            WM_RBUTTONDOWN,
+                            WM_RBUTTONUP,
+                            WM_MBUTTONDOWN,
+                            WM_XBUTTONUP,
+                            WM_MOUSEMOVE,
+                            WM_MOUSEWHEEL,
+                            WM_MOUSEHWHEEL,
+                        ] {
+                            assert_eq!(hook_verdict(msg, false, p), v(true, false), "{ctx}");
+                        }
+                        // Injected events pass untouched and are never forwarded, as before.
+                        for msg in [WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONDOWN] {
+                            assert_eq!(hook_verdict(msg, true, p), v(false, true), "{ctx}");
+                        }
+                    }
                 }
             }
         }
-        // Not over our window: a press is swallowed, as in phase 1...
+        // Spelled out: over our window with the same foreground, a press passes...
+        let ours = Pass {
+            over_ours: true,
+            fg_match: true,
+            ..Pass::default()
+        };
+        assert_eq!(hook_verdict(WM_LBUTTONDOWN, false, ours), v(true, true));
+        // ...but not with another window in front, nor when not over ours.
+        let new_fg = Pass {
+            fg_match: false,
+            ..ours
+        };
+        assert_eq!(hook_verdict(WM_LBUTTONDOWN, false, new_fg), v(true, false));
         assert_eq!(
-            hook_verdict(WM_LBUTTONDOWN, false, false, false),
+            hook_verdict(WM_LBUTTONDOWN, false, Pass::default()),
             v(true, false)
         );
-        assert_eq!(
-            hook_verdict(WM_LBUTTONDOWN, false, false, true),
-            v(true, false)
-        );
-        assert_eq!(
-            hook_verdict(WM_LBUTTONUP, false, false, false),
-            v(true, false)
-        );
-        // ...but the release of a press Windows saw always reaches it.
-        assert_eq!(
-            hook_verdict(WM_LBUTTONUP, false, false, true),
-            v(true, true)
-        );
+        // A release with no passed press and no ride is swallowed, even over ours.
+        assert_eq!(hook_verdict(WM_LBUTTONUP, false, ours), v(true, false));
+        // The release of a press Windows saw always reaches it.
+        let passed = Pass {
+            down_passed: true,
+            ..Pass::default()
+        };
+        assert_eq!(hook_verdict(WM_LBUTTONUP, false, passed), v(true, true));
+    }
+
+    #[test]
+    fn a_window_covering_the_edge_monitor_is_fullscreen() {
+        let r = |left, top, right, bottom| Rect {
+            left,
+            top,
+            right,
+            bottom,
+        };
+        let mon = r(0, 0, 1920, 1080);
+        assert!(covers_monitor(&mon, &mon));
+        // Borderless with invisible resize borders, or spanning monitors.
+        assert!(covers_monitor(&r(-8, -8, 1928, 1088), &mon));
+        assert!(covers_monitor(&r(-1080, -400, 1920, 1520), &mon));
+        // Maximized: the taskbar stays visible.
+        assert!(!covers_monitor(&r(-8, -8, 1928, 1040), &mon));
+        assert!(!covers_monitor(&r(0, 0, 1919, 1080), &mon));
+        // Fullscreen on another monitor.
+        assert!(!covers_monitor(&r(-1920, 0, 0, 1080), &mon));
     }
 
     #[test]
@@ -1794,6 +1935,8 @@ mod tests {
             shared: shared.clone(),
             cmds,
         });
+        // As the last park check saw it.
+        s.mac.as_mut().unwrap().park_fg = foreground();
         let at = MSLLHOOKSTRUCT {
             pt: POINT {
                 x: CENTER.0,
@@ -1814,6 +1957,17 @@ mod tests {
         assert!(!swallowed(&mut s, WM_LBUTTONUP));
         assert!(swallowed(&mut s, WM_LBUTTONDOWN));
         assert!(swallowed(&mut s, WM_LBUTTONUP));
+        // A release with no press passed, over ours: swallowed...
+        shared.under_park_is_ours.store(true, Ordering::Release);
+        assert!(swallowed(&mut s, WM_LBUTTONUP));
+        // ...unless the button was down at the crossing (a ride), once.
+        s.mac.as_mut().unwrap().left_held_at_entry = true;
+        assert!(!swallowed(&mut s, WM_LBUTTONUP));
+        assert!(swallowed(&mut s, WM_LBUTTONUP));
+        // Another window came to the front since the park check: no press passes.
+        s.mac.as_mut().unwrap().park_fg = foreground() ^ 1;
+        assert!(swallowed(&mut s, WM_LBUTTONDOWN));
+        assert!(swallowed(&mut s, WM_LBUTTONUP));
         // Every real button still reached the Mac.
         let buttons: Vec<_> = drain(&rx)
             .into_iter()
@@ -1831,6 +1985,11 @@ mod tests {
                 (Left, true),
                 (Right, true),
                 (Right, false),
+                (Left, false),
+                (Left, true),
+                (Left, false),
+                (Left, false),
+                (Left, false),
                 (Left, false),
                 (Left, true),
                 (Left, false)
