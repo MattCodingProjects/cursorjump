@@ -929,13 +929,17 @@ mod tests {
 
         async fn step(&mut self) {
             let (o, r) = (&mut self.origin, &mut self.receiver);
+            // Events first: one a link emitted before sending a Control is
+            // in its channel by the time that Control arrives, so it is
+            // logged before the Control is delivered and causes more.
             let got = tokio::select! {
+                biased;
+                Some(e) = o.events.recv() => Got::Event(At::Origin, e),
+                Some(e) = r.events.recv() => Got::Event(At::Receiver, e),
                 c = o.session.recv_control() => Got::Control(At::Origin, c.unwrap()),
                 c = r.session.recv_control() => Got::Control(At::Receiver, c.unwrap()),
                 Some(f) = o.files.recv() => Got::Files(At::Origin, f),
                 Some(f) = r.files.recv() => Got::Files(At::Receiver, f),
-                Some(e) = o.events.recv() => Got::Event(At::Origin, e),
-                Some(e) = r.events.recv() => Got::Event(At::Receiver, e),
                 () = sleep(Duration::from_millis(10)) => Got::Tick,
             };
             match got {
@@ -1749,8 +1753,10 @@ mod tests {
             .await;
         let bad = Control::FileFetch { drag: 14, item: 5 };
         p.receiver.session.send_control(&bad).await.unwrap();
-        p.until(|p| !p.cancels_to(At::Receiver, 14).is_empty())
-            .await;
+        p.until(|p| {
+            !p.cancels_to(At::Receiver, 14).is_empty() && !p.finished(At::Origin, 14).is_empty()
+        })
+        .await;
         let why = unreadable("item 5");
         assert_eq!(p.cancels_to(At::Receiver, 14), [&why]);
         assert_eq!(
