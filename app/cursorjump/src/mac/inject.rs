@@ -195,6 +195,19 @@ fn motion_event_type(held: Option<MouseButton>) -> (CGEventType, CGMouseButton) 
     }
 }
 
+/// Where a jiggle posts: 1 pt below `pos` (`nudge`), or above it on the
+/// bottom row, or `pos` itself; and the delta from the other one.
+fn jiggle_point(pos: (f64, f64), bounds: Rectf, nudge: bool) -> ((f64, f64), (i64, i64)) {
+    let r = bounds.to_rect();
+    let down = pos.1 + 1.0 <= f64::from(r.bottom - 1);
+    let (dy, off) = if down { (1, 1.0) } else { (-1, -1.0) };
+    if nudge {
+        ((pos.0, pos.1 + off), (0, dy))
+    } else {
+        (pos, (0, -dy))
+    }
+}
+
 /// (wheel1, wheel2) for `CGEventCreateScrollWheelEvent2` from wire deltas.
 /// Wire: dy > 0 scrolls up, dx > 0 scrolls right. CG: wheel1 > 0 scrolls
 /// up, wheel2 > 0 scrolls left.
@@ -393,6 +406,26 @@ impl Injector {
     }
 
     /// Where the cursor is now (the virtual cursor, or where something else
+    /// moved it), in global points.
+    pub fn cursor(&mut self) -> (f64, f64) {
+        self.current_pos()
+    }
+
+    /// Posts a dragged event of the first held button 1 pt off the cursor
+    /// (`nudge`) or back on it, leaving the virtual cursor where it is: a
+    /// drag session whose drop is held stays alive (R47). Nothing without
+    /// a held button.
+    pub fn jiggle(&mut self, nudge: bool) {
+        let Some(b) = self.held.first_button() else {
+            return;
+        };
+        let (at, delta) = jiggle_point(self.pos, self.bounds, nudge);
+        let (ty, button) = mouse_event_type(b, MouseAction::Drag);
+        let clicks = self.click_state[button_index(b)];
+        self.post_mouse(ty, button, at, delta, clicks);
+    }
+
+    /// Where the cursor is now (the virtual cursor, or where something else
     /// moved it), as a fraction along the entry edge.
     pub fn entry_frac(&self) -> f32 {
         let recent: Vec<(f64, f64)> = self.recent.iter().map(|&(_, p)| p).collect();
@@ -561,6 +594,27 @@ mod tests {
         w: 1512.0,
         h: 982.0,
     };
+
+    #[test]
+    fn jiggle_goes_one_point_off_and_back() {
+        assert_eq!(
+            jiggle_point((100.0, 200.0), MBP, true),
+            ((100.0, 201.0), (0, 1))
+        );
+        assert_eq!(
+            jiggle_point((100.0, 200.0), MBP, false),
+            ((100.0, 200.0), (0, -1))
+        );
+        // On the bottom row it goes up instead, staying on the screen.
+        assert_eq!(
+            jiggle_point((100.0, 981.0), MBP, true),
+            ((100.0, 980.0), (0, -1))
+        );
+        assert_eq!(
+            jiggle_point((100.0, 981.0), MBP, false),
+            ((100.0, 981.0), (0, 1))
+        );
+    }
 
     #[test]
     fn motion_reports_push_out_only_on_entry_edge() {

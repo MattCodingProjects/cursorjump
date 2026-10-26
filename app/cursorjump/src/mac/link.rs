@@ -27,11 +27,23 @@ const DECLINE_FLUSH: Duration = Duration::from_secs(1);
 /// Input for the injection thread, or (Err) a message for the loop.
 pub(super) fn route_control(c: Control) -> Result<Input, Control> {
     match c {
-        Control::Enter { edge, frac, .. } => Ok(Input::Enter { edge, frac }),
+        Control::Enter { edge, frac, drag } => Ok(Input::Enter { edge, frac, drag }),
         Control::Button { button, down } => Ok(Input::Button { button, down }),
         Control::Key { mac_keycode, down } => Ok(Input::Key { mac_keycode, down }),
         Control::ReleaseAll => Ok(Input::ReleaseAll),
         other => Err(other),
+    }
+}
+
+/// What the injection thread also needs of a message for the loop: a
+/// `DragOffer`'s items, there before the crossing that carries the drag.
+pub(super) fn inject_copy(c: &Control) -> Option<Input> {
+    match c {
+        Control::DragOffer { drag, items } => Some(Input::DragOffer {
+            drag: *drag,
+            items: items.clone(),
+        }),
+        _ => None,
     }
 }
 
@@ -136,18 +148,25 @@ impl Live {
         tasks.push(tokio::spawn(async move {
             let reason = loop {
                 match s.recv_control().await {
-                    Ok(c) => match route_control(c) {
-                        Ok(input) => {
-                            if inj.send(InjectMsg::Input { sid, input }).is_err() {
-                                break "the injection thread is gone".to_string();
+                    Ok(c) => {
+                        if let Some(input) = inject_copy(&c)
+                            && inj.send(InjectMsg::Input { sid, input }).is_err()
+                        {
+                            break "the injection thread is gone".to_string();
+                        }
+                        match route_control(c) {
+                            Ok(input) => {
+                                if inj.send(InjectMsg::Input { sid, input }).is_err() {
+                                    break "the injection thread is gone".to_string();
+                                }
+                            }
+                            Err(other) => {
+                                if tx.send(net(NetEv::Control(other))).is_err() {
+                                    return;
+                                }
                             }
                         }
-                        Err(other) => {
-                            if tx.send(net(NetEv::Control(other))).is_err() {
-                                return;
-                            }
-                        }
-                    },
+                    }
                     Err(e) => break format!("control stream: {e:#}"),
                 }
             };
@@ -234,8 +253,22 @@ mod tests {
             }),
             Ok(Input::Enter {
                 edge: Side::Left,
-                frac: 0.25
+                frac: 0.25,
+                drag: None
             })
+        );
+        assert_eq!(
+            route_control(Control::Enter {
+                edge: Side::Top,
+                frac: 0.5,
+                drag: Some(7)
+            }),
+            Ok(Input::Enter {
+                edge: Side::Top,
+                frac: 0.5,
+                drag: Some(7)
+            }),
+            "the drag rides along"
         );
         assert_eq!(
             route_control(Control::Button {
@@ -267,6 +300,26 @@ mod tests {
         ] {
             assert_eq!(route_control(other.clone()), Err(other));
         }
+    }
+
+    #[test]
+    fn drag_offers_go_to_the_loop_with_a_copy_for_the_injection_thread() {
+        let items = vec![cj_core::dnd::DragItem {
+            name: "a.jpg".into(),
+            kind: cj_core::dnd::ItemKind::File,
+            size: Some(3),
+        }];
+        let offer = Control::DragOffer {
+            drag: 7,
+            items: items.clone(),
+        };
+        assert_eq!(
+            inject_copy(&offer),
+            Some(Input::DragOffer { drag: 7, items })
+        );
+        assert_eq!(route_control(offer.clone()), Err(offer));
+        assert_eq!(inject_copy(&Control::ReleaseAll), None);
+        assert_eq!(inject_copy(&Control::DragDropped { drag: 7 }), None);
     }
 
     /// Real QUIC sessions on 127.0.0.1 between this Mac's code and a fake PC.
@@ -469,21 +522,44 @@ mod tests {
                     mac_keycode: 0x00,
                     down: false,
                 },
+                Control::DragOffer {
+                    drag: 3,
+                    items: Vec::new(),
+                },
                 Control::PairConfirm { accepted: true },
             ] {
                 pc.send_control(&c).await.unwrap();
             }
             let mut got = Vec::new();
-            for _ in 0..4 {
+            for _ in 0..5 {
                 got.push(next(&inject_rx).await);
             }
+            // A copy of the offer, in order (after Begin and the input).
+            assert_eq!(
+                got[4],
+                InjectMsg::Input {
+                    sid: 5,
+                    input: Input::DragOffer {
+                        drag: 3,
+                        items: Vec::new()
+                    }
+                }
+            );
             // Datagrams are not ordered with the control stream: send motion
             // only once the keys have arrived.
             pc.send_datagram(&Datagram::Motion { dx: 3, dy: -1 })
                 .unwrap();
             got.push(next(&inject_rx).await);
 
-            // Non-input goes to the loop instead.
+            // Non-input goes to the loop instead, the offer too.
+            let ev = timeout(T, events_rx.recv()).await.unwrap().unwrap();
+            assert!(matches!(
+                ev,
+                Ev::Net {
+                    sid: 5,
+                    ev: NetEv::Control(Control::DragOffer { drag: 3, .. })
+                }
+            ));
             let ev = timeout(T, events_rx.recv()).await.unwrap().unwrap();
             assert!(matches!(
                 ev,
@@ -517,7 +593,7 @@ mod tests {
 
             let (fake, calls) = Fake::new();
             let granted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-            let mut router = Router::new(fake, granted);
+            let mut router = Router::new(fake, crate::mac::control::NoDrags, granted);
             for msg in got {
                 router.handle(msg);
             }

@@ -31,7 +31,7 @@ use tracing::{debug, error, info, warn};
 
 use super::clipboard::{read_clipboard, spawn_clipboard_watcher, write_clipboard};
 use super::control::{
-    InjectEv, InjectMsg, set_user_interactive_qos, spawn_inject_thread, update_access,
+    InjectEv, InjectMsg, NoDrags, set_user_interactive_qos, spawn_inject_thread, update_access,
 };
 use super::inject::Injector;
 use super::link::{Live, run_pairing};
@@ -126,7 +126,8 @@ pub fn run_mac() -> Result<()> {
             "Accessibility is on, but posting events is not confirmed"
         );
     }
-    let inject = spawn_inject_thread(Injector::new()?, access.clone(), move |ev| {
+    // Task 17 passes the drag source (dnd::source::DragSource) instead.
+    let inject = spawn_inject_thread(Injector::new()?, NoDrags, access.clone(), move |ev| {
         let _ = inject_events.send(Ev::Inject(ev));
     })?;
     let clip_link = Arc::new(ClipboardLink::new(cfg.clipboard_max_bytes));

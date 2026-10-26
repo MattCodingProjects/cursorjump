@@ -37,9 +37,9 @@ block2 = "0.6.2"
 dispatch2 = "0.3.1"
 libc = "0.2.191"
 objc2 = "0.6.5"
-objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "block2", "objc2-core-graphics", "objc2-uniform-type-identifiers", "NSAppearance", "NSApplication", "NSCell", "NSColor", "NSControl", "NSDragging", "NSDraggingItem", "NSDraggingSession", "NSEvent", "NSFilePromiseProvider", "NSFilePromiseReceiver", "NSGraphics", "NSImage", "NSImageView", "NSPanel", "NSPasteboard", "NSPasteboardItem", "NSResponder", "NSRunningApplication", "NSScreen", "NSTrackingArea", "NSView", "NSVisualEffectView", "NSWindow", "NSWorkspace"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "block2", "libc", "objc2-core-graphics", "objc2-uniform-type-identifiers", "NSAppearance", "NSApplication", "NSCell", "NSColor", "NSControl", "NSDragging", "NSDraggingItem", "NSDraggingSession", "NSEvent", "NSFilePromiseProvider", "NSFilePromiseReceiver", "NSGraphics", "NSImage", "NSImageView", "NSPanel", "NSPasteboard", "NSPasteboardItem", "NSResponder", "NSRunningApplication", "NSScreen", "NSTrackingArea", "NSView", "NSVisualEffectView", "NSWindow", "NSWorkspace"] }
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFCGTypes", "CFData", "CFString"] }
-objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "CGColorSpace", "CGDataProvider", "CGDirectDisplay", "CGDisplayConfiguration", "CGEvent", "CGEventSource", "CGEventTypes", "CGImage", "CGRemoteOperation", "CGError", "libc"] }
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "CGColorSpace", "CGDataProvider", "CGDirectDisplay", "CGDisplayConfiguration", "CGEvent", "CGEventSource", "CGEventTypes", "CGImage", "CGRemoteOperation", "CGError", "CGWindow", "libc"] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "block2", "NSArray", "NSData", "NSDictionary", "NSError", "NSGeometry", "NSNotification", "NSObjCRuntime", "NSOperation", "NSProcessInfo", "NSString", "NSThread", "NSURL", "NSValue"] }
 objc2-io-kit = { version = "0.3.2", default-features = false, features = ["std", "pwr_mgt"] }
 objc2-uniform-type-identifiers = { version = "0.3.2", default-features = false, features = ["std", "UTType"] }

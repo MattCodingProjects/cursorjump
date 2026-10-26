@@ -30,7 +30,7 @@ const FLAGS: [&str; 5] = [
 
 /// Hidden options of debug builds, for a person to look at a piece of the app.
 #[cfg(all(target_os = "macos", debug_assertions))]
-const DEBUG_FLAGS: [&str; 1] = ["--smoke-pill"];
+const DEBUG_FLAGS: [&str; 2] = ["--smoke-pill", "--smoke-drag"];
 #[cfg(not(all(target_os = "macos", debug_assertions)))]
 const DEBUG_FLAGS: [&str; 0] = [];
 
@@ -53,6 +53,26 @@ fn main() {
     #[cfg(all(target_os = "macos", debug_assertions))]
     if has("--smoke-pill") {
         if let Err(e) = mac::pill::run_smoke() {
+            error!("{e:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    // A drag from a fake PC, driven through the real injection thread and
+    // drag source (mac/dnd/source.rs `run_smoke`): `--smoke-drag [auto|promise|hold]`.
+    #[cfg(all(target_os = "macos", debug_assertions))]
+    if has("--smoke-drag") {
+        let mode = args
+            .iter()
+            .skip_while(|a| *a != "--smoke-drag")
+            .nth(1)
+            .map(String::as_str);
+        let Some(mode) = mac::SmokeMode::parse(mode) else {
+            error!("--smoke-drag takes auto, promise or hold");
+            std::process::exit(2);
+        };
+        if let Err(e) = mac::run_smoke_drag(mode) {
             error!("{e:#}");
             std::process::exit(1);
         }
@@ -270,6 +290,8 @@ mod tests {
         assert_eq!(unknown_flag(&args(&["--setting"])), Some("--setting"));
         // Only debug Mac builds know the pill smoke.
         let smoke = unknown_flag(&args(&["--smoke-pill"])).is_none();
+        assert_eq!(smoke, cfg!(all(target_os = "macos", debug_assertions)));
+        let smoke = unknown_flag(&args(&["--smoke-drag", "hold"])).is_none();
         assert_eq!(smoke, cfg!(all(target_os = "macos", debug_assertions)));
         assert_eq!(
             unknown_flag(&args(&["--enable-autostart", "--bogus"])),

@@ -11,6 +11,8 @@ use dispatch2::DispatchQueue;
 use objc2::MainThreadMarker;
 use tracing::warn;
 
+pub mod source;
+
 /// Run `f` on the main thread, later: queued on GCD's main queue, even when
 /// called from the main thread. A panic in `f` is caught and logged.
 pub fn on_main(f: impl FnOnce(MainThreadMarker) + Send + 'static) {
@@ -30,7 +32,6 @@ pub fn on_main(f: impl FnOnce(MainThreadMarker) + Send + 'static) {
 /// - On timeout this returns `None`, but `f` is still queued and runs later;
 ///   its result is then dropped. That is why `f` and `R` are `'static`.
 /// - A panic in `f` is caught and logged, and gives `None`.
-#[expect(dead_code, reason = "the drag source and catcher use it (Tasks 15–16)")]
 pub fn on_main_sync<R: Send + 'static>(
     timeout: Duration,
     f: impl FnOnce(MainThreadMarker) -> R + Send + 'static,

@@ -7,6 +7,20 @@
 //! except the up of a key or button the Injector still holds: a PC key-down
 //! can be queued ahead of this Mac's own `Leave`, and the PC then never
 //! sends its up, so injecting the down would leave it stuck.
+//!
+//! A PC file drag riding along (`Enter { drag }`) becomes a Mac drag
+//! session (`dnd::source`, R47):
+//! - `BeginDrag`: the source arms the drag under the cursor (`prepare`,
+//!   with the items of the latest `DragOffer`), then the left button goes
+//!   down; it counts as held from then on, like any button.
+//! - The PC's left-up is the user letting go (`released`). The up is posted
+//!   at once if the source says the drop may go ahead (`may_release`);
+//!   otherwise it is held: motion and scroll are ignored, the cursor
+//!   jiggles 1 pt every [`JIGGLE_EVERY`], and the up goes out when the
+//!   source reports every item complete (`InjectMsg::DragReady`).
+//! - Cancelling (`CancelDrag` from the machine, `InjectMsg::CancelDrag`, a
+//!   failed item) posts Esc, which ends the session without a drop, then
+//!   lets go of the button unless the PC still holds it.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
@@ -14,15 +28,21 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use cj_core::dnd::{DragId, DragItem};
 use cj_core::mac_state::{MacAction, MacEvent, MacMachine};
 use cj_core::proto::{MouseButton, Side};
-use tracing::{error, warn};
+use crossbeam_channel::RecvTimeoutError;
+use tracing::{error, info, warn};
 
+use super::dnd::source::KVK_ESCAPE;
 use super::inject::Injector;
 use super::power;
 
 /// The "no Accessibility" bounce is logged at most this often.
 const NO_ACCESS_LOG_EVERY: Duration = Duration::from_secs(10);
+/// While a drop is held, the cursor jiggles this often to keep the drag
+/// session alive (spike 1b, run 7).
+pub const JIGGLE_EVERY: Duration = Duration::from_millis(500);
 
 /// What the thread needs from the Injector; a trait so the routing can be
 /// tested without posting real events.
@@ -40,6 +60,39 @@ pub trait Inject {
     fn key_held(&self, mac_keycode: u16) -> bool;
     /// Where the cursor is now, as a fraction along the entry edge.
     fn entry_frac(&self) -> f32;
+    /// Where the cursor is now, in global points (origin top left).
+    fn cursor(&mut self) -> (f64, f64);
+    /// A dragged event of the held button 1 pt off the cursor (`nudge`) or
+    /// back on it; the cursor itself stays put.
+    fn jiggle(&mut self, nudge: bool);
+}
+
+/// What the thread needs from the Mac's drag source
+/// (`dnd::source::DragSource`); a trait so the routing can be tested
+/// without AppKit.
+pub trait DragPort {
+    /// Arms drag `drag` under `at` (global points); false if it can't start.
+    fn prepare(&mut self, drag: DragId, items: Vec<DragItem>, at: (f64, f64)) -> bool;
+    /// The user let go while the drag rode here, at `at`.
+    fn released(&mut self, drag: DragId, at: (f64, f64));
+    /// Whether the up may be posted now, over `at`.
+    fn may_release(&mut self, drag: DragId, at: (f64, f64)) -> bool;
+    /// The drag is over here without a drop: stop its fetches.
+    fn cancel(&mut self, drag: DragId);
+}
+
+/// For a Mac without a drag source: no PC drag starts here.
+pub struct NoDrags;
+
+impl DragPort for NoDrags {
+    fn prepare(&mut self, _drag: DragId, _items: Vec<DragItem>, _at: (f64, f64)) -> bool {
+        false
+    }
+    fn released(&mut self, _drag: DragId, _at: (f64, f64)) {}
+    fn may_release(&mut self, _drag: DragId, _at: (f64, f64)) -> bool {
+        true
+    }
+    fn cancel(&mut self, _drag: DragId) {}
 }
 
 impl Inject for Injector {
@@ -76,14 +129,22 @@ impl Inject for Injector {
     fn entry_frac(&self) -> f32 {
         Injector::entry_frac(self)
     }
+    fn cursor(&mut self) -> (f64, f64) {
+        Injector::cursor(self)
+    }
+    fn jiggle(&mut self, nudge: bool) {
+        Injector::jiggle(self, nudge);
+    }
 }
 
 /// Input from the PC, as the session readers pass it on.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Input {
+    /// `drag`: the PC's file drag riding along (its `DragOffer` came first).
     Enter {
         edge: Side,
         frac: f32,
+        drag: Option<DragId>,
     },
     Motion {
         dx: i16,
@@ -103,6 +164,13 @@ pub enum Input {
     },
     /// The PC took the cursor back.
     ReleaseAll,
+    /// The PC's next crossing carries this drag. A copy of the `DragOffer`
+    /// the loop gets too, sent by the control reader so it is here, in
+    /// order, before that crossing's `Enter`.
+    DragOffer {
+        drag: DragId,
+        items: Vec<DragItem>,
+    },
 }
 
 /// What the thread is sent. Input is tagged with its session, so anything
@@ -124,6 +192,29 @@ pub enum InjectMsg {
     /// The Accessibility permission was revoked: if the PC is controlling
     /// this Mac, send its cursor back.
     AccessLost,
+    /// From the drag source (`MacDndEv::inject_msg`): every item of `drag`
+    /// is complete, so a held drop may go ahead.
+    DragReady {
+        drag: DragId,
+    },
+    /// From the drag source: an item of `drag` failed; the drag is
+    /// cancelled.
+    DragFailed {
+        drag: DragId,
+    },
+    /// From the drag source: `drag`'s session ended, dropped or not.
+    DragEnded {
+        drag: DragId,
+    },
+    /// Cancel `drag` (the pill's ✕, the PC's `DragCancel`): Esc, then the
+    /// button goes up if the PC doesn't hold it any more.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Task 17 sends it for the pill's ✕ and DragCancel")
+    )]
+    CancelDrag {
+        drag: DragId,
+    },
     /// Release everything and stop the thread.
     Quit,
 }
@@ -188,9 +279,25 @@ pub enum InjectEv {
     Stopped,
 }
 
+/// The PC's drag riding on this Mac, with the left button down for it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Ride {
+    drag: DragId,
+    /// The user let go and the up is held until the items are complete.
+    hold: Option<Hold>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Hold {
+    next_jiggle: Instant,
+    /// The last jiggle left the cursor 1 pt off.
+    nudged: bool,
+}
+
 /// Routes messages to the Injector through the `MacMachine`.
-pub struct Router<I: Inject> {
+pub struct Router<I: Inject, D: DragPort> {
     inj: I,
+    drags: D,
     machine: MacMachine,
     /// The session whose input is accepted.
     sid: Option<u64>,
@@ -199,22 +306,50 @@ pub struct Router<I: Inject> {
     /// For the "no Accessibility" bounce, which serves races (an Enter sent
     /// before the PC got `MacReady { ready: false }`) and can repeat.
     no_access_log: LogLimit,
+    /// The latest `DragOffer` from the PC, until its crossing.
+    offer: Option<(DragId, Vec<DragItem>)>,
+    ride: Option<Ride>,
 }
 
-impl<I: Inject> Router<I> {
-    pub fn new(inj: I, access: Arc<AtomicBool>) -> Self {
+impl<I: Inject, D: DragPort> Router<I, D> {
+    pub fn new(inj: I, drags: D, access: Arc<AtomicBool>) -> Self {
         Router {
             inj,
+            drags,
             machine: MacMachine::new(),
             sid: None,
             access,
             no_access_log: LogLimit::new(NO_ACCESS_LOG_EVERY),
+            offer: None,
+            ride: None,
         }
     }
 
     /// Lets go of every key and button the Injector holds.
     pub fn release_all(&mut self) {
         self.inj.release_all();
+    }
+
+    /// When `tick` must next run: the next jiggle of a held drop.
+    pub fn next_tick(&self) -> Option<Instant> {
+        self.ride.and_then(|r| r.hold).map(|h| h.next_jiggle)
+    }
+
+    /// Jiggles the cursor of a held drop when it is due.
+    pub fn tick(&mut self, now: Instant) {
+        let Some(Ride {
+            hold: Some(hold), ..
+        }) = &mut self.ride
+        else {
+            return;
+        };
+        if now < hold.next_jiggle {
+            return;
+        }
+        hold.nudged = !hold.nudged;
+        hold.next_jiggle = now + JIGGLE_EVERY;
+        let nudge = hold.nudged;
+        self.inj.jiggle(nudge);
     }
 
     /// Handles one message; returns what to report to the loop.
@@ -236,6 +371,21 @@ impl<I: Inject> Router<I> {
                 }
                 _ => Vec::new(),
             },
+            InjectMsg::DragReady { drag } => {
+                if self.holding(drag) {
+                    info!(drag, "every item is here: posting the held up");
+                    self.drop_now(drag);
+                }
+                Vec::new()
+            }
+            InjectMsg::DragFailed { drag } | InjectMsg::CancelDrag { drag } => {
+                self.abort_drag(drag);
+                Vec::new()
+            }
+            InjectMsg::DragEnded { drag } => {
+                self.session_ended(drag);
+                Vec::new()
+            }
             InjectMsg::Quit => {
                 let out = self.end_session();
                 self.inj.release_all();
@@ -245,6 +395,7 @@ impl<I: Inject> Router<I> {
     }
 
     fn end_session(&mut self) -> Vec<InjectEv> {
+        self.offer = None;
         match self.sid.take() {
             Some(sid) => self.feed(sid, MacEvent::Disconnected),
             None => Vec::new(),
@@ -253,18 +404,12 @@ impl<I: Inject> Router<I> {
 
     fn input(&mut self, sid: u64, input: Input) -> Vec<InjectEv> {
         let controlled = self.machine.controlled();
+        let held = self.ride.is_some_and(|r| r.hold.is_some());
         match input {
-            Input::Enter { edge, frac } => {
+            Input::Enter { edge, frac, drag } => {
                 // The cached state: asking the system costs milliseconds.
                 if self.access.load(Ordering::Relaxed) {
-                    return self.feed(
-                        sid,
-                        MacEvent::Enter {
-                            edge,
-                            frac,
-                            drag: None,
-                        },
-                    );
+                    return self.feed(sid, MacEvent::Enter { edge, frac, drag });
                 }
                 if let Some(suppressed) = self.no_access_log.allow(Instant::now()) {
                     warn!(
@@ -273,7 +418,8 @@ impl<I: Inject> Router<I> {
                     );
                 }
                 // Neither wake nor warp: the Mac's cursor must not jump to
-                // the edge for a crossing that is undone at once.
+                // the edge for a crossing that is undone at once. The drag
+                // is left out: no session may start (Task 17 note a).
                 let mut out = self.feed_quietly(
                     sid,
                     MacEvent::Enter {
@@ -285,6 +431,8 @@ impl<I: Inject> Router<I> {
                 out.extend(self.bounce(sid, frac));
                 out
             }
+            // A held drop keeps the cursor on the drop spot.
+            Input::Motion { .. } | Input::Scroll { .. } if held => Vec::new(),
             Input::Motion { dx, dy } if controlled => match self.inj.motion(dx, dy) {
                 Some(frac) => {
                     let buttons_held = self.inj.buttons_held();
@@ -303,6 +451,18 @@ impl<I: Inject> Router<I> {
                 self.inj.scroll(dx, dy);
                 Vec::new()
             }
+            Input::Button {
+                button: MouseButton::Left,
+                down,
+            } if self.ride.is_some() => {
+                // The left button is the drag's: only its first up counts.
+                if let Some(Ride { drag, hold: None }) = self.ride
+                    && !down
+                {
+                    self.let_go(drag);
+                }
+                Vec::new()
+            }
             Input::Button { button, down } => {
                 if controlled || (!down && self.inj.button_held(button)) {
                     self.inj.button(button, down);
@@ -316,8 +476,124 @@ impl<I: Inject> Router<I> {
                 Vec::new()
             }
             Input::ReleaseAll => self.feed(sid, MacEvent::ReleaseAll),
+            Input::DragOffer { drag, items } => {
+                self.offer = Some((drag, items));
+                Vec::new()
+            }
             Input::Motion { .. } | Input::Scroll { .. } => Vec::new(),
         }
+    }
+
+    fn holding(&self, drag: DragId) -> bool {
+        self.ride
+            .is_some_and(|r| r.drag == drag && r.hold.is_some())
+    }
+
+    /// `BeginDrag`: arm the drag under the cursor, then press for it.
+    fn begin_drag(&mut self, drag: DragId) {
+        if self.ride.is_some_and(|r| r.drag == drag) {
+            return; // Already riding.
+        }
+        let items = match self.offer.take() {
+            Some((d, items)) if d == drag => items,
+            other => {
+                self.offer = other;
+                Vec::new()
+            }
+        };
+        let at = self.inj.cursor();
+        if self.drags.prepare(drag, items, at) {
+            self.inj.button(MouseButton::Left, true);
+            self.ride = Some(Ride { drag, hold: None });
+        } else {
+            // Nothing is pressed, so nothing stays held or stranded.
+            warn!(
+                drag,
+                "the PC's drag could not start here; it ends undropped"
+            );
+            self.machine.on(MacEvent::DragEnded { drag });
+        }
+    }
+
+    /// The PC's left-up while the drag rides: drop now, or hold the up.
+    fn let_go(&mut self, drag: DragId) {
+        let at = self.inj.cursor();
+        self.drags.released(drag, at);
+        if self.drags.may_release(drag, at) {
+            self.drop_now(drag);
+            return;
+        }
+        info!(drag, "holding the drop until every item is here");
+        self.ride = Some(Ride {
+            drag,
+            hold: Some(Hold {
+                next_jiggle: Instant::now() + JIGGLE_EVERY,
+                nudged: false,
+            }),
+        });
+    }
+
+    /// Posts the up that drops the drag: it is over as far as input goes.
+    fn drop_now(&mut self, drag: DragId) {
+        self.let_go_of_left();
+        self.machine.on(MacEvent::DragEnded { drag });
+    }
+
+    /// Ends the ride, letting go of the left button: back on the drop spot
+    /// first if the last jiggle left the cursor off it.
+    fn let_go_of_left(&mut self) {
+        if let Some(Ride {
+            hold: Some(Hold { nudged: true, .. }),
+            ..
+        }) = self.ride
+        {
+            self.inj.jiggle(false);
+        }
+        self.ride = None;
+        self.inj.button(MouseButton::Left, false);
+    }
+
+    /// Cancels `drag` from this side: Esc ends its session undropped. A
+    /// held up goes out too; while the drag still rides, the PC holds the
+    /// button and sends the up itself.
+    fn abort_drag(&mut self, drag: DragId) {
+        match self.ride {
+            Some(r) if r.drag == drag => {
+                info!(drag, "cancelling the drag from the PC");
+                self.escape();
+                self.drags.cancel(drag);
+                if r.hold.is_some() {
+                    self.let_go_of_left();
+                } else {
+                    self.ride = None;
+                }
+                self.machine.on(MacEvent::DragEnded { drag });
+            }
+            // Dropped already, or never here: stop its fetches.
+            _ => self.drags.cancel(drag),
+        }
+    }
+
+    /// `drag`'s session ended (dropped, or Esc from the PC's keyboard).
+    fn session_ended(&mut self, drag: DragId) {
+        if let Some(r) = self.ride
+            && r.drag == drag
+        {
+            if r.hold.is_some() {
+                // Never leave a hold with the button still down.
+                self.let_go_of_left();
+            } else {
+                // The PC still holds the button: it counts as held until
+                // the PC's up (Task 17 note b), so pushing out is a wall.
+                self.ride = None;
+            }
+        }
+        self.machine.on(MacEvent::DragEnded { drag });
+    }
+
+    fn escape(&mut self) {
+        self.inj.key(KVK_ESCAPE, true);
+        self.inj.key(KVK_ESCAPE, false);
     }
 
     /// Sends the PC's cursor back at `frac` along the entry edge, as if
@@ -354,8 +630,15 @@ impl<I: Inject> Router<I> {
                 MacAction::ReleaseAllInjected => self.inj.release_all(),
                 MacAction::StartControl => out.push(InjectEv::Controlled { sid, on: true }),
                 MacAction::StopControl => out.push(InjectEv::Controlled { sid, on: false }),
-                // No drag rides yet: Task 17 wires these to the Mac's drag session.
-                MacAction::BeginDrag { .. } | MacAction::CancelDrag { .. } => {}
+                MacAction::BeginDrag { drag } => self.begin_drag(drag),
+                // Always before ReleaseAllInjected, which posts the up.
+                MacAction::CancelDrag { drag } => {
+                    if self.ride.is_some_and(|r| r.drag == drag) {
+                        self.escape();
+                    }
+                    self.ride = None;
+                    self.drags.cancel(drag);
+                }
             }
         }
         out
@@ -365,8 +648,9 @@ impl<I: Inject> Router<I> {
 /// Starts the injection thread; `report` passes its events to the app's
 /// loop. It always ends by reporting `Stopped`: after `Quit`, or, having
 /// released everything, after a panic.
-pub fn spawn_inject_thread<I: Inject + Send + 'static>(
+pub fn spawn_inject_thread<I: Inject + Send + 'static, D: DragPort + Send + 'static>(
     inj: I,
+    drags: D,
     access: Arc<AtomicBool>,
     report: impl Fn(InjectEv) + Send + 'static,
 ) -> Result<crossbeam_channel::Sender<InjectMsg>> {
@@ -375,9 +659,23 @@ pub fn spawn_inject_thread<I: Inject + Send + 'static>(
         .name("cj-inject".into())
         .spawn(move || {
             set_user_interactive_qos();
-            let mut router = Router::new(inj, access);
+            let mut router = Router::new(inj, drags, access);
             let run = catch_unwind(AssertUnwindSafe(|| {
-                for msg in rx {
+                loop {
+                    let msg = match router.next_tick() {
+                        Some(at) => match rx.recv_deadline(at) {
+                            Ok(msg) => msg,
+                            Err(RecvTimeoutError::Timeout) => {
+                                router.tick(Instant::now());
+                                continue;
+                            }
+                            Err(RecvTimeoutError::Disconnected) => break,
+                        },
+                        None => match rx.recv() {
+                            Ok(msg) => msg,
+                            Err(_) => break,
+                        },
+                    };
                     let quit = msg == InjectMsg::Quit;
                     for ev in router.handle(msg) {
                         report(ev);
@@ -429,6 +727,12 @@ pub(super) mod tests {
         Button(MouseButton, bool),
         Key(u16, bool),
         ReleaseAll,
+        Jiggle(bool),
+        // The drag source's calls.
+        Prepare(DragId, usize),
+        Released(DragId),
+        MayRelease(DragId),
+        CancelSource(DragId),
     }
 
     /// Records every call; holds keys and buttons like the Injector does.
@@ -510,6 +814,52 @@ pub(super) mod tests {
         fn entry_frac(&self) -> f32 {
             self.at_frac
         }
+        fn cursor(&mut self) -> (f64, f64) {
+            (300.0, 200.0)
+        }
+        fn jiggle(&mut self, nudge: bool) {
+            self.log(Call::Jiggle(nudge));
+        }
+    }
+
+    /// A drag source that records its calls in the Fake's list.
+    pub(crate) struct FakeDrags {
+        calls: Arc<Mutex<Vec<Call>>>,
+        prepare_ok: bool,
+        may_release: bool,
+    }
+
+    impl FakeDrags {
+        pub(crate) fn new(calls: &Arc<Mutex<Vec<Call>>>) -> FakeDrags {
+            FakeDrags {
+                calls: calls.clone(),
+                prepare_ok: true,
+                may_release: false,
+            }
+        }
+
+        fn log(&self, c: Call) {
+            self.calls.lock().unwrap().push(c);
+        }
+    }
+
+    impl DragPort for FakeDrags {
+        fn prepare(&mut self, drag: DragId, items: Vec<DragItem>, at: (f64, f64)) -> bool {
+            assert_eq!(at, (300.0, 200.0), "under the cursor");
+            self.log(Call::Prepare(drag, items.len()));
+            self.prepare_ok
+        }
+        fn released(&mut self, drag: DragId, at: (f64, f64)) {
+            assert_eq!(at, (300.0, 200.0));
+            self.log(Call::Released(drag));
+        }
+        fn may_release(&mut self, drag: DragId, _at: (f64, f64)) -> bool {
+            self.log(Call::MayRelease(drag));
+            self.may_release
+        }
+        fn cancel(&mut self, drag: DragId) {
+            self.log(Call::CancelSource(drag));
+        }
     }
 
     fn input(sid: u64, input: Input) -> InjectMsg {
@@ -520,6 +870,7 @@ pub(super) mod tests {
         Input::Enter {
             edge: Side::Left,
             frac,
+            drag: None,
         }
     }
 
@@ -542,17 +893,15 @@ pub(super) mod tests {
     }
 
     /// A router with session 1 begun, with or without Accessibility.
-    fn begun_with(fake: Fake, access: Arc<AtomicBool>) -> Router<Fake> {
-        let mut r = Router::new(fake, access);
+    fn begun_with(fake: Fake, access: Arc<AtomicBool>) -> Router<Fake, NoDrags> {
+        let mut r = Router::new(fake, NoDrags, access);
         assert_eq!(r.handle(InjectMsg::Begin { sid: 1 }), vec![]);
         r
     }
 
     /// A router with session 1 begun.
-    fn begun(fake: Fake) -> Router<Fake> {
-        let mut r = Router::new(fake, granted());
-        assert_eq!(r.handle(InjectMsg::Begin { sid: 1 }), vec![]);
-        r
+    fn begun(fake: Fake) -> Router<Fake, NoDrags> {
+        begun_with(fake, granted())
     }
 
     pub(crate) fn take(calls: &Arc<Mutex<Vec<Call>>>) -> Vec<Call> {
@@ -850,7 +1199,7 @@ pub(super) mod tests {
     fn thread_injects_in_order_and_reports_until_quit() {
         let (fake, calls) = Fake::new();
         let (ev_tx, ev_rx) = crossbeam_channel::unbounded();
-        let tx = spawn_inject_thread(fake, granted(), move |ev| {
+        let tx = spawn_inject_thread(fake, NoDrags, granted(), move |ev| {
             let _ = ev_tx.send(ev);
         })
         .unwrap();
@@ -893,7 +1242,7 @@ pub(super) mod tests {
         let (mut fake, calls) = Fake::new();
         fake.key_panics = true;
         let (ev_tx, ev_rx) = crossbeam_channel::unbounded();
-        let tx = spawn_inject_thread(fake, granted(), move |ev| {
+        let tx = spawn_inject_thread(fake, NoDrags, granted(), move |ev| {
             let _ = ev_tx.send(ev);
         })
         .unwrap();
@@ -922,5 +1271,406 @@ pub(super) mod tests {
             Some(&Call::ReleaseAll),
             "the held button is let go"
         );
+    }
+
+    // ------------------------------------------------ drags from the PC
+
+    use cj_core::dnd::ItemKind;
+
+    const LEFT_DOWN: Call = Call::Button(MouseButton::Left, true);
+    const LEFT_UP: Call = Call::Button(MouseButton::Left, false);
+    const ESC_DOWN: Call = Call::Key(KVK_ESCAPE, true);
+    const ESC_UP: Call = Call::Key(KVK_ESCAPE, false);
+
+    fn items(n: usize) -> Vec<DragItem> {
+        (0..n)
+            .map(|i| DragItem {
+                name: format!("f{i}.jpg"),
+                kind: ItemKind::File,
+                size: Some(10),
+            })
+            .collect()
+    }
+
+    fn enter_with(drag: DragId) -> Input {
+        Input::Enter {
+            edge: Side::Left,
+            frac: 0.5,
+            drag: Some(drag),
+        }
+    }
+
+    /// Session 1 begun on a fake drag source set up by `setup`.
+    fn begun_drags(
+        fake: Fake,
+        calls: &Arc<Mutex<Vec<Call>>>,
+        setup: impl FnOnce(&mut FakeDrags),
+    ) -> Router<Fake, FakeDrags> {
+        let mut drags = FakeDrags::new(calls);
+        setup(&mut drags);
+        let mut r = Router::new(fake, drags, granted());
+        assert_eq!(r.handle(InjectMsg::Begin { sid: 1 }), vec![]);
+        r
+    }
+
+    /// Drag 7 (two items) riding on the Mac, its source saying `may_release`
+    /// at the release; the calls so far are taken.
+    fn riding(may_release: bool) -> (Router<Fake, FakeDrags>, Arc<Mutex<Vec<Call>>>) {
+        let (mut fake, calls) = Fake::new();
+        fake.push_out = Some(0.3);
+        let mut r = begun_drags(fake, &calls, |d| d.may_release = may_release);
+        r.handle(input(
+            1,
+            Input::DragOffer {
+                drag: 7,
+                items: items(2),
+            },
+        ));
+        r.handle(input(1, enter_with(7)));
+        take(&calls);
+        (r, calls)
+    }
+
+    /// Drag 7 let go of while incomplete: the up is held.
+    fn holding() -> (Router<Fake, FakeDrags>, Arc<Mutex<Vec<Call>>>) {
+        let (mut r, calls) = riding(false);
+        r.handle(input(1, button(false)));
+        assert!(r.next_tick().is_some(), "jiggling");
+        take(&calls);
+        (r, calls)
+    }
+
+    #[test]
+    fn begin_drag_prepares_then_presses_left() {
+        let (fake, calls) = Fake::new();
+        let mut r = begun_drags(fake, &calls, |_| {});
+        r.handle(input(
+            1,
+            Input::DragOffer {
+                drag: 7,
+                items: items(2),
+            },
+        ));
+        assert_eq!(take(&calls), vec![], "an offer alone does nothing");
+        assert_eq!(
+            r.handle(input(1, enter_with(7))),
+            vec![InjectEv::Controlled { sid: 1, on: true }]
+        );
+        assert_eq!(
+            take(&calls),
+            vec![
+                Call::Wake,
+                Call::Warp(Side::Left, 0.5),
+                Call::Prepare(7, 2),
+                LEFT_DOWN
+            ]
+        );
+        // Motion drags the session along.
+        r.handle(input(1, Input::Motion { dx: 4, dy: 1 }));
+        assert_eq!(take(&calls), vec![Call::Motion(4, 1)]);
+    }
+
+    #[test]
+    fn prepare_failure_presses_nothing() {
+        let (mut fake, calls) = Fake::new();
+        fake.push_out = Some(0.3);
+        let mut r = begun_drags(fake, &calls, |d| d.prepare_ok = false);
+        r.handle(input(
+            1,
+            Input::DragOffer {
+                drag: 7,
+                items: items(1),
+            },
+        ));
+        r.handle(input(1, enter_with(7)));
+        assert_eq!(
+            take(&calls),
+            vec![Call::Wake, Call::Warp(Side::Left, 0.5), Call::Prepare(7, 1)]
+        );
+        // The drag is over: the PC's up passes as a plain up, and pushing
+        // out is a plain leave, with no Esc.
+        r.handle(input(1, button(false)));
+        assert_eq!(
+            r.handle(input(1, Input::Motion { dx: -9, dy: 0 })),
+            vec![
+                InjectEv::SendLeave { sid: 1, frac: 0.3 },
+                InjectEv::Controlled { sid: 1, on: false }
+            ]
+        );
+        assert_eq!(
+            take(&calls),
+            vec![LEFT_UP, Call::Motion(-9, 0), Call::ReleaseAll]
+        );
+
+        // A crossing whose offer never came: no items, so prepare fails.
+        r.handle(input(1, enter_with(8)));
+        assert_eq!(
+            take(&calls),
+            vec![Call::Wake, Call::Warp(Side::Left, 0.5), Call::Prepare(8, 0)]
+        );
+    }
+
+    #[test]
+    fn cancel_drag_posts_escape_before_release() {
+        let (mut r, calls) = riding(false);
+        assert_eq!(
+            r.handle(input(1, Input::ReleaseAll)),
+            vec![InjectEv::Controlled { sid: 1, on: false }]
+        );
+        assert_eq!(
+            take(&calls),
+            vec![ESC_DOWN, ESC_UP, Call::CancelSource(7), Call::ReleaseAll]
+        );
+    }
+
+    #[test]
+    fn release_over_a_taker_or_when_complete_drops_at_once() {
+        let (mut fake, calls) = Fake::new();
+        fake.push_out = Some(0.3);
+        let mut r = begun_drags(fake, &calls, |d| d.may_release = true);
+        r.handle(input(
+            1,
+            Input::DragOffer {
+                drag: 7,
+                items: items(1),
+            },
+        ));
+        r.handle(input(1, enter_with(7)));
+        take(&calls);
+        r.handle(input(1, button(false)));
+        assert_eq!(
+            take(&calls),
+            vec![Call::Released(7), Call::MayRelease(7), LEFT_UP]
+        );
+        assert_eq!(r.next_tick(), None);
+        // Dropped: the next push out is a plain leave.
+        r.handle(input(1, Input::Motion { dx: -9, dy: 0 }));
+        assert_eq!(take(&calls), vec![Call::Motion(-9, 0), Call::ReleaseAll]);
+    }
+
+    #[test]
+    fn release_while_incomplete_holds_the_up_and_freezes_motion() {
+        let (mut r, calls) = riding(false);
+        r.handle(input(1, button(false)));
+        assert_eq!(take(&calls), vec![Call::Released(7), Call::MayRelease(7)]);
+        // The cursor stays on the drop spot; repeated ups do nothing.
+        for i in [
+            Input::Motion { dx: -50, dy: 3 },
+            Input::Scroll { dx: 0, dy: 5 },
+            button(false),
+            button(true),
+        ] {
+            assert_eq!(r.handle(input(1, i)), vec![]);
+        }
+        assert_eq!(take(&calls), vec![]);
+        // Keys still pass (Esc from the PC's keyboard cancels).
+        r.handle(input(1, key(0x00, true)));
+        assert_eq!(take(&calls), vec![Call::Key(0x00, true)]);
+
+        // The jiggle: due every JIGGLE_EVERY, nudged then back.
+        let due = r.next_tick().unwrap();
+        r.tick(due - Duration::from_millis(1));
+        assert_eq!(take(&calls), vec![], "not yet");
+        r.tick(due);
+        let next = r.next_tick().unwrap();
+        assert_eq!(next, due + JIGGLE_EVERY);
+        r.tick(next);
+        assert_eq!(take(&calls), vec![Call::Jiggle(true), Call::Jiggle(false)]);
+    }
+
+    #[test]
+    fn hold_ends_with_the_up_when_complete() {
+        let (mut r, calls) = holding();
+        let due = r.next_tick().unwrap();
+        r.tick(due);
+        assert_eq!(r.handle(InjectMsg::DragReady { drag: 8 }), vec![]);
+        assert_eq!(take(&calls), vec![Call::Jiggle(true)], "another drag");
+        assert_eq!(r.handle(InjectMsg::DragReady { drag: 7 }), vec![]);
+        // Back on the drop spot, then the up.
+        assert_eq!(take(&calls), vec![Call::Jiggle(false), LEFT_UP]);
+        assert_eq!(r.next_tick(), None);
+        // Motion flows again, and the session's end changes nothing: the
+        // next push out is a plain leave, with no Esc.
+        r.handle(InjectMsg::DragEnded { drag: 7 });
+        r.handle(input(1, Input::Motion { dx: 2, dy: 2 }));
+        assert_eq!(take(&calls), vec![Call::Motion(2, 2), Call::ReleaseAll]);
+    }
+
+    #[test]
+    fn cancel_during_hold_posts_escape_then_up() {
+        for msg in [
+            InjectMsg::CancelDrag { drag: 7 },
+            InjectMsg::DragFailed { drag: 7 },
+        ] {
+            let (mut r, calls) = holding();
+            assert_eq!(r.handle(msg.clone()), vec![]);
+            assert_eq!(
+                take(&calls),
+                vec![ESC_DOWN, ESC_UP, Call::CancelSource(7), LEFT_UP],
+                "{msg:?}"
+            );
+            assert_eq!(r.next_tick(), None);
+            // Over: pushing out is a plain leave.
+            r.handle(input(1, Input::Motion { dx: -9, dy: 0 }));
+            assert_eq!(take(&calls), vec![Call::Motion(-9, 0), Call::ReleaseAll]);
+        }
+        // A session that ends by itself during a hold (Esc typed on the PC)
+        // lets go too.
+        let (mut r, calls) = holding();
+        r.handle(InjectMsg::DragEnded { drag: 7 });
+        assert_eq!(take(&calls), vec![LEFT_UP]);
+        assert_eq!(r.next_tick(), None);
+    }
+
+    #[test]
+    fn cancel_while_riding_leaves_the_button_to_the_pc() {
+        let (mut r, calls) = riding(false);
+        r.handle(InjectMsg::DragFailed { drag: 7 });
+        assert_eq!(take(&calls), vec![ESC_DOWN, ESC_UP, Call::CancelSource(7)]);
+        // The PC's up is its own.
+        r.handle(input(1, button(false)));
+        assert_eq!(take(&calls), vec![LEFT_UP]);
+        // A cancel for a drag no longer riding only stops its fetches.
+        r.handle(InjectMsg::CancelDrag { drag: 7 });
+        assert_eq!(take(&calls), vec![Call::CancelSource(7)]);
+    }
+
+    #[test]
+    fn disconnect_during_hold_releases_everything() {
+        let (mut r, calls) = holding();
+        assert_eq!(
+            r.handle(InjectMsg::End { sid: 1 }),
+            vec![InjectEv::Controlled { sid: 1, on: false }]
+        );
+        assert_eq!(
+            take(&calls),
+            vec![ESC_DOWN, ESC_UP, Call::CancelSource(7), Call::ReleaseAll]
+        );
+        assert_eq!(r.next_tick(), None);
+
+        // Losing Accessibility during a hold sends the cursor back the same way.
+        let (mut r, calls) = holding();
+        assert_eq!(
+            r.handle(InjectMsg::AccessLost),
+            vec![
+                InjectEv::SendLeave { sid: 1, frac: 0.5 },
+                InjectEv::Controlled { sid: 1, on: false }
+            ]
+        );
+        assert_eq!(
+            take(&calls),
+            vec![ESC_DOWN, ESC_UP, Call::CancelSource(7), Call::ReleaseAll]
+        );
+    }
+
+    #[test]
+    fn left_counts_as_held_from_begin_drag() {
+        let (mut r, calls) = riding(false);
+        // Esc on the Mac's side ended the session; the PC still holds the
+        // button, so pushing out is a wall.
+        r.handle(InjectMsg::DragEnded { drag: 7 });
+        assert_eq!(r.handle(input(1, Input::Motion { dx: -9, dy: 0 })), vec![]);
+        assert_eq!(take(&calls), vec![Call::Motion(-9, 0)]);
+        // Once the PC lets go, the cursor may leave.
+        r.handle(input(1, button(false)));
+        assert_eq!(
+            r.handle(input(1, Input::Motion { dx: -9, dy: 0 })),
+            vec![
+                InjectEv::SendLeave { sid: 1, frac: 0.3 },
+                InjectEv::Controlled { sid: 1, on: false }
+            ]
+        );
+        assert_eq!(
+            take(&calls),
+            vec![LEFT_UP, Call::Motion(-9, 0), Call::ReleaseAll]
+        );
+    }
+
+    #[test]
+    fn going_home_cancels_the_prefetch() {
+        let (mut r, calls) = riding(false);
+        assert_eq!(
+            r.handle(input(1, Input::Motion { dx: -9, dy: 0 })),
+            vec![
+                InjectEv::SendLeave { sid: 1, frac: 0.3 },
+                InjectEv::Controlled { sid: 1, on: false }
+            ]
+        );
+        assert_eq!(
+            take(&calls),
+            vec![
+                Call::Motion(-9, 0),
+                ESC_DOWN,
+                ESC_UP,
+                Call::CancelSource(7),
+                Call::ReleaseAll
+            ]
+        );
+        assert_eq!(r.next_tick(), None);
+    }
+
+    #[test]
+    fn a_new_crossing_over_a_riding_drag_cancels_it_first() {
+        let (mut r, calls) = riding(false);
+        r.handle(input(
+            1,
+            Input::DragOffer {
+                drag: 8,
+                items: items(3),
+            },
+        ));
+        r.handle(input(1, enter_with(8)));
+        assert_eq!(
+            take(&calls),
+            vec![
+                ESC_DOWN,
+                ESC_UP,
+                Call::CancelSource(7),
+                Call::Wake,
+                Call::Warp(Side::Left, 0.5),
+                Call::Prepare(8, 3),
+                LEFT_DOWN
+            ]
+        );
+    }
+
+    #[test]
+    fn thread_jiggles_a_held_drop() {
+        let (mut fake, calls) = Fake::new();
+        fake.push_out = None;
+        let drags = FakeDrags::new(&calls);
+        let (ev_tx, ev_rx) = crossbeam_channel::unbounded();
+        let tx = spawn_inject_thread(fake, drags, granted(), move |ev| {
+            let _ = ev_tx.send(ev);
+        })
+        .unwrap();
+        for msg in [
+            InjectMsg::Begin { sid: 2 },
+            input(
+                2,
+                Input::DragOffer {
+                    drag: 7,
+                    items: items(1),
+                },
+            ),
+            input(2, enter_with(7)),
+            input(2, button(false)),
+        ] {
+            tx.send(msg).unwrap();
+        }
+        std::thread::sleep(JIGGLE_EVERY * 2 + Duration::from_millis(200));
+        tx.send(InjectMsg::DragReady { drag: 7 }).unwrap();
+        tx.send(InjectMsg::Quit).unwrap();
+        let t = Duration::from_secs(2);
+        while ev_rx.recv_timeout(t).unwrap() != InjectEv::Stopped {}
+        let calls = take(&calls);
+        let jiggles = calls
+            .iter()
+            .filter(|c| matches!(c, Call::Jiggle(_)))
+            .count();
+        assert!(jiggles >= 2, "{calls:?}");
+        let up = calls.iter().position(|c| *c == LEFT_UP).unwrap();
+        assert!(calls[..up].contains(&Call::Jiggle(true)));
+        assert_eq!(calls[up - 1], Call::Jiggle(false), "{calls:?}");
     }
 }
