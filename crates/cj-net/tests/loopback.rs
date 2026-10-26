@@ -10,7 +10,7 @@ use cj_core::proto::{
     Control, Datagram, MouseButton, PROTOCOL_VERSION, decode_control_body, encode_control,
     encode_datagram,
 };
-use cj_net::files::{FilesIn, MAX_FRAME, STOP_INVALID};
+use cj_net::files::{FilesIn, MAX_FRAME, STOP_CANCELLED, STOP_INVALID, stop_code};
 use cj_net::session::{IncomingStream, Listener, Session, connect};
 use cj_net::{ALPN, CjServerCertVerifier, Identity, SERVER_NAME, Trust, client_config};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -993,7 +993,7 @@ async fn files_cancel_resets_receiver() {
             match f.read_chunk(&mut buf).await {
                 Ok(0) => anyhow::bail!("a cancelled entry must not look complete"),
                 Ok(_) => {}
-                Err(_) => return anyhow::Ok(()),
+                Err(e) => return anyhow::Ok(stop_code(&e)),
             }
         }
     };
@@ -1001,7 +1001,86 @@ async fn files_cancel_resets_receiver() {
         .await
         .unwrap();
     sent.unwrap();
+    assert_eq!(got.unwrap(), Some(STOP_CANCELLED));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropped_files_out_cancels_the_stream() {
+    let (a, b) = (ident(), ident());
+    let (_l, server, client) = pair_up(&a, Trust::PairingMode, &b, Trust::PairingMode).await;
+
+    // Dropped mid-entry, and dropped between entries: never Ok(0) or None.
+    for mid_entry in [true, false] {
+        let sent_bytes: &[u8] = if mid_entry { b"ab" } else { b"abcd" };
+        let (entry_tx, entry_rx) = tokio::sync::oneshot::channel();
+        let send = async {
+            let mut out = client.open_files(&header(ItemKind::Dir, 8, 3)).await?;
+            out.entry(&entry(&[], ItemKind::Dir, 0)).await?;
+            out.entry(&entry(&["a"], ItemKind::File, 4)).await?;
+            out.write(sent_bytes).await?;
+            entry_rx.await?;
+            drop(out);
+            anyhow::Ok(())
+        };
+        let recv = async {
+            let mut f = recv_files(&server).await?;
+            f.next_entry().await?.expect("root");
+            f.next_entry().await?.expect("a");
+            // Every byte sent before the drop arrives first, so the drop
+            // lands exactly where the test means it to.
+            let mut buf = [0u8; 4];
+            let mut read = 0;
+            while read < sent_bytes.len() {
+                read += f.read_chunk(&mut buf[read..]).await?;
+            }
+            entry_tx.send(()).unwrap();
+            let err = if mid_entry {
+                match f.read_chunk(&mut buf[read..]).await {
+                    Ok(n) => anyhow::bail!("read {n} bytes of a dropped entry"),
+                    Err(e) => e,
+                }
+            } else {
+                match f.next_entry().await {
+                    Ok(e) => anyhow::bail!("a dropped stream gave {e:?}"),
+                    Err(e) => e,
+                }
+            };
+            anyhow::Ok(stop_code(&err))
+        };
+        let (sent, code) = timeout(T, async { tokio::join!(send, recv) })
+            .await
+            .unwrap();
+        sent.unwrap();
+        assert_eq!(code.unwrap(), Some(STOP_CANCELLED), "mid_entry {mid_entry}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropped_files_in_cancels_the_sender() {
+    let (a, b) = (ident(), ident());
+    let (_l, server, client) = pair_up(&a, Trust::PairingMode, &b, Trust::PairingMode).await;
+
+    let len = 20 * MB as u64;
+    let send = async {
+        let mut out = client.open_files(&header(ItemKind::File, len, 1)).await?;
+        out.entry(&entry(&[], ItemKind::File, len)).await?;
+        let chunk = vec![0u8; 64 * 1024];
+        for _ in 0..len / chunk.len() as u64 {
+            if let Err(e) = out.write(&chunk).await {
+                return anyhow::Ok(stop_code(&e));
+            }
+        }
+        anyhow::bail!("all 20 MB written to a dropped receiver")
+    };
+    let recv = async {
+        drop(recv_files(&server).await?);
+        anyhow::Ok(())
+    };
+    let (code, got) = timeout(T, async { tokio::join!(send, recv) })
+        .await
+        .unwrap();
     got.unwrap();
+    assert_eq!(code.unwrap(), Some(STOP_CANCELLED));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1013,12 +1092,14 @@ async fn hostile_entry_path_is_refused() {
     for (depth, ok) in [(64, true), (65, false)] {
         let path = vec!["d"; depth];
         let send = async {
-            let mut out = client.open_files(&header(ItemKind::Dir, 0, 1)).await?;
+            let mut out = client.open_files(&header(ItemKind::Dir, 0, 2)).await?;
+            out.entry(&entry(&[], ItemKind::Dir, 0)).await?;
             out.entry(&entry(&path, ItemKind::Dir, 0)).await?;
             out.finish()
         };
         let recv = async {
             let mut f = recv_files(&server).await?;
+            f.next_entry().await?.expect("root");
             let got = f.next_entry().await;
             if ok {
                 assert_eq!(got?.unwrap().path.len(), depth);
@@ -1279,4 +1360,113 @@ async fn oversized_files_frames_are_refused() {
         timeout(T, s.stopped()).await.unwrap().unwrap(),
         Some(quinn::VarInt::from_u32(STOP_INVALID))
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn roots_out_of_place_or_of_the_wrong_kind_are_refused() {
+    let (a, b) = (ident(), ident());
+    let (_l, server, client) = pair_up(&a, Trust::PairingMode, &b, Trust::PairingMode).await;
+
+    let root = |kind| entry(&[], kind, 0);
+    let child = || entry(&["a"], ItemKind::Dir, 0);
+    // The entries sent, and the index of the one refused.
+    let cases = [
+        // A file item's root is a file, a folder item's a folder.
+        (header(ItemKind::File, 0, 1), vec![root(ItemKind::Dir)], 0),
+        (header(ItemKind::Dir, 0, 1), vec![root(ItemKind::File)], 0),
+        // The root comes first, and only once.
+        (
+            header(ItemKind::Dir, 0, 2),
+            vec![child(), root(ItemKind::Dir)],
+            0,
+        ),
+        (
+            header(ItemKind::Dir, 0, 2),
+            vec![root(ItemKind::Dir), root(ItemKind::Dir)],
+            1,
+        ),
+        // A file item is its root alone.
+        (
+            header(ItemKind::File, 0, 1),
+            vec![root(ItemKind::File), child()],
+            1,
+        ),
+    ];
+    for (h, entries, refused) in cases {
+        let send = async {
+            let mut out = client.open_files(&h).await?;
+            for e in &entries {
+                out.entry(e).await?;
+            }
+            out.finish()
+        };
+        let recv = async {
+            let mut f = recv_files(&server).await?;
+            for i in 0..refused {
+                f.next_entry()
+                    .await?
+                    .unwrap_or_else(|| panic!("no entry {i}"));
+            }
+            anyhow::Ok(f.next_entry().await.is_err())
+        };
+        let (_sent, was_refused) = timeout(T, async { tokio::join!(send, recv) })
+            .await
+            .unwrap();
+        assert!(
+            was_refused.unwrap(),
+            "{h:?} {entries:?}: entry {refused} accepted"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn headers_with_impossible_entry_counts_are_refused() {
+    let (a, b) = (ident(), ident());
+    let (_l, server, client) = pair_up(&a, Trust::PairingMode, &b, Trust::PairingMode).await;
+
+    // A file item is exactly its root; a folder item has at least its root.
+    for h in [
+        header(ItemKind::File, 0, 2),
+        header(ItemKind::File, 0, 0),
+        header(ItemKind::Dir, 0, 0),
+    ] {
+        let (_out, got) = timeout(T, async {
+            tokio::join!(client.open_files(&h), server.accept_stream())
+        })
+        .await
+        .unwrap();
+        assert!(got.is_err(), "{h:?} accepted");
+    }
+
+    // The session survives the refused streams.
+    let small = ClipboardData {
+        text: Some("ok".into()),
+        ..Default::default()
+    };
+    let (sent, got) = timeout(T, async {
+        tokio::join!(
+            client.send_clipboard(&small),
+            recv_clipboard(&server, MB as u64)
+        )
+    })
+    .await
+    .unwrap();
+    sent.unwrap();
+    assert_eq!(got.unwrap(), small);
+}
+
+#[test]
+fn stop_code_ignores_other_errors() {
+    assert_eq!(
+        stop_code(&anyhow::anyhow!("entries exceed the header")),
+        None
+    );
+    let lost = quinn::ReadError::ConnectionLost(quinn::ConnectionError::TimedOut);
+    assert_eq!(stop_code(&lost.into()), None);
+
+    let reset = quinn::ReadError::Reset(quinn::VarInt::from_u32(STOP_CANCELLED));
+    let wrapped = anyhow::Error::from(quinn::ReadExactError::ReadError(reset)).context("header");
+    assert_eq!(stop_code(&wrapped), Some(STOP_CANCELLED));
+    let stopped = quinn::WriteError::Stopped(quinn::VarInt::from_u32(STOP_INVALID));
+    assert_eq!(stop_code(&stopped.into()), Some(STOP_INVALID));
 }

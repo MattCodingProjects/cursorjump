@@ -5,11 +5,16 @@
 //! exactly `size` raw bytes, and then the stream is finished. A frame is a
 //! u32 little-endian length and that many bytes of postcard. The receiver
 //! holds every entry to the header's promises and stops the stream
-//! (`STOP_INVALID`) on the first one broken; the session stays up.
+//! (`STOP_INVALID`) on the first one broken; the session stays up. The
+//! first entry is the item's root (path `[]`, of the header's kind), and
+//! only the first: a `File` item is that one entry, a `Dir` item its root
+//! folder and then what is inside.
 
 use anyhow::{Result, anyhow, bail};
 use cj_core::dnd::{FileEntry, FilesHeader, ItemKind, MAX_PATH_DEPTH, safe_rel_path};
-use quinn::{ReadExactError, RecvStream, SendStream, VarInt};
+use quinn::{
+    ReadError, ReadExactError, ReadToEndError, RecvStream, SendStream, VarInt, WriteError,
+};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -25,6 +30,31 @@ pub const STOP_CANCELLED: u32 = 2;
 /// Stream stop code: the peer broke the stream protocol (an unknown tag, a
 /// bad frame, or an entry breaking its header's promises).
 pub const STOP_INVALID: u32 = 3;
+
+/// The code the peer stopped or reset a stream with, if that is what `e`
+/// is: on the sending side, the receiver stopped it (`STOP_CANCELLED`,
+/// `STOP_INVALID`, or 1 for a clipboard item over the receiver's limit); on
+/// the receiving side, the sender reset it (`STOP_CANCELLED`). None for
+/// anything else, such as a lost connection or a stream refused here.
+pub fn stop_code(e: &anyhow::Error) -> Option<u32> {
+    let code = e.chain().find_map(|cause| {
+        if let Some(WriteError::Stopped(c)) = cause.downcast_ref() {
+            return Some(*c);
+        }
+        let read = match cause.downcast_ref() {
+            Some(ReadExactError::ReadError(r)) => Some(r),
+            _ => match cause.downcast_ref() {
+                Some(ReadToEndError::Read(r)) => Some(r),
+                _ => cause.downcast_ref::<ReadError>(),
+            },
+        };
+        match read {
+            Some(ReadError::Reset(c)) => Some(*c),
+            _ => None,
+        }
+    })?;
+    u32::try_from(code.into_inner()).ok()
+}
 
 fn frame(v: &impl Serialize) -> Result<Vec<u8>> {
     let body = postcard::to_allocvec(v)?;
@@ -146,7 +176,8 @@ impl Drop for FilesOut {
 /// The receiving half of a files stream, from `Session::accept_stream`.
 /// It checks what the peer sends but never touches the disk: entry paths are
 /// still to be sanitized (`dnd::safe_rel_path`) by whoever writes them.
-/// Any error from the peer's side ends the stream.
+/// Any error from the peer's side ends the stream. Dropping it before the
+/// item is complete cancels the stream.
 #[derive(Debug)]
 pub struct FilesIn {
     rx: RecvStream,
@@ -159,6 +190,8 @@ pub struct FilesIn {
     bytes: u64,
     /// The stream finished where the header said it would.
     ended: bool,
+    /// Stopped by us: refused or cancelled.
+    stopped: bool,
 }
 
 impl FilesIn {
@@ -172,6 +205,18 @@ impl FilesIn {
                 return Err(e.context("files stream header"));
             }
         };
+        let fits = match header.kind {
+            ItemKind::File => header.entries == 1,
+            ItemKind::Dir => header.entries >= 1,
+        };
+        if !fits {
+            let _ = rx.stop(VarInt::from_u32(STOP_INVALID));
+            bail!(
+                "a {:?} item cannot have {} entries",
+                header.kind,
+                header.entries
+            );
+        }
         Ok(FilesIn {
             rx,
             header,
@@ -179,6 +224,7 @@ impl FilesIn {
             entries: 0,
             bytes: 0,
             ended: false,
+            stopped: false,
         })
     }
 
@@ -189,14 +235,18 @@ impl FilesIn {
     /// The next entry; None once the item is complete. Fails if the current
     /// entry's bytes are not all read (that alone changes nothing), or if
     /// the peer breaks the header's promises: more entries or bytes than
-    /// announced, a `Dir` with a size, an unsafe path, or a stream that ends
-    /// short. Not cancel-safe.
+    /// announced, a root that is missing, out of place or of the wrong kind,
+    /// a `Dir` with a size, an unsafe path, or a stream that ends short. Not
+    /// cancel-safe.
     pub async fn next_entry(&mut self) -> Result<Option<FileEntry>> {
         if self.left > 0 {
             bail!("{} bytes of the current entry not yet read", self.left);
         }
         if self.ended {
             return Ok(None);
+        }
+        if self.stopped {
+            bail!("files stream already refused");
         }
         let got = self.read_entry().await;
         if got.is_err() {
@@ -222,6 +272,13 @@ impl FilesIn {
         };
         if self.entries >= h.entries {
             bail!("more than the {} entries announced", h.entries);
+        }
+        let first = self.entries == 0;
+        if e.path.is_empty() != first {
+            bail!("the root must be the first entry and only the first");
+        }
+        if first && e.kind != h.kind {
+            bail!("a {:?} item with a {:?} root", h.kind, e.kind);
         }
         if e.kind == ItemKind::Dir && e.size != 0 {
             bail!("a folder entry claims {} bytes", e.size);
@@ -270,10 +327,23 @@ impl FilesIn {
 
     /// Abandons the item: the sender's writes fail.
     pub fn cancel(mut self) {
-        let _ = self.rx.stop(VarInt::from_u32(STOP_CANCELLED));
+        self.stop(STOP_CANCELLED);
     }
 
     fn refuse(&mut self) {
-        let _ = self.rx.stop(VarInt::from_u32(STOP_INVALID));
+        self.stop(STOP_INVALID);
+    }
+
+    fn stop(&mut self, code: u32) {
+        if !self.ended && !self.stopped {
+            let _ = self.rx.stop(VarInt::from_u32(code));
+            self.stopped = true;
+        }
+    }
+}
+
+impl Drop for FilesIn {
+    fn drop(&mut self) {
+        self.stop(STOP_CANCELLED);
     }
 }

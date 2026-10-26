@@ -54,6 +54,8 @@ const MAX_BIDI_STREAMS: u32 = 1;
 /// Clipboard items and files streams in flight at once.
 const MAX_UNI_STREAMS: u32 = 16;
 /// Connection-wide flow-control window (per-stream window stays at quinn's default).
+/// Left as is for files streams on purpose: more data in flight works against
+/// the no-stutter goal, and the 1.25 MB per-stream default gives ~125 MB/s at 10 ms RTT.
 const CONNECTION_RECEIVE_WINDOW: u32 = 48 * 1024 * 1024;
 /// Postcard framing (option tags, length varints) on top of `ClipboardData::byte_len`.
 const CLIPBOARD_FRAMING_ALLOWANCE: u64 = 64;
