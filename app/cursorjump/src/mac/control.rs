@@ -257,7 +257,14 @@ impl<I: Inject> Router<I> {
             Input::Enter { edge, frac } => {
                 // The cached state: asking the system costs milliseconds.
                 if self.access.load(Ordering::Relaxed) {
-                    return self.feed(sid, MacEvent::Enter { edge, frac });
+                    return self.feed(
+                        sid,
+                        MacEvent::Enter {
+                            edge,
+                            frac,
+                            drag: None,
+                        },
+                    );
                 }
                 if let Some(suppressed) = self.no_access_log.allow(Instant::now()) {
                     warn!(
@@ -267,14 +274,28 @@ impl<I: Inject> Router<I> {
                 }
                 // Neither wake nor warp: the Mac's cursor must not jump to
                 // the edge for a crossing that is undone at once.
-                let mut out = self.feed_quietly(sid, MacEvent::Enter { edge, frac });
+                let mut out = self.feed_quietly(
+                    sid,
+                    MacEvent::Enter {
+                        edge,
+                        frac,
+                        drag: None,
+                    },
+                );
                 out.extend(self.bounce(sid, frac));
                 out
             }
             Input::Motion { dx, dy } if controlled => match self.inj.motion(dx, dy) {
                 Some(frac) => {
                     let buttons_held = self.inj.buttons_held();
-                    self.feed(sid, MacEvent::PushOut { frac, buttons_held })
+                    self.feed(
+                        sid,
+                        MacEvent::PushOut {
+                            frac,
+                            buttons_held,
+                            offer: None,
+                        },
+                    )
                 }
                 None => Vec::new(),
             },
@@ -307,6 +328,7 @@ impl<I: Inject> Router<I> {
             MacEvent::PushOut {
                 frac,
                 buttons_held: false,
+                offer: None,
             },
         )
     }
@@ -328,10 +350,12 @@ impl<I: Inject> Router<I> {
                 MacAction::WakeDisplay | MacAction::WarpTo { .. } if !move_cursor => {}
                 MacAction::WakeDisplay => self.inj.wake_display(),
                 MacAction::WarpTo { edge, frac } => self.inj.warp_to(edge, frac),
-                MacAction::SendLeave { frac } => out.push(InjectEv::SendLeave { sid, frac }),
+                MacAction::SendLeave { frac, .. } => out.push(InjectEv::SendLeave { sid, frac }),
                 MacAction::ReleaseAllInjected => self.inj.release_all(),
                 MacAction::StartControl => out.push(InjectEv::Controlled { sid, on: true }),
                 MacAction::StopControl => out.push(InjectEv::Controlled { sid, on: false }),
+                // No drag rides yet: Task 17 wires these to the Mac's drag session.
+                MacAction::BeginDrag { .. } | MacAction::CancelDrag { .. } => {}
             }
         }
         out

@@ -639,6 +639,7 @@ impl State {
             frac: edge_frac(&edge, side, x, y),
             game: probe_game(),
             buttons_held: mouse_buttons_held(),
+            offer: None,
         }));
     }
 

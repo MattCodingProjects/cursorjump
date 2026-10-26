@@ -356,7 +356,7 @@ impl App {
                     self.update_config(|c| c.paired_peer = Some(fp));
                 }
             }
-            PcAction::EnterMac { mac_edge, frac } => {
+            PcAction::EnterMac { mac_edge, frac, .. } => {
                 self.send_input(InputCmd::EnterMac);
                 self.control(Control::Enter {
                     edge: mac_edge,
@@ -368,6 +368,11 @@ impl App {
             PcAction::ReturnToPc { pc_frac } => self.send_input(InputCmd::ReturnToPc { pc_frac }),
             PcAction::SendReleaseAll => self.control(Control::ReleaseAll).await,
             PcAction::Reconnect => self.reconnect(),
+            // No drag rides yet: Task 13 wires these to the catcher and `DoDragDrop`.
+            PcAction::CancelSourceDrag { .. }
+            | PcAction::SourceDragHome { .. }
+            | PcAction::StartIncomingDrag { .. }
+            | PcAction::CancelIncomingDrag { .. } => {}
         }
     }
 
@@ -441,7 +446,9 @@ impl App {
 
     fn on_net(&mut self, ev: NetEv) {
         match ev {
-            NetEv::Control(Control::Leave { frac, .. }) => self.feed(PcEvent::MacLeave { frac }),
+            NetEv::Control(Control::Leave { frac, .. }) => {
+                self.feed(PcEvent::MacLeave { frac, drag: None })
+            }
             NetEv::Control(Control::MacReady { ready }) => {
                 if ready != self.machine.mac_ready() {
                     info!(ready, "the Mac's readiness changed");

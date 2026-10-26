@@ -164,6 +164,7 @@ impl Diagnose {
                 frac,
                 game,
                 buttons_held,
+                ..
             }) => {
                 let locked = game_locked(&game);
                 info!(frac, buttons_held, locked, ?game, "EdgePush");
