@@ -34,9 +34,11 @@
 //! # Source (A1, A2, A3): a drag that starts on our tiny panel
 //!
 //! ```text
-//! cargo run -p cursorjump --example dnd_spike_mac -- source [--kind promise|url] [--size-mb 5]
-//!     [--from PATH] [--wait-secs 60] [--wait-when drop|first] [--end up|esc|esc-then-up|mask-none]
+//! cargo run -p cursorjump --example dnd_spike_mac -- source [--kind promise|url|both]
+//!     [--size-mb 5] [--from PATH] [--wait-secs 60] [--wait-when drop|first]
+//!     [--end up|esc|esc-then-up|mask-none|hold]
 //!     [--start left-edge|here] [--hover-ms 1500] [--jiggle] [--panel-alpha 0.01]
+//!     [--hold-write rename|inplace]
 //!     [--countdown 5] [--move-ms 800] [--quit-after 20]
 //! ```
 //! 1. Payload: `--from PATH` serves a copy of that file under its name; otherwise
@@ -65,8 +67,18 @@
 //!    asked again after the release or the pasteboard served its cached answer.
 //! 5. The script drags S to T over `--move-ms`, then hovers `--hover-ms` (default 1500;
 //!    `--jiggle` adds a +-1 pt dragged event every 50 ms).
+//!    `--kind both`: one item whose writer (an `NSFilePromiseProvider` subclass) offers the
+//!    promise AND `public.file-url` pointing at the placeholder (answered at once, so it
+//!    is empty unless `--end hold` filled it). The summary says which one the target
+//!    used: `writePromiseToURL` called means the promise; a drop without it means the URL.
 //! 6. `--end`:
 //!    - `up` (default): RELEASE = LeftMouseUp at T.
+//!    - `hold`: after the hover the button stays down while the script writes the payload
+//!      into the placeholder over `--wait-secs` (a +-1 pt dragged jiggle every 500 ms keeps
+//!      the session alive), then RELEASE. `--hold-write rename` (default) writes a temp
+//!      file in the same directory and renames it over the placeholder; `inplace`
+//!      truncates and writes the placeholder's own inode. In this mode the promise writer
+//!      and the URL provider do not wait again after the release.
 //!    - `esc`: Escape down/up (keycode 0x35) from the same source, wait 1 s, log whether
 //!      the session ended. The button stays (virtually) down until the quit posts the up.
 //!    - `esc-then-up`: Escape down/up, 300 ms, LeftMouseUp at T (the real app's
@@ -136,8 +148,8 @@ mod mac {
         NSDraggingSession, NSDraggingSource, NSEvent, NSFilePromiseProvider,
         NSFilePromiseProviderDelegate, NSFilePromiseReceiver, NSPanel, NSPasteboard,
         NSPasteboardItem, NSPasteboardItemDataProvider, NSPasteboardTypeFileURL,
-        NSPasteboardURLReadingFileURLsOnlyKey, NSResponder, NSStatusWindowLevel, NSView,
-        NSWindowCollectionBehavior, NSWindowStyleMask, NSWorkspace,
+        NSPasteboardURLReadingFileURLsOnlyKey, NSPasteboardWritingOptions, NSResponder,
+        NSStatusWindowLevel, NSView, NSWindowCollectionBehavior, NSWindowStyleMask, NSWorkspace,
     };
     use objc2_core_foundation::{CFRetained, CGPoint};
     use objc2_core_graphics::{
@@ -239,6 +251,7 @@ mod mac {
     static PROVIDER_AFTER: AtomicU32 = AtomicU32::new(0);
     static PROMISE_NAME_CALLS: AtomicU32 = AtomicU32::new(0);
     static PROMISE_WRITE_CALLS: AtomicU32 = AtomicU32::new(0);
+    static BOTH_URL_CALLS: AtomicU32 = AtomicU32::new(0);
 
     static UPDATED_CALLS: AtomicU32 = AtomicU32::new(0);
     static PERFORMED: AtomicBool = AtomicBool::new(false);
@@ -300,6 +313,7 @@ mod mac {
         "--start",
         "--hover-ms",
         "--panel-alpha",
+        "--hold-write",
     ];
     const SOURCE_FLAGS: &[&str] = &["--jiggle"];
     const CATCHER_VALS: &[&str] = &["--drive", "--alpha", "--hover-ms"];
@@ -705,6 +719,9 @@ mod mac {
 
     struct SourceCfg {
         kind: String,
+        /// `--end hold`: `rename` (temp file renamed over the placeholder) or
+        /// `inplace` (truncate and write the placeholder's own inode).
+        hold_write: String,
         wait_secs: u64,
         wait_when: String,
         end: String,
@@ -925,7 +942,18 @@ mod mac {
                 event.clickCount(),
                 c.kind
             );
-            let item = if c.kind == "promise" {
+            let item = if c.kind == "both" {
+                let delegate = PromiseDelegate::new();
+                let provider = BothProvider::new(&c.payload.uti, &delegate);
+                let writer: &NSFilePromiseProvider = &provider;
+                let item = NSDraggingItem::initWithPasteboardWriter(
+                    NSDraggingItem::alloc(),
+                    ProtocolObject::from_ref(writer),
+                );
+                self.keep(delegate.into_super());
+                self.keep(provider.into_super().into_super());
+                item
+            } else if c.kind == "promise" {
                 let delegate = PromiseDelegate::new();
                 let provider = NSFilePromiseProvider::initWithFileType_delegate(
                     NSFilePromiseProvider::alloc(),
@@ -1028,7 +1056,9 @@ mod mac {
                 let path = url.path().map(|p| p.to_string()).unwrap_or_default();
                 log!("promise writePromiseToURL call #{n}: {path} ({})", rel());
                 let c = cfg();
-                wait_logged(c.wait_secs, "promise writer");
+                // `--end hold` already waited (and wrote) before the release.
+                let wait = if c.end == "hold" { 0 } else { c.wait_secs };
+                wait_logged(wait, "promise writer");
                 let res = std::fs::copy(&c.payload.path, &path);
                 match &res {
                     Ok(b) => log!("promise writer: wrote {b} bytes to {path} ({})", rel()),
@@ -1097,7 +1127,9 @@ mod mac {
                     rel()
                 );
                 let c = cfg();
-                let block = if c.wait_when == "first" {
+                let block = if c.end == "hold" {
+                    false // the hold writes the bytes before the release
+                } else if c.wait_when == "first" {
                     total == 1
                 } else {
                     after && n == 1
@@ -1132,6 +1164,156 @@ mod mac {
         }
     }
 
+    define_class!(
+        // SAFETY: NSFilePromiseProvider may be subclassed (AppKit documents
+        // overriding its NSPasteboardWriting methods to add types); no Drop.
+        #[unsafe(super(NSFilePromiseProvider, NSObject))]
+        #[name = "CJSpikeBothProvider"]
+        struct BothProvider;
+
+        unsafe impl NSObjectProtocol for BothProvider {}
+
+        impl BothProvider {
+            #[unsafe(method_id(writableTypesForPasteboard:))]
+            fn writable_types(&self, pasteboard: &NSPasteboard) -> Retained<NSArray<NSString>> {
+                // SAFETY: the superclass's own method with the same arguments.
+                let base: Retained<NSArray<NSString>> =
+                    unsafe { msg_send![super(self), writableTypesForPasteboard: pasteboard] };
+                let mut types = base.to_vec();
+                types.push(NSString::from_str(&file_url_type()));
+                log!("both: writableTypesForPasteboard -> [{}] ({})", join(&NSArray::from_retained_slice(&types)), rel());
+                NSArray::from_retained_slice(&types)
+            }
+
+            #[unsafe(method(writingOptionsForType:pasteboard:))]
+            fn writing_options(
+                &self,
+                ty: &NSString,
+                pasteboard: &NSPasteboard,
+            ) -> NSPasteboardWritingOptions {
+                if ty.to_string() == file_url_type() {
+                    return NSPasteboardWritingOptions(0);
+                }
+                // SAFETY: the superclass's own method with the same arguments.
+                unsafe { msg_send![super(self), writingOptionsForType: ty, pasteboard: pasteboard] }
+            }
+
+            #[unsafe(method_id(pasteboardPropertyListForType:))]
+            fn property_list(&self, ty: &NSString) -> Option<Retained<AnyObject>> {
+                both_property_list(self, ty)
+            }
+        }
+    );
+
+    /// The file URL of the placeholder for `public.file-url`; the promise's
+    /// own types from the superclass.
+    fn both_property_list(this: &BothProvider, ty: &NSString) -> Option<Retained<AnyObject>> {
+        if ty.to_string() == file_url_type() {
+            let n = BOTH_URL_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
+            let url = file_url_string(&cfg().payload.placeholder);
+            log!(
+                "both: pasteboardPropertyListForType(public.file-url) call #{n} -> {url}, placeholder {} ({})",
+                size_of(&cfg().payload.placeholder),
+                rel()
+            );
+            return Some(url.into_super().into_super());
+        }
+        // SAFETY: the superclass's own method with the same argument.
+        let v: Option<Retained<AnyObject>> =
+            unsafe { msg_send![super(this), pasteboardPropertyListForType: ty] };
+        log!(
+            "both: pasteboardPropertyListForType({ty}) -> super ({})",
+            rel()
+        );
+        v
+    }
+
+    impl BothProvider {
+        /// A file promise of type `uti` that also offers `public.file-url`
+        /// (the placeholder), on one pasteboard item.
+        fn new(uti: &str, delegate: &PromiseDelegate) -> Retained<BothProvider> {
+            let this = BothProvider::alloc().set_ivars(());
+            let uti = NSString::from_str(uti);
+            let delegate = ProtocolObject::<dyn NSFilePromiseProviderDelegate>::from_ref(delegate);
+            // SAFETY: NSFilePromiseProvider's designated initializer.
+            unsafe { msg_send![super(this), initWithFileType: &*uti, delegate: delegate] }
+        }
+    }
+
+    fn file_url_type() -> String {
+        // SAFETY: a static AppKit string.
+        unsafe { NSPasteboardTypeFileURL }.to_string()
+    }
+
+    /// `--end hold`: keeps the button down while writing the payload into the
+    /// placeholder over `--wait-secs`, with a +-1 pt dragged jiggle every 500 ms.
+    fn hold_and_write(p: &Poster, t: (f64, f64)) {
+        let c = cfg();
+        let data = match std::fs::read(&c.payload.path) {
+            Ok(d) => d,
+            Err(e) => {
+                log!("HOLD: reading the payload failed: {e}");
+                return;
+            }
+        };
+        let ticks = (c.wait_secs * 2).max(1) as usize;
+        let chunk = data.len().div_ceil(ticks).max(1);
+        let dest = &c.payload.placeholder;
+        let tmp = dest.with_file_name(format!(".{}.part", c.payload.name));
+        let target = if c.hold_write == "rename" { &tmp } else { dest };
+        log!(
+            "HOLD: button stays down; writing {} bytes into {} over {} s ({}), jiggle every 500 ms",
+            data.len(),
+            target.display(),
+            c.wait_secs,
+            c.hold_write
+        );
+        let mut file = match File::create(target) {
+            Ok(f) => f,
+            Err(e) => {
+                log!("HOLD: creating {} failed: {e}", target.display());
+                return;
+            }
+        };
+        let mut jiggles = 0u32;
+        let mut up = true;
+        for part in data.chunks(chunk) {
+            if let Err(e) = file.write_all(part) {
+                log!("HOLD: write failed: {e}");
+                return;
+            }
+            p.mouse(
+                CGEventType::LeftMouseDragged,
+                (t.0, t.1 + if up { 1.0 } else { 0.0 }),
+                (0, if up { 1 } else { -1 }),
+            );
+            up = !up;
+            jiggles += 1;
+            if jiggles.is_multiple_of(10) {
+                log!(
+                    "HOLD: {jiggles} jiggles; session ended {}",
+                    SESSION_ENDED.load(Ordering::SeqCst)
+                );
+            }
+            sleep_ms(500);
+        }
+        if let Err(e) = file.sync_all() {
+            log!("HOLD: sync failed: {e}");
+        }
+        drop(file);
+        if c.hold_write == "rename"
+            && let Err(e) = std::fs::rename(&tmp, dest)
+        {
+            log!("HOLD: renaming over the placeholder failed: {e}");
+        }
+        p.mouse(CGEventType::LeftMouseDragged, t, (0, 0));
+        log!(
+            "HOLD: payload complete in the placeholder ({}) after {jiggles} jiggles; session ended {}",
+            size_of(dest),
+            SESSION_ENDED.load(Ordering::SeqCst)
+        );
+    }
+
     fn source_summary() {
         let c = cfg();
         log!("---- summary (source, kind {}, end {}) ----", c.kind, c.end);
@@ -1157,13 +1339,38 @@ mod mac {
             MASK_CALLS.load(Ordering::SeqCst),
             MOVED_CALLS.load(Ordering::SeqCst)
         );
-        if c.kind == "promise" {
+        if c.kind != "url" {
             log!(
                 "promise: fileNameForType calls {}, writePromiseToURL calls {}",
                 PROMISE_NAME_CALLS.load(Ordering::SeqCst),
                 PROMISE_WRITE_CALLS.load(Ordering::SeqCst)
             );
-        } else {
+        }
+        if c.kind == "both" {
+            let (url_reads, writes) = (
+                BOTH_URL_CALLS.load(Ordering::SeqCst),
+                PROMISE_WRITE_CALLS.load(Ordering::SeqCst),
+            );
+            log!(
+                "both: public.file-url property-list calls {url_reads} (asked when the drag starts, so they do not show who used it)"
+            );
+            let ended_ok =
+                matches!(ENDED_OP.load(Ordering::SeqCst), op if op != NOT_YET && op != 0);
+            let verdict = if writes > 0 {
+                "the target used the PROMISE (writePromiseToURL was called)"
+            } else if ended_ok {
+                "the target took the drop WITHOUT asking for the promise: it used the file URL (placeholder)"
+            } else {
+                "no drop (operation None or no end)"
+            };
+            log!("=> both: {verdict}");
+            log!(
+                "placeholder now: {} ({})",
+                c.payload.placeholder.display(),
+                size_of(&c.payload.placeholder)
+            );
+        }
+        if c.kind == "url" {
             let (b, a) = (
                 PROVIDER_BEFORE.load(Ordering::SeqCst),
                 PROVIDER_AFTER.load(Ordering::SeqCst),
@@ -1268,6 +1475,10 @@ mod mac {
                 sleep_ms(50);
                 release("mask-none");
             }
+            "hold" => {
+                hold_and_write(&p, t);
+                release("hold");
+            }
             _ => release("up"),
         }
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -1281,14 +1492,15 @@ mod mac {
     }
 
     fn run_source(args: &Args) {
-        let kind = args.choice("--kind", &["promise", "url"]);
+        let kind = args.choice("--kind", &["promise", "url", "both"]);
         let size_mb: u64 = args.num("--size-mb", 5);
         let payload = prepare_payload(args.vals.get("--from"), size_mb);
         let cfg = SourceCfg {
             kind,
             wait_secs: args.num("--wait-secs", 60),
             wait_when: args.choice("--wait-when", &["drop", "first"]),
-            end: args.choice("--end", &["up", "esc", "esc-then-up", "mask-none"]),
+            end: args.choice("--end", &["up", "esc", "esc-then-up", "mask-none", "hold"]),
+            hold_write: args.choice("--hold-write", &["rename", "inplace"]),
             hover_ms: args.num("--hover-ms", 1500),
             jiggle: args.flag("--jiggle"),
             move_ms: args.num("--move-ms", 800),
@@ -1673,6 +1885,7 @@ mod mac {
         let placeholder = payload.placeholder.clone();
         let _ = SOURCE.set(SourceCfg {
             kind: "promise".into(),
+            hold_write: "rename".into(),
             wait_secs: 0,
             wait_when: "drop".into(),
             end: "up".into(),
@@ -1762,6 +1975,45 @@ mod mac {
             unsafe { item.setDraggingFrame_contents(rect, Some(contents)) };
             check("dragging item with icon", item.imageComponents().is_some());
         }
+        let both = BothProvider::new(&cfg().payload.uti, &delegate);
+        let pb = NSPasteboard::pasteboardWithUniqueName();
+        // SAFETY: the NSPasteboardWriting methods' own selectors and argument types.
+        let types: Retained<NSArray<NSString>> =
+            unsafe { msg_send![&*both, writableTypesForPasteboard: &*pb] };
+        let types: Vec<String> = types.iter().map(|t| t.to_string()).collect();
+        check(
+            &format!("both: writable types {types:?}"),
+            types.contains(&file_url_type()) && types.len() > 1,
+        );
+        let ft = NSString::from_str(&file_url_type());
+        // SAFETY: as above.
+        let opts: NSPasteboardWritingOptions =
+            unsafe { msg_send![&*both, writingOptionsForType: &*ft, pasteboard: &*pb] };
+        check("both: file-url written at once", opts.0 == 0);
+        // SAFETY: as above.
+        let plist: Option<Retained<AnyObject>> =
+            unsafe { msg_send![&*both, pasteboardPropertyListForType: &*ft] };
+        let plist = plist
+            .and_then(|o| o.downcast::<NSString>().ok())
+            .map(|s| s.to_string());
+        check(
+            &format!("both: file-url answer {plist:?}"),
+            plist.as_deref() == Some(want.as_str()),
+        );
+        let promise_types: Vec<String> = types
+            .iter()
+            .filter(|t| **t != file_url_type())
+            .cloned()
+            .collect();
+        for t in promise_types {
+            let nt = NSString::from_str(&t);
+            // SAFETY: as above.
+            let o: NSPasteboardWritingOptions =
+                unsafe { msg_send![&*both, writingOptionsForType: &*nt, pasteboard: &*pb] };
+            log!("both: super writingOptions({t}) = {:#x}", o.0);
+        }
+        // SAFETY: releases the unique pasteboard made above.
+        let () = unsafe { msg_send![&*pb, releaseGlobally] };
         log!("selfcheck: {}", if ok { "PASS" } else { "FAIL" });
         std::process::exit(if ok { 0 } else { 1 });
     }
