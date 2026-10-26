@@ -2,7 +2,10 @@
 //!
 //! It carries unreliable datagrams (motion, pings), one long-lived reliable
 //! control stream (opened by the connector and announced with `Hello`), and a
-//! fresh unidirectional stream per clipboard item.
+//! fresh unidirectional stream per clipboard item or dragged item, each
+//! starting with a tag byte that says which. The control stream is sent
+//! first, clipboard items next, and file data only when nothing else is
+//! waiting.
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
@@ -11,6 +14,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use cj_core::clipboard::ClipboardData;
+use cj_core::dnd::FilesHeader;
 use cj_core::proto::{
     Control, Datagram, PROTOCOL_VERSION, decode_control_body, decode_datagram, encode_control,
     encode_datagram,
@@ -24,6 +28,9 @@ use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 
+use crate::files::{
+    FILES_PRIORITY, FilesIn, FilesOut, STOP_INVALID, STREAM_TAG_CLIPBOARD, STREAM_TAG_FILES,
+};
 use crate::identity::{
     Fingerprint, Identity, SERVER_NAME, pair_commit, pairing_code, random_nonce,
 };
@@ -44,18 +51,21 @@ const MAX_PENDING_HANDSHAKES: usize = 8;
 const ACCEPT_QUEUE: usize = 8;
 /// Only the control stream may be bidirectional.
 const MAX_BIDI_STREAMS: u32 = 1;
-/// Clipboard items in flight at once.
-const MAX_UNI_STREAMS: u32 = 4;
+/// Clipboard items and files streams in flight at once.
+const MAX_UNI_STREAMS: u32 = 16;
 /// Connection-wide flow-control window (per-stream window stays at quinn's default).
 const CONNECTION_RECEIVE_WINDOW: u32 = 48 * 1024 * 1024;
 /// Postcard framing (option tags, length varints) on top of `ClipboardData::byte_len`.
 const CLIPBOARD_FRAMING_ALLOWANCE: u64 = 64;
+/// Ahead of clipboard items (0) and files streams (`FILES_PRIORITY`).
+const CONTROL_PRIORITY: i32 = 100;
 
 /// Application close / stream stop codes.
 const CLOSE_BYE: u32 = 0;
 const CLOSE_PROTOCOL: u32 = 1;
 const CLOSE_PAIRING: u32 = 2;
 const STOP_TOO_LARGE: u32 = 1;
+// 2 and 3 are `files::STOP_CANCELLED` and `files::STOP_INVALID`.
 
 fn transport_config() -> Arc<TransportConfig> {
     let mut t = TransportConfig::default();
@@ -338,6 +348,36 @@ struct Inner {
     _endpoint: Endpoint,
 }
 
+/// A unidirectional stream from the peer, from `Session::accept_stream`.
+#[derive(Debug)]
+pub enum IncomingStream {
+    Clipboard(ClipboardIn),
+    Files(FilesIn),
+}
+
+/// A clipboard item whose body is still to be read.
+#[derive(Debug)]
+pub struct ClipboardIn(RecvStream);
+
+impl ClipboardIn {
+    /// Reads the item. `max_bytes` is a content limit (as in
+    /// `clipboard::within_limit`); the wire encoding may exceed it by
+    /// 64 bytes of postcard framing. A larger item is refused (its stream
+    /// is stopped) and returns Err.
+    pub async fn read(mut self, max_bytes: u64) -> Result<ClipboardData> {
+        let wire_limit = max_bytes.saturating_add(CLIPBOARD_FRAMING_ALLOWANCE);
+        let limit = usize::try_from(wire_limit).unwrap_or(usize::MAX);
+        match self.0.read_to_end(limit).await {
+            Ok(body) => Ok(postcard::from_bytes(&body)?),
+            Err(ReadToEndError::TooLong) => {
+                let _ = self.0.stop(VarInt::from_u32(STOP_TOO_LARGE));
+                bail!("clipboard item exceeds the {max_bytes}-byte limit")
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
 /// An established, authenticated connection. Cheap to clone.
 #[derive(Clone)]
 pub struct Session {
@@ -355,6 +395,7 @@ impl Session {
         endpoint: Endpoint,
     ) -> Result<Session> {
         let peer = peer_fingerprint(&conn)?;
+        control_tx.set_priority(CONTROL_PRIORITY)?;
         Ok(Session {
             inner: Arc::new(Inner {
                 conn,
@@ -432,29 +473,43 @@ impl Session {
 
     /// Sends one clipboard item on a fresh unidirectional stream.
     pub async fn send_clipboard(&self, d: &ClipboardData) -> Result<()> {
-        let body = postcard::to_allocvec(d)?;
+        let mut wire = vec![STREAM_TAG_CLIPBOARD];
+        wire.extend(postcard::to_allocvec(d)?);
         let mut s = self.inner.conn.open_uni().await?;
-        s.write_all(&body).await?;
+        s.write_all(&wire).await?;
         s.finish()?;
         Ok(())
     }
 
-    /// Next clipboard item from the peer. `max_bytes` is a content limit (as in
-    /// `clipboard::within_limit`); the wire encoding may exceed it by
-    /// 64 bytes of postcard framing. A larger item is refused (its stream
-    /// is stopped) and returns Err, but unlike the other `recv_*` errors the
-    /// session stays up.
-    pub async fn recv_clipboard(&self, max_bytes: u64) -> Result<ClipboardData> {
+    /// Opens a files stream for one dragged item and sends its header.
+    pub async fn open_files(&self, h: &FilesHeader) -> Result<FilesOut> {
+        let s = self.inner.conn.open_uni().await?;
+        s.set_priority(FILES_PRIORITY)?;
+        FilesOut::start(s, h).await
+    }
+
+    /// Next unidirectional stream from the peer, by its tag; a files
+    /// stream's header is read before it is returned.
+    ///
+    /// Single consumer: the app's one stream acceptor calls this, since a
+    /// second caller would take some of the streams. Not cancel-safe: a
+    /// cancelled call may drop a stream. A stream with an unknown tag or a
+    /// bad header is stopped (`STOP_INVALID`) and returns Err, but unlike
+    /// the other `recv_*` errors the session stays up.
+    pub async fn accept_stream(&self) -> Result<IncomingStream> {
         let mut s = self.inner.conn.accept_uni().await?;
-        let wire_limit = max_bytes.saturating_add(CLIPBOARD_FRAMING_ALLOWANCE);
-        let limit = usize::try_from(wire_limit).unwrap_or(usize::MAX);
-        match s.read_to_end(limit).await {
-            Ok(body) => Ok(postcard::from_bytes(&body)?),
-            Err(ReadToEndError::TooLong) => {
-                let _ = s.stop(VarInt::from_u32(STOP_TOO_LARGE));
-                bail!("clipboard item exceeds the {max_bytes}-byte limit")
+        let mut tag = [0u8];
+        if let Err(e) = s.read_exact(&mut tag).await {
+            let _ = s.stop(VarInt::from_u32(STOP_INVALID));
+            bail!("stream without a tag: {e}");
+        }
+        match tag[0] {
+            STREAM_TAG_CLIPBOARD => Ok(IncomingStream::Clipboard(ClipboardIn(s))),
+            STREAM_TAG_FILES => Ok(IncomingStream::Files(FilesIn::accept(s).await?)),
+            other => {
+                let _ = s.stop(VarInt::from_u32(STOP_INVALID));
+                bail!("stream with unknown tag {other}")
             }
-            Err(e) => Err(e.into()),
         }
     }
 

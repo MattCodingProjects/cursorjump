@@ -545,6 +545,8 @@ impl App {
                     warn!("clipboard bridge is gone; clipboard from the PC dropped");
                 }
             }
+            // Dropping it refuses the stream.
+            NetEv::Files(_) => {}
             NetEv::Closed(reason) => {
                 info!("disconnected: {reason}");
                 self.set_conn(Conn::Waiting);

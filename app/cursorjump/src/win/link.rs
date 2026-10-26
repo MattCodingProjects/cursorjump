@@ -16,7 +16,7 @@ use tokio::task::JoinHandle;
 
 use super::app::Ev;
 use crate::common::paired_fingerprint;
-use crate::common::session_tasks::{ClipboardOut, NetEv, pong, spawn_clipboard_tasks};
+use crate::common::session_tasks::{ClipboardOut, NetEv, pong, spawn_stream_tasks};
 
 /// `discover` needs at least 3 s to get through mDNS and the broadcast fallback.
 const DISCOVER_TIMEOUT: Duration = Duration::from_secs(3);
@@ -145,10 +145,13 @@ impl Live {
         }));
 
         let tx = events.clone();
-        let (clip_out, clip_tasks) = spawn_clipboard_tasks(&session, clip_max, move |d| {
-            tx.send(net(NetEv::Clipboard(d))).is_ok()
-        });
-        tasks.extend(clip_tasks);
+        let (clip_out, stream_tasks) = spawn_stream_tasks(
+            &session,
+            clip_max,
+            move |d| tx.send(net(NetEv::Clipboard(d))).is_ok(),
+            |_| true,
+        );
+        tasks.extend(stream_tasks);
 
         Live {
             sid,

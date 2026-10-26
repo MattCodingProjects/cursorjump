@@ -471,6 +471,8 @@ impl App {
                     warn!("clipboard bridge is gone; clipboard from the Mac dropped");
                 }
             }
+            // Dropping it refuses the stream.
+            NetEv::Files(_) => {}
             NetEv::Closed(reason) => self.mark_dead(reason),
         }
     }

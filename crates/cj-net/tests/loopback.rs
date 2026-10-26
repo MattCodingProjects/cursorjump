@@ -5,14 +5,17 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cj_core::clipboard::{ClipboardData, within_limit};
+use cj_core::dnd::{FileEntry, FilesHeader, ItemKind};
 use cj_core::proto::{
     Control, Datagram, MouseButton, PROTOCOL_VERSION, decode_control_body, encode_control,
     encode_datagram,
 };
-use cj_net::session::{Listener, Session, connect};
+use cj_net::files::{FilesIn, MAX_FRAME, STOP_INVALID};
+use cj_net::session::{IncomingStream, Listener, Session, connect};
 use cj_net::{ALPN, CjServerCertVerifier, Identity, SERVER_NAME, Trust, client_config};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::sign::CertifiedKey;
+use sha2::{Digest, Sha256};
 use tokio::time::timeout;
 
 /// Generous upper bound for anything that is expected to finish.
@@ -508,6 +511,72 @@ async fn datagram_and_control_flow() {
     );
 }
 
+/// The next stream from the peer, which must be a clipboard item.
+async fn recv_clipboard(s: &Session, max_bytes: u64) -> anyhow::Result<ClipboardData> {
+    match s.accept_stream().await? {
+        IncomingStream::Clipboard(c) => c.read(max_bytes).await,
+        IncomingStream::Files(f) => anyhow::bail!("expected a clipboard item, got {f:?}"),
+    }
+}
+
+/// The next stream from the peer, which must be a files stream.
+async fn recv_files(s: &Session) -> anyhow::Result<FilesIn> {
+    match timeout(T, s.accept_stream()).await?? {
+        IncomingStream::Files(f) => Ok(f),
+        IncomingStream::Clipboard(_) => {
+            anyhow::bail!("expected a files stream, got a clipboard item")
+        }
+    }
+}
+
+/// `n` deterministic pseudo-random bytes (xorshift64).
+fn noise(n: usize, seed: u64) -> Vec<u8> {
+    let mut x = seed | 1;
+    let mut out = Vec::with_capacity(n + 8);
+    while out.len() < n {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        out.extend_from_slice(&x.to_le_bytes());
+    }
+    out.truncate(n);
+    out
+}
+
+fn header(kind: ItemKind, total_bytes: u64, entries: u64) -> FilesHeader {
+    FilesHeader {
+        drag: 7,
+        item: 0,
+        name: "item".into(),
+        kind,
+        total_bytes,
+        entries,
+    }
+}
+
+fn entry(path: &[&str], kind: ItemKind, size: u64) -> FileEntry {
+    FileEntry {
+        path: path.iter().map(|c| c.to_string()).collect(),
+        kind,
+        size,
+    }
+}
+
+/// Reads the rest of the current entry; returns its SHA-256 and length.
+async fn hash_entry(f: &mut FilesIn) -> anyhow::Result<([u8; 32], u64)> {
+    let mut h = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut len = 0;
+    loop {
+        let n = f.read_chunk(&mut buf).await?;
+        if n == 0 {
+            return Ok((h.finalize().into(), len));
+        }
+        h.update(&buf[..n]);
+        len += n as u64;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn clipboard_transfer_and_limit() {
     let (a, b) = (ident(), ident());
@@ -531,7 +600,7 @@ async fn clipboard_transfer_and_limit() {
         let (sent, got) = timeout(T, async {
             tokio::join!(
                 client.send_clipboard(item),
-                server.recv_clipboard(MB as u64)
+                recv_clipboard(&server, MB as u64)
             )
         })
         .await
@@ -547,7 +616,7 @@ async fn clipboard_transfer_and_limit() {
     let (_sent, got) = timeout(T, async {
         tokio::join!(
             client.send_clipboard(&too_big),
-            server.recv_clipboard(MB as u64)
+            recv_clipboard(&server, MB as u64)
         )
     })
     .await
@@ -562,7 +631,7 @@ async fn clipboard_transfer_and_limit() {
     let (sent, got) = timeout(T, async {
         tokio::join!(
             client.send_clipboard(&small),
-            server.recv_clipboard(MB as u64)
+            recv_clipboard(&server, MB as u64)
         )
     })
     .await
@@ -755,16 +824,16 @@ async fn stream_limits_are_enforced() {
         "a second bi stream must not be granted"
     );
 
-    // At most 4 unaccepted clipboard streams in flight.
+    // At most 16 unaccepted uni streams in flight.
     let mut unis = Vec::new();
-    for _ in 0..4 {
+    for _ in 0..16 {
         let mut s = timeout(T, raw.conn.open_uni()).await.unwrap().unwrap();
         s.write_all(b"x").await.unwrap();
         unis.push(s);
     }
     assert!(
         timeout(short, raw.conn.open_uni()).await.is_err(),
-        "a 5th uni stream must wait for credit"
+        "a 17th uni stream must wait for credit"
     );
 }
 
@@ -788,4 +857,426 @@ async fn broadcast_fallback_finds_responder() {
         .expect("responder found via broadcast fallback");
     assert_eq!(found.addr.port(), 47800);
     assert_eq!(found.name, "test-mac");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn files_stream_roundtrip_20mb() {
+    let (a, b) = (ident(), ident());
+    let (_l, server, client) = pair_up(&a, Trust::PairingMode, &b, Trust::PairingMode).await;
+
+    let data = noise(20 * MB, 1);
+    let h = header(ItemKind::Dir, data.len() as u64, 3);
+    let entries = [
+        entry(&[], ItemKind::Dir, 0),
+        entry(&["big.bin"], ItemKind::File, data.len() as u64),
+        entry(&["empty.txt"], ItemKind::File, 0),
+    ];
+    let send = async {
+        let mut out = client.open_files(&h).await?;
+        for e in &entries {
+            out.entry(e).await?;
+            if e.size > 0 {
+                for chunk in data.chunks(256 * 1024) {
+                    out.write(chunk).await?;
+                }
+            }
+        }
+        out.finish()
+    };
+    let recv = async {
+        let mut f = recv_files(&server).await?;
+        assert_eq!(f.header(), &h);
+        let mut got = Vec::new();
+        while let Some(e) = f.next_entry().await? {
+            let (sum, len) = hash_entry(&mut f).await?;
+            got.push((e, sum, len));
+        }
+        assert!(f.next_entry().await?.is_none(), "the end stays the end");
+        anyhow::Ok(got)
+    };
+    let started = Instant::now();
+    let (sent, got) = timeout(T, async { tokio::join!(send, recv) })
+        .await
+        .unwrap();
+    eprintln!("20 MB files stream took {:?}", started.elapsed());
+    sent.unwrap();
+    let empty: [u8; 32] = Sha256::digest(b"").into();
+    let [root, big, zero] = entries;
+    assert_eq!(
+        got.unwrap(),
+        [
+            (root, empty, 0),
+            (big, Sha256::digest(&data).into(), data.len() as u64),
+            (zero, empty, 0),
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clipboard_still_works_alongside_files() {
+    let (a, b) = (ident(), ident());
+    let (_l, server, client) = pair_up(&a, Trust::PairingMode, &b, Trust::PairingMode).await;
+
+    let data = noise(20 * MB, 2);
+    let half = data.len() / 2;
+    let clip = ClipboardData {
+        png: Some(noise(MB, 3)),
+        ..Default::default()
+    };
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (clip_tx, clip_rx) = tokio::sync::oneshot::channel();
+
+    // The file stream holds back its second half until the clipboard item
+    // has crossed, so the item certainly arrives mid-transfer.
+    let send_files = async {
+        let len = data.len() as u64;
+        let mut out = client.open_files(&header(ItemKind::File, len, 1)).await?;
+        out.entry(&entry(&[], ItemKind::File, len)).await?;
+        out.write(&data[..half]).await?;
+        clip_rx.await?;
+        out.write(&data[half..]).await?;
+        out.finish()
+    };
+    let recv_files = async {
+        let mut f = recv_files(&server).await?;
+        f.next_entry().await?.expect("one entry");
+        started_tx.send(()).unwrap();
+        let (sum, _) = hash_entry(&mut f).await?;
+        assert!(f.next_entry().await?.is_none());
+        anyhow::Ok(sum)
+    };
+    let clipboard = async {
+        started_rx.await?;
+        let (sent, got) = tokio::join!(
+            client.send_clipboard(&clip),
+            recv_clipboard(&server, MB as u64)
+        );
+        sent?;
+        clip_tx.send(()).unwrap();
+        got
+    };
+    let started = Instant::now();
+    let (sent, sum, got) = timeout(T, async { tokio::join!(send_files, recv_files, clipboard) })
+        .await
+        .unwrap();
+    eprintln!(
+        "20 MB files stream with a 1 MB clipboard item took {:?}",
+        started.elapsed()
+    );
+    sent.unwrap();
+    assert_eq!(got.unwrap(), clip);
+    assert_eq!(sum.unwrap(), <[u8; 32]>::from(Sha256::digest(&data)));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn files_cancel_resets_receiver() {
+    let (a, b) = (ident(), ident());
+    let (_l, server, client) = pair_up(&a, Trust::PairingMode, &b, Trust::PairingMode).await;
+
+    let (entry_tx, entry_rx) = tokio::sync::oneshot::channel();
+    let send = async {
+        let mut out = client
+            .open_files(&header(ItemKind::File, MB as u64, 1))
+            .await?;
+        out.entry(&entry(&[], ItemKind::File, MB as u64)).await?;
+        out.write(&noise(100_000, 4)).await?;
+        entry_rx.await?;
+        out.cancel();
+        anyhow::Ok(())
+    };
+    let recv = async {
+        let mut f = recv_files(&server).await?;
+        f.next_entry().await?.expect("one entry");
+        entry_tx.send(()).unwrap();
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            match f.read_chunk(&mut buf).await {
+                Ok(0) => anyhow::bail!("a cancelled entry must not look complete"),
+                Ok(_) => {}
+                Err(_) => return anyhow::Ok(()),
+            }
+        }
+    };
+    let (sent, got) = timeout(T, async { tokio::join!(send, recv) })
+        .await
+        .unwrap();
+    sent.unwrap();
+    got.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hostile_entry_path_is_refused() {
+    let (a, b) = (ident(), ident());
+    let (_l, server, client) = pair_up(&a, Trust::PairingMode, &b, Trust::PairingMode).await;
+
+    // 64 components is the deepest allowed; 65 is refused.
+    for (depth, ok) in [(64, true), (65, false)] {
+        let path = vec!["d"; depth];
+        let send = async {
+            let mut out = client.open_files(&header(ItemKind::Dir, 0, 1)).await?;
+            out.entry(&entry(&path, ItemKind::Dir, 0)).await?;
+            out.finish()
+        };
+        let recv = async {
+            let mut f = recv_files(&server).await?;
+            let got = f.next_entry().await;
+            if ok {
+                assert_eq!(got?.unwrap().path.len(), depth);
+                assert!(f.next_entry().await?.is_none());
+            } else {
+                assert!(got.is_err(), "a {depth}-deep path must be refused");
+            }
+            anyhow::Ok(())
+        };
+        let (_sent, got) = timeout(T, async { tokio::join!(send, recv) })
+            .await
+            .unwrap();
+        got.unwrap();
+    }
+
+    // The session survives the refused stream.
+    let small = ClipboardData {
+        text: Some("still here".into()),
+        ..Default::default()
+    };
+    let (sent, got) = timeout(T, async {
+        tokio::join!(
+            client.send_clipboard(&small),
+            recv_clipboard(&server, MB as u64)
+        )
+    })
+    .await
+    .unwrap();
+    sent.unwrap();
+    assert_eq!(got.unwrap(), small);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn entry_bytes_over_header_total_are_refused() {
+    let (a, b) = (ident(), ident());
+    let (_l, server, client) = pair_up(&a, Trust::PairingMode, &b, Trust::PairingMode).await;
+
+    // One entry larger than the whole item.
+    let send = async {
+        let mut out = client.open_files(&header(ItemKind::File, 10, 1)).await?;
+        out.entry(&entry(&[], ItemKind::File, 11)).await?;
+        out.write(&[0; 11]).await?;
+        out.finish()
+    };
+    let recv = async {
+        let mut f = recv_files(&server).await?;
+        anyhow::Ok(f.next_entry().await.is_err())
+    };
+    let (_sent, refused) = timeout(T, async { tokio::join!(send, recv) })
+        .await
+        .unwrap();
+    assert!(refused.unwrap(), "an 11-byte entry in a 10-byte item");
+
+    // Entries that only add up to more than the whole item.
+    let send = async {
+        let mut out = client.open_files(&header(ItemKind::Dir, 10, 3)).await?;
+        out.entry(&entry(&[], ItemKind::Dir, 0)).await?;
+        out.entry(&entry(&["a"], ItemKind::File, 6)).await?;
+        out.write(b"aaaaaa").await?;
+        out.entry(&entry(&["b"], ItemKind::File, 5)).await?;
+        out.write(b"bbbbb").await?;
+        out.finish()
+    };
+    let recv = async {
+        let mut f = recv_files(&server).await?;
+        f.next_entry().await?.expect("root");
+        f.next_entry().await?.expect("a");
+        assert_eq!(hash_entry(&mut f).await?.1, 6);
+        anyhow::Ok(f.next_entry().await.is_err())
+    };
+    let (_sent, refused) = timeout(T, async { tokio::join!(send, recv) })
+        .await
+        .unwrap();
+    assert!(refused.unwrap(), "6 + 5 bytes in a 10-byte item");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn extra_entries_and_sized_dirs_are_refused() {
+    let (a, b) = (ident(), ident());
+    let (_l, server, client) = pair_up(&a, Trust::PairingMode, &b, Trust::PairingMode).await;
+
+    // A second entry in a one-entry item.
+    let send = async {
+        let mut out = client.open_files(&header(ItemKind::Dir, 0, 1)).await?;
+        out.entry(&entry(&[], ItemKind::Dir, 0)).await?;
+        out.entry(&entry(&["x"], ItemKind::Dir, 0)).await?;
+        out.finish()
+    };
+    let recv = async {
+        let mut f = recv_files(&server).await?;
+        f.next_entry().await?.expect("root");
+        anyhow::Ok(f.next_entry().await.is_err())
+    };
+    let (_sent, refused) = timeout(T, async { tokio::join!(send, recv) })
+        .await
+        .unwrap();
+    assert!(refused.unwrap(), "more entries than the header announced");
+
+    // A folder that claims bytes.
+    let send = async {
+        let mut out = client.open_files(&header(ItemKind::Dir, 5, 1)).await?;
+        out.entry(&entry(&[], ItemKind::Dir, 5)).await?;
+        out.finish()
+    };
+    let recv = async {
+        let mut f = recv_files(&server).await?;
+        anyhow::Ok(f.next_entry().await.is_err())
+    };
+    let (_sent, refused) = timeout(T, async { tokio::join!(send, recv) })
+        .await
+        .unwrap();
+    assert!(refused.unwrap(), "a Dir entry with a size");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn files_stream_short_of_its_header_is_error() {
+    let (a, b) = (ident(), ident());
+    let (_l, server, client) = pair_up(&a, Trust::PairingMode, &b, Trust::PairingMode).await;
+
+    // Fewer entries than announced, then fewer bytes than announced.
+    for (h, last) in [
+        (header(ItemKind::Dir, 0, 2), entry(&[], ItemKind::Dir, 0)),
+        (header(ItemKind::File, 10, 1), entry(&[], ItemKind::File, 4)),
+    ] {
+        let send = async {
+            let mut out = client.open_files(&h).await?;
+            out.entry(&last).await?;
+            out.write(&vec![1; last.size as usize]).await?;
+            out.finish()
+        };
+        let recv = async {
+            let mut f = recv_files(&server).await?;
+            f.next_entry().await?.expect("the one entry sent");
+            assert_eq!(hash_entry(&mut f).await?.1, last.size);
+            anyhow::Ok(f.next_entry().await.is_err())
+        };
+        let (sent, short) = timeout(T, async { tokio::join!(send, recv) })
+            .await
+            .unwrap();
+        sent.unwrap();
+        assert!(short.unwrap(), "{h:?} ended early but looked complete");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn skipped_entry_bytes_are_an_error() {
+    let (a, b) = (ident(), ident());
+    let (_l, server, client) = pair_up(&a, Trust::PairingMode, &b, Trust::PairingMode).await;
+
+    let send = async {
+        let mut out = client.open_files(&header(ItemKind::Dir, 8, 3)).await?;
+        out.entry(&entry(&[], ItemKind::Dir, 0)).await?;
+        out.entry(&entry(&["a"], ItemKind::File, 4)).await?;
+        out.write(b"abcd").await?;
+        out.entry(&entry(&["b"], ItemKind::File, 4)).await?;
+        out.write(b"efgh").await?;
+        out.finish()
+    };
+    let recv = async {
+        let mut f = recv_files(&server).await?;
+        f.next_entry().await?.expect("root");
+        f.next_entry().await?.expect("a");
+        let mut two = [0u8; 2];
+        assert_eq!(f.read_chunk(&mut two).await?, 2);
+        // Half of "a" is still unread: moving on must fail, not read "cd" as
+        // the start of the next frame.
+        anyhow::Ok(f.next_entry().await.is_err())
+    };
+    let (sent, refused) = timeout(T, async { tokio::join!(send, recv) })
+        .await
+        .unwrap();
+    sent.unwrap();
+    assert!(refused.unwrap());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn files_out_keeps_entries_whole() {
+    let (a, b) = (ident(), ident());
+    let (_l, _server, client) = pair_up(&a, Trust::PairingMode, &b, Trust::PairingMode).await;
+
+    let mut out = client
+        .open_files(&header(ItemKind::Dir, 8, 3))
+        .await
+        .unwrap();
+    assert!(out.write(b"x").await.is_err(), "bytes before any entry");
+    out.entry(&entry(&[], ItemKind::Dir, 0)).await.unwrap();
+    assert!(out.write(b"x").await.is_err(), "bytes for a folder");
+    out.entry(&entry(&["a"], ItemKind::File, 4)).await.unwrap();
+    assert!(
+        out.write(b"abcde").await.is_err(),
+        "more than the entry's size"
+    );
+    out.write(b"ab").await.unwrap();
+    assert!(
+        out.entry(&entry(&["b"], ItemKind::File, 4)).await.is_err(),
+        "a new entry before the last one's bytes"
+    );
+    assert!(out.finish().is_err(), "finishing mid-entry");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_stream_tag_is_refused() {
+    let (a, b) = (ident(), ident());
+    let (_l, server, raw) = listener_with_raw_peer(&a, &b).await;
+
+    let mut bad = timeout(T, raw.conn.open_uni()).await.unwrap().unwrap();
+    bad.write_all(&[9, 1, 2, 3]).await.unwrap();
+    assert!(timeout(T, server.accept_stream()).await.unwrap().is_err());
+    assert_eq!(
+        timeout(T, bad.stopped()).await.unwrap().unwrap(),
+        Some(quinn::VarInt::from_u32(STOP_INVALID))
+    );
+
+    // The session survives: a well-formed clipboard stream still lands.
+    let small = ClipboardData {
+        text: Some("after".into()),
+        ..Default::default()
+    };
+    let mut good = timeout(T, raw.conn.open_uni()).await.unwrap().unwrap();
+    let mut wire = vec![0u8];
+    wire.extend(postcard::to_allocvec(&small).unwrap());
+    good.write_all(&wire).await.unwrap();
+    good.finish().unwrap();
+    let got = timeout(T, recv_clipboard(&server, MB as u64))
+        .await
+        .unwrap();
+    assert_eq!(got.unwrap(), small);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oversized_files_frames_are_refused() {
+    let (a, b) = (ident(), ident());
+    let (_l, server, raw) = listener_with_raw_peer(&a, &b).await;
+    let too_long = (MAX_FRAME as u32 + 1).to_le_bytes();
+
+    // An oversized header frame: refused from its length prefix alone.
+    let mut s = timeout(T, raw.conn.open_uni()).await.unwrap().unwrap();
+    s.write_all(&[1]).await.unwrap();
+    s.write_all(&too_long).await.unwrap();
+    assert!(timeout(T, server.accept_stream()).await.unwrap().is_err());
+    assert_eq!(
+        timeout(T, s.stopped()).await.unwrap().unwrap(),
+        Some(quinn::VarInt::from_u32(STOP_INVALID))
+    );
+
+    // A good header, then an oversized entry frame.
+    let body = postcard::to_allocvec(&header(ItemKind::Dir, 0, 1)).unwrap();
+    let mut s = timeout(T, raw.conn.open_uni()).await.unwrap().unwrap();
+    s.write_all(&[1]).await.unwrap();
+    s.write_all(&(body.len() as u32).to_le_bytes())
+        .await
+        .unwrap();
+    s.write_all(&body).await.unwrap();
+    s.write_all(&too_long).await.unwrap();
+    let mut f = recv_files(&server).await.unwrap();
+    assert!(timeout(T, f.next_entry()).await.unwrap().is_err());
+    assert_eq!(
+        timeout(T, s.stopped()).await.unwrap().unwrap(),
+        Some(quinn::VarInt::from_u32(STOP_INVALID))
+    );
 }

@@ -18,7 +18,7 @@ use tracing::{debug, info};
 
 use super::app::Ev;
 use super::control::{InjectMsg, Input};
-use crate::common::session_tasks::{ClipboardOut, NetEv, pong, spawn_clipboard_tasks};
+use crate::common::session_tasks::{ClipboardOut, NetEv, pong, spawn_stream_tasks};
 
 /// After declining a pairing, how long to wait for the PC to close the
 /// session (so the answer is delivered) before closing it ourselves.
@@ -183,10 +183,13 @@ impl Live {
         }));
 
         let tx = events.clone();
-        let (clip_out, clip_tasks) = spawn_clipboard_tasks(&session, clip_max, move |d| {
-            tx.send(net(NetEv::Clipboard(d))).is_ok()
-        });
-        tasks.extend(clip_tasks);
+        let (clip_out, stream_tasks) = spawn_stream_tasks(
+            &session,
+            clip_max,
+            move |d| tx.send(net(NetEv::Clipboard(d))).is_ok(),
+            |_| true,
+        );
+        tasks.extend(stream_tasks);
 
         Live {
             sid,

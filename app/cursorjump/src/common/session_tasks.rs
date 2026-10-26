@@ -1,13 +1,14 @@
-//! What every live session runs on either computer: the clipboard tasks
-//! (receiving items, and sending the latest local one) and round-trip
-//! measurement from pongs.
+//! What every live session runs on either computer: the stream tasks
+//! (accepting clipboard items and files streams, and sending the latest
+//! local clipboard item) and round-trip measurement from pongs.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cj_core::clipboard::ClipboardData;
 use cj_core::proto::Control;
-use cj_net::session::Session;
+use cj_net::files::FilesIn;
+use cj_net::session::{IncomingStream, Session};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
@@ -25,6 +26,8 @@ pub enum NetEv {
         at: Instant,
     },
     Clipboard(ClipboardData),
+    #[expect(dead_code, reason = "the apps take files streams in later tasks")]
+    Files(FilesIn),
     Closed(String),
 }
 
@@ -55,26 +58,31 @@ impl ClipboardOut {
     }
 }
 
-/// Starts the session's clipboard reader, which passes each item (of at
-/// most `clip_max` bytes) to `on_item` until that returns false, and its
-/// sender of the items queued on the returned `ClipboardOut`.
-pub fn spawn_clipboard_tasks(
+/// Starts the session's stream acceptor, which passes each clipboard item
+/// (of at most `clip_max` bytes) to `on_clip` and each files stream to
+/// `on_files` until either returns false, and its sender of the clipboard
+/// items queued on the returned `ClipboardOut`. The acceptor is the
+/// session's one caller of `accept_stream`.
+pub fn spawn_stream_tasks(
     session: &Session,
     clip_max: u64,
-    on_item: impl Fn(ClipboardData) -> bool + Send + 'static,
+    on_clip: impl Fn(ClipboardData) -> bool + Send + 'static,
+    on_files: impl Fn(FilesIn) -> bool + Send + 'static,
 ) -> (ClipboardOut, [JoinHandle<()>; 2]) {
     let s = session.clone();
-    let reader = tokio::spawn(async move {
+    let acceptor = tokio::spawn(async move {
         loop {
-            match s.recv_clipboard(clip_max).await {
-                Ok(d) => {
-                    if !on_item(d) {
-                        return;
-                    }
-                }
+            let delivered = match s.accept_stream().await {
+                Ok(IncomingStream::Clipboard(c)) => c.read(clip_max).await.map(&on_clip),
+                Ok(IncomingStream::Files(f)) => Ok(on_files(f)),
+                Err(e) => Err(e),
+            };
+            match delivered {
+                Ok(true) => {}
+                Ok(false) => return,
                 // A closed session is reported by the other readers.
                 Err(_) if is_closed(&s).await => return,
-                Err(e) => warn!("clipboard from the other computer not accepted: {e:#}"),
+                Err(e) => warn!("stream from the other computer not accepted: {e:#}"),
             }
         }
     });
@@ -91,7 +99,7 @@ pub fn spawn_clipboard_tasks(
             }
         }
     });
-    (ClipboardOut(out), [reader, sender])
+    (ClipboardOut(out), [acceptor, sender])
 }
 
 async fn is_closed(s: &Session) -> bool {
@@ -103,6 +111,7 @@ async fn is_closed(s: &Session) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cj_core::dnd::{FileEntry, FilesHeader, ItemKind};
     use cj_net::session::{Listener, connect};
     use cj_net::{Identity, Trust};
     use tokio::time::timeout;
@@ -129,11 +138,8 @@ mod tests {
         }
     }
 
-    /// Items cross the session, and an item replaced before it is sent is
-    /// never delivered. (Refusing oversized items is tested in cj-net's
-    /// loopback tests.)
-    #[tokio::test]
-    async fn clipboard_items_cross_and_the_latest_wins() {
+    /// Two live sessions over loopback, and the listener that keeps them up.
+    async fn session_pair() -> (Listener, Session, Session) {
         let ident = || {
             let dir = tempfile::tempdir().unwrap();
             Identity::load_or_create(dir.path()).unwrap()
@@ -151,11 +157,20 @@ mod tests {
         })
         .await
         .unwrap();
-        let (sa, sb) = (sa.unwrap(), sb.unwrap());
+        (listener, sa.unwrap(), sb.unwrap())
+    }
+
+    /// Items cross the session, and an item replaced before it is sent is
+    /// never delivered. (Refusing oversized items is tested in cj-net's
+    /// loopback tests.)
+    #[tokio::test]
+    async fn clipboard_items_cross_and_the_latest_wins() {
+        let (_l, sa, sb) = session_pair().await;
 
         let (got_tx, mut got_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (_a_out, _a_tasks) = spawn_clipboard_tasks(&sa, 10, move |d| got_tx.send(d).is_ok());
-        let (b_out, _b_tasks) = spawn_clipboard_tasks(&sb, 10, |_| true);
+        let (_a_out, _a_tasks) =
+            spawn_stream_tasks(&sa, 10, move |d| got_tx.send(d).is_ok(), |_| true);
+        let (b_out, _b_tasks) = spawn_stream_tasks(&sb, 10, |_| true, |_| true);
 
         b_out.send(text("this is far too long"));
         b_out.send(text("hello"));
@@ -164,5 +179,46 @@ mod tests {
         // item to arrive is "hello".
         let d = timeout(T, got_rx.recv()).await.unwrap().unwrap();
         assert_eq!(d, text("hello"));
+    }
+
+    /// Files streams go to `on_files`, clipboard items still to `on_clip`.
+    #[tokio::test]
+    async fn files_streams_reach_on_files() {
+        let (_l, sa, sb) = session_pair().await;
+
+        let (clip_tx, mut clip_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (files_tx, mut files_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_a_out, _a_tasks) = spawn_stream_tasks(
+            &sa,
+            100,
+            move |d| clip_tx.send(d).is_ok(),
+            move |f| files_tx.send(f).is_ok(),
+        );
+
+        let h = FilesHeader {
+            drag: 1,
+            item: 0,
+            name: "empty".into(),
+            kind: ItemKind::Dir,
+            total_bytes: 0,
+            entries: 1,
+        };
+        let mut out = sb.open_files(&h).await.unwrap();
+        out.entry(&FileEntry {
+            path: vec![],
+            kind: ItemKind::Dir,
+            size: 0,
+        })
+        .await
+        .unwrap();
+        out.finish().unwrap();
+        sb.send_clipboard(&text("after")).await.unwrap();
+
+        let mut f = timeout(T, files_rx.recv()).await.unwrap().unwrap();
+        assert_eq!(f.header(), &h);
+        assert!(f.next_entry().await.unwrap().is_some());
+        assert!(f.next_entry().await.unwrap().is_none());
+        let d = timeout(T, clip_rx.recv()).await.unwrap().unwrap();
+        assert_eq!(d, text("after"));
     }
 }
