@@ -48,8 +48,9 @@ use objc2::runtime::AnyObject;
 use objc2_app_kit::NSRunningApplication;
 use objc2_core_foundation::{CFRetained, CFString};
 use objc2_core_graphics::{
-    CGWindowLevelForKey, CGWindowLevelKey, CGWindowListCopyWindowInfo, CGWindowListOption,
-    kCGNullWindowID, kCGWindowBounds, kCGWindowLayer, kCGWindowNumber, kCGWindowOwnerPID,
+    CGDisplayBounds, CGError, CGGetActiveDisplayList, CGWindowLevelForKey, CGWindowLevelKey,
+    CGWindowListCopyWindowInfo, CGWindowListOption, kCGNullWindowID, kCGWindowBounds,
+    kCGWindowLayer, kCGWindowNumber, kCGWindowOwnerPID,
 };
 use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSString, ns_string};
 use objc2_uniform_type_identifiers::UTType;
@@ -497,9 +498,45 @@ impl SystemTargets {
                 })
             })
             .filter(|w| !floating.contains(&w.layer))
-            .collect();
-        Some(windows)
+            .collect::<Vec<_>>();
+        Some(drop_screen_overlays(windows, &display_bounds()))
     }
+}
+
+/// Every active display's bounds (x, y, width, height), global points.
+fn display_bounds() -> Vec<(f64, f64, f64, f64)> {
+    let mut ids = [0u32; 16];
+    let mut count = 0u32;
+    // SAFETY: `ids` has room for the 16 displays asked for; `count` is
+    // written with how many were filled in.
+    let err = unsafe { CGGetActiveDisplayList(16, ids.as_mut_ptr(), &mut count) };
+    if err != CGError::Success {
+        return Vec::new();
+    }
+    ids[..count.min(16) as usize]
+        .iter()
+        .map(|&id| {
+            let r = CGDisplayBounds(id);
+            (r.origin.x, r.origin.y, r.size.width, r.size.height)
+        })
+        .collect()
+}
+
+/// Leaves out windows above the normal layer that cover a whole display:
+/// invisible system overlays, such as the Dock's full-screen Mission
+/// Control window (layer 20) or a screen-tint app's, which sit over every
+/// point and take no drop. A full-screen app's window is layer 0 and stays.
+fn drop_screen_overlays(windows: Vec<WinInfo>, displays: &[(f64, f64, f64, f64)]) -> Vec<WinInfo> {
+    let same = |a: (f64, f64, f64, f64), b: (f64, f64, f64, f64)| {
+        (a.0 - b.0).abs() < 1.0
+            && (a.1 - b.1).abs() < 1.0
+            && (a.2 - b.2).abs() < 1.0
+            && (a.3 - b.3).abs() < 1.0
+    };
+    windows
+        .into_iter()
+        .filter(|w| w.layer == 0 || !displays.iter().any(|&d| same(w.bounds, d)))
+        .collect()
 }
 
 // ------------------------------------------------------------ one drag
@@ -1463,6 +1500,25 @@ mod tests {
         let under = |x, y| window_at(&overlaid, (x, y), OURS).map(|w| w.pid);
         assert_eq!(under(120.0, 120.0), Some(20), "overlays are passed over");
         assert_eq!(under(1500.0, 10.0), None, "the desktop under an overlay");
+    }
+
+    #[test]
+    fn whole_screen_overlays_above_the_normal_layer_are_left_out() {
+        let screen = (0.0, 0.0, 1800.0, 1169.0);
+        let windows = vec![
+            win(20, 1681, screen), // the Dock's Mission Control window
+            win(20, 1681, (500.0, 1100.0, 800.0, 69.0)), // the Dock bar
+            win(0, 77, screen),    // a full-screen app
+        ];
+        let kept: Vec<i32> = drop_screen_overlays(windows, &[screen])
+            .iter()
+            .map(|w| w.layer as i32 * 10_000 + w.pid)
+            .collect();
+        assert_eq!(
+            kept,
+            vec![20 * 10_000 + 1681, 77],
+            "the bar and the app stay"
+        );
     }
 
     #[test]
