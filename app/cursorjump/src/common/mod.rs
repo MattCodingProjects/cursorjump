@@ -2,6 +2,11 @@
 
 pub mod clipboard_bridge;
 pub mod config_file;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the apps drive drags through it in later tasks")
+)]
+pub mod dnd_link;
 pub mod session_tasks;
 pub mod settings_window;
 #[cfg_attr(

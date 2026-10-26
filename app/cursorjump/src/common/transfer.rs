@@ -776,7 +776,7 @@ fn c_path(p: &Path) -> io::Result<std::ffi::CString> {
 /// Test seam: something to do to a file each time the sender has read from
 /// it, to change it mid-send.
 #[cfg(test)]
-mod hooks {
+pub(super) mod hooks {
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
