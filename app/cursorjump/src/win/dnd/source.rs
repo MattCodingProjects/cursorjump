@@ -25,6 +25,10 @@
 //!   holds it, and a target that asks only after `DoDragDrop` returned
 //!   still gets its fetch. A drag that ends without a drop takes its
 //!   placeholders with it, and later asks fail.
+//! - The wait can be escaped from this side: `CancelIncoming` and cj-dnd
+//!   stopping fail it (`E_FAIL`) within [`REPLY_POLL`]. Both are handled by
+//!   the command relay through [`Live`], not on cj-dnd, whose message loop
+//!   may be held in a target's synchronous `Drop` (Explorer's) all along.
 //! - Whatever is set on the data object (`IDragSourceHelper`'s image, a
 //!   target helper's flags) is kept and served back.
 //!
@@ -37,12 +41,12 @@ use std::mem::ManuallyDrop;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use cj_core::dnd::{DragId, DragItem, ItemKind, sanitize_component};
-use tokio::sync::oneshot;
+use tokio::sync::oneshot::{self, error::TryRecvError};
 use tracing::{debug, info, warn};
 use windows::Win32::Foundation::{
     COLORREF, DATA_S_SAMEFORMATETC, DRAGDROP_S_CANCEL, DRAGDROP_S_DROP,
@@ -57,9 +61,9 @@ use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBU
 use windows::Win32::System::Com::StructuredStorage::CreateStreamOnHGlobal;
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemAlloc, DATADIR_GET, FORMATETC, IAdviseSink,
-    IDataObject, IDataObject_Impl, IEnumFORMATETC, IEnumSTATDATA, STGMEDIUM, STGMEDIUM_0, TYMED,
-    TYMED_ENHMF, TYMED_FILE, TYMED_GDI, TYMED_HGLOBAL, TYMED_ISTORAGE, TYMED_ISTREAM, TYMED_MFPICT,
-    TYMED_NULL,
+    IDataObject, IDataObject_Impl, IEnumFORMATETC, IEnumSTATDATA, STGMEDIUM, STGMEDIUM_0,
+    STREAM_SEEK_SET, TYMED, TYMED_ENHMF, TYMED_FILE, TYMED_GDI, TYMED_HGLOBAL, TYMED_ISTORAGE,
+    TYMED_ISTREAM, TYMED_MFPICT, TYMED_NULL,
 };
 use windows::Win32::System::Memory::{
     GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
@@ -80,11 +84,14 @@ use windows::core::{BOOL, HRESULT, HSTRING, IUnknown, Interface, PWSTR, Ref, imp
 
 use super::catcher::{Medium, formatetc, self_format};
 use super::{DndShared, Emit, WinDndEv, incoming_let_go, left_button_down};
+use cj_core::dnd::FailReason;
 
 /// A placeholder that won't go (a scanner holding it open) is retried this
 /// often, this many times, before its fetch goes ahead regardless.
 const REMOVE_STEP: Duration = Duration::from_millis(20);
 const REMOVE_TRIES: u32 = 10;
+/// Most an after-drop wait takes to see it was cancelled.
+pub(super) const REPLY_POLL: Duration = Duration::from_millis(50);
 
 thread_local! {
     static DND_THREAD: Cell<bool> = const { Cell::new(false) };
@@ -139,6 +146,16 @@ pub(super) fn hdrop_bytes(paths: &[PathBuf]) -> Vec<u8> {
     units.push(0);
     bytes.extend(units.iter().flat_map(|u| u.to_le_bytes()));
     bytes
+}
+
+/// Whether the drag still holds the button: only while Raw Input
+/// (`DndShared::left_down`) and OLE's key state (`MK_LBUTTON`) both say so.
+/// Either one seeing the release drops, so neither a Raw Input up that went
+/// missing nor a stale key state can strand the drag under the cursor. The
+/// key state is the real button's: Windows saw our press (R29), and in the
+/// spike the two flipped within 1 ms of each other.
+pub(super) fn button_held(raw_down: bool, keystate_down: bool) -> bool {
+    raw_down && keystate_down
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -235,21 +252,69 @@ pub(super) struct Incoming {
     events: Emit,
     phase: Mutex<Phase>,
     turned: Condvar,
+    /// `CancelIncoming`, or cj-dnd stopping: the drag ends, a running wait
+    /// fails, and later asks fail.
+    cancelled: Mutex<bool>,
+    stop: Condvar,
+}
+
+/// The drags from the Mac whose data objects may still be served (a
+/// target can hold one long after `DoDragDrop` returned).
+pub(super) type Live = Arc<Mutex<Vec<Weak<Incoming>>>>;
+
+fn live_list(live: &Live) -> MutexGuard<'_, Vec<Weak<Incoming>>> {
+    live.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn register(live: &Live, incoming: &Arc<Incoming>) {
+    let mut list = live_list(live);
+    list.retain(|w| w.strong_count() > 0);
+    list.push(Arc::downgrade(incoming));
+}
+
+/// Cancels the live drag `drag` (every one for `None`); how many it reached.
+pub(super) fn cancel_live(live: &Live, drag: Option<DragId>) -> usize {
+    let found: Vec<Arc<Incoming>> = {
+        let mut list = live_list(live);
+        list.retain(|w| w.strong_count() > 0);
+        list.iter()
+            .filter_map(Weak::upgrade)
+            .filter(|i| drag.is_none_or(|d| i.drag == d))
+            .collect()
+    };
+    found.iter().for_each(|i| i.cancel());
+    found.len()
+}
+
+/// How the wait for one reply ended.
+#[derive(Debug, PartialEq)]
+enum Reply {
+    Got(Result<PathBuf, FailReason>),
+    /// The app dropped it unanswered.
+    Dropped,
+    Cancelled,
 }
 
 impl Incoming {
     /// The drag's folder `base`, with a placeholder for each item.
     fn create(drag: DragId, base: PathBuf, items: &[DragItem], events: Emit) -> Result<Arc<Self>> {
         let slots = slots(&base, items);
-        for s in &slots {
-            std::fs::create_dir_all(&s.dir)
-                .with_context(|| format!("creating {}", s.dir.display()))?;
-            let made = if s.is_dir {
-                std::fs::create_dir_all(&s.path)
-            } else {
-                File::create(&s.path).map(drop)
-            };
-            made.with_context(|| format!("placeholder {}", s.path.display()))?;
+        for (i, s) in slots.iter().enumerate() {
+            let made = std::fs::create_dir_all(&s.dir)
+                .with_context(|| format!("creating {}", s.dir.display()))
+                .and_then(|()| {
+                    if s.is_dir {
+                        std::fs::create_dir_all(&s.path)
+                    } else {
+                        File::create(&s.path).map(drop)
+                    }
+                    .with_context(|| format!("placeholder {}", s.path.display()))
+                });
+            if made.is_err() {
+                // Only what was made here goes.
+                remove_all(&base, &slots[..i]);
+            }
+            made?;
         }
         Ok(Arc::new(Incoming {
             drag,
@@ -258,7 +323,48 @@ impl Incoming {
             events,
             phase: Mutex::new(Phase::Hover),
             turned: Condvar::new(),
+            cancelled: Mutex::new(false),
+            stop: Condvar::new(),
         }))
+    }
+
+    fn cancel(&self) {
+        let mut cancelled = self
+            .cancelled
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !*cancelled {
+            info!(drag = self.drag, "incoming: cancelled");
+        }
+        *cancelled = true;
+        self.stop.notify_all();
+    }
+
+    fn is_cancelled(&self) -> bool {
+        *self
+            .cancelled
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// One reply, or the cancel, whichever comes first (the cancel within
+    /// `REPLY_POLL`).
+    fn await_reply(&self, mut rx: oneshot::Receiver<Result<PathBuf, FailReason>>) -> Reply {
+        loop {
+            match rx.try_recv() {
+                Ok(got) => return Reply::Got(got),
+                Err(TryRecvError::Closed) => return Reply::Dropped,
+                Err(TryRecvError::Empty) => {}
+            }
+            let cancelled = self
+                .cancelled
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if *cancelled {
+                return Reply::Cancelled;
+            }
+            let _ = self.stop.wait_timeout(cancelled, REPLY_POLL);
+        }
     }
 
     fn phase(&self) -> MutexGuard<'_, Phase> {
@@ -286,16 +392,7 @@ impl Incoming {
         }
         *phase = Phase::Abandoned;
         drop(phase);
-        // On cj-dnd: one try each, no waiting.
-        for s in &self.slots {
-            remove_placeholder(s, 1);
-        }
-        for s in &self.slots {
-            if s.dir != self.base {
-                let _ = std::fs::remove_dir(&s.dir);
-            }
-        }
-        let _ = std::fs::remove_dir(&self.base);
+        remove_all(&self.base, &self.slots);
         debug!(drag = self.drag, "incoming: placeholders removed");
     }
 
@@ -315,6 +412,10 @@ impl Incoming {
                         drag = self.drag,
                         "incoming: the bytes asked for on cj-dnd, which must not wait; refused"
                     );
+                    return Err(E_FAIL);
+                }
+                Phase::Dropped if self.is_cancelled() => {
+                    *phase = Phase::Fetched(None);
                     return Err(E_FAIL);
                 }
                 Phase::Dropped => true,
@@ -365,16 +466,22 @@ impl Incoming {
         let mut paths = Vec::with_capacity(replies.len());
         let mut ok = true;
         for (item, rx) in replies.into_iter().enumerate() {
-            // A COM thread, never a tokio one: blocking here is fine.
-            match rx.blocking_recv() {
-                Ok(Ok(path)) => paths.push(path),
-                Ok(Err(why)) => {
+            // A COM thread, never cj-dnd: waiting here is fine.
+            match self.await_reply(rx) {
+                Reply::Got(Ok(path)) => paths.push(path),
+                Reply::Got(Err(why)) => {
                     warn!(drag, item, ?why, "incoming: fetch failed");
                     ok = false;
                 }
-                Err(_) => {
+                Reply::Dropped => {
                     warn!(drag, item, "incoming: fetch dropped unanswered");
                     ok = false;
+                }
+                Reply::Cancelled => {
+                    // The rest are dropped with the receivers.
+                    warn!(drag, item, "incoming: the wait for the bytes was cancelled");
+                    ok = false;
+                    break;
                 }
             }
         }
@@ -401,6 +508,20 @@ fn remove_placeholder(slot: &Slot, tries: u32) {
             ),
         }
     }
+}
+
+/// The placeholders of `slots` and the folders made for them. On cj-dnd
+/// (or with a create failing): one try each, no waiting.
+fn remove_all(base: &Path, slots: &[Slot]) {
+    for s in slots {
+        remove_placeholder(s, 1);
+    }
+    for s in slots {
+        if s.dir != base {
+            let _ = std::fs::remove_dir(&s.dir);
+        }
+    }
+    let _ = std::fs::remove_dir(base);
 }
 
 // ---------------------------------------------------------------- media
@@ -523,6 +644,30 @@ fn duplicate(m: &STGMEDIUM, cf: u16) -> windows::core::Result<STGMEDIUM> {
     })
 }
 
+/// A stream handed out from what was set: a clone with a seek pointer of
+/// its own, at the start, so readers don't move each other's. A stream
+/// that can't clone is shared, rewound.
+///
+/// # Safety
+/// `m` holds a stream (`TYMED_ISTREAM`).
+unsafe fn own_seek(m: &mut STGMEDIUM) {
+    // SAFETY: per the contract; `pstm` is replaced by our own reference.
+    unsafe {
+        let Some(shared) = (*m.u.pstm).clone() else {
+            return;
+        };
+        let stream = match shared.Clone() {
+            Ok(own) => {
+                ManuallyDrop::drop(&mut m.u.pstm);
+                m.u.pstm = ManuallyDrop::new(Some(own.clone()));
+                own
+            }
+            Err(_) => shared,
+        };
+        let _ = stream.Seek(0, STREAM_SEEK_SET, None);
+    }
+}
+
 // ---------------------------------------------------------------- IDataObject
 
 /// A format set on the data object, and its medium.
@@ -607,7 +752,12 @@ impl IDataObject_Impl for DataObject_Impl {
             .iter()
             .find(|s| s.format.cfFormat == f.cfFormat && s.format.tymed & f.tymed != 0)
             .ok_or(DV_E_FORMATETC)?;
-        duplicate(&s.medium.0, f.cfFormat)
+        let mut copy = duplicate(&s.medium.0, f.cfFormat)?;
+        if copy.tymed == TYMED_ISTREAM.0 as u32 {
+            // SAFETY: tymed says the union holds a stream; the copy is ours.
+            unsafe { own_seek(&mut copy) };
+        }
+        Ok(copy)
     }
 
     fn GetDataHere(
@@ -730,30 +880,31 @@ impl IDataObject_Impl for DataObject_Impl {
 #[implement(IDropSource)]
 struct DropSource {
     shared: Arc<DndShared>,
-    cancel: Arc<AtomicBool>,
     incoming: Arc<Incoming>,
+    /// `QueryContinueDrag` was called: `DoDragDrop` has the mouse.
+    started: AtomicBool,
 }
 
 impl IDropSource_Impl for DropSource_Impl {
     fn QueryContinueDrag(&self, fescapepressed: BOOL, grfkeystate: MODIFIERKEYS_FLAGS) -> HRESULT {
-        // Held only while both Raw Input and OLE's key state say so, so
-        // either seeing the release drops: a Raw Input up that went
-        // missing can't strand the drag, and the key state is the real
-        // button's, since Windows saw our press.
+        let drag = self.incoming.drag;
+        // The first call: OLE holds its own capture now, so the shield
+        // (whose press started it) can go. Fallback, should the hands-on
+        // smoke show the drag stop following once the shield vanishes: let
+        // go at DROP/CANCEL instead (`hr != S_OK` below).
+        if !self.started.swap(true, Ordering::Relaxed) {
+            incoming_let_go(drag);
+        }
         let raw = self.shared.left_down.load(Ordering::Acquire);
         let keys = grfkeystate.0 & MK_LBUTTON.0 != 0;
         let escape = fescapepressed.as_bool();
-        let cancelled = self.cancel.load(Ordering::Acquire);
-        let hr = continue_decision(escape, raw && keys, cancelled);
-        let drag = self.incoming.drag;
+        let cancelled = self.incoming.is_cancelled();
+        let hr = continue_decision(escape, button_held(raw, keys), cancelled);
         if hr == DRAGDROP_S_DROP {
             info!(drag, raw, keys, "incoming: released; drop");
             self.incoming.dropped();
         } else if hr == DRAGDROP_S_CANCEL {
             info!(drag, escape, cancelled, "incoming: drag cancelled");
-        }
-        if hr != S_OK {
-            incoming_let_go(drag);
         }
         hr
     }
@@ -769,7 +920,7 @@ impl IDropSource_Impl for DropSource_Impl {
 pub(super) struct Run {
     pub(super) drag: DragId,
     pub(super) items: Vec<DragItem>,
-    pub(super) cancel: Arc<AtomicBool>,
+    pub(super) live: Live,
     pub(super) shared: Arc<DndShared>,
     pub(super) events: Emit,
 }
@@ -781,7 +932,7 @@ pub(super) fn run_incoming(run: Run) {
     let Run {
         drag,
         items,
-        cancel,
+        live,
         shared,
         events,
     } = run;
@@ -800,11 +951,13 @@ pub(super) fn run_incoming(run: Run) {
             return ended(false);
         }
     };
+    // Before DoDragDrop: a CancelIncoming reaches it from here on.
+    register(&live, &incoming);
     let data: IDataObject = DataObject::new(incoming.clone()).into();
     let source: IDropSource = DropSource {
         shared,
-        cancel,
         incoming: incoming.clone(),
+        started: AtomicBool::new(false),
     }
     .into();
     set_drag_image(&data, &items[0]);
@@ -931,10 +1084,8 @@ fn draw_icon(icon: HICON) -> Option<(HBITMAP, i32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cj_core::dnd::FailReason;
     use std::sync::mpsc;
     use windows::Win32::System::Com::IAgileObject;
-    use windows::Win32::System::Com::STREAM_SEEK_SET;
     use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
 
     #[test]
@@ -1266,7 +1417,7 @@ mod tests {
         );
     }
 
-    fn register(name: &str) -> u16 {
+    fn register_format(name: &str) -> u16 {
         // SAFETY: registering a format name has no preconditions.
         unsafe { RegisterClipboardFormatW(&HSTRING::from(name)) as u16 }
     }
@@ -1291,7 +1442,7 @@ mod tests {
         let items = [item("a.txt", ItemKind::File)];
         let incoming = Incoming::create(13, tmp.path().join("13"), &items, emitter().0).unwrap();
         let data: IDataObject = DataObject::new(incoming).into();
-        let blob = register("CursorJump.Test.Blob");
+        let blob = register_format("CursorJump.Test.Blob");
         let fmt = formatetc(blob, TYMED_HGLOBAL, -1);
         // fRelease: the data object owns the medium from here on.
         let m = hglobal_medium(hglobal_from(b"first").unwrap());
@@ -1310,7 +1461,7 @@ mod tests {
             b"second"
         );
         // An IStream, as IDragSourceHelper sets its DragContext.
-        let ctx = register("CursorJump.Test.Stream");
+        let ctx = register_format("CursorJump.Test.Stream");
         let stream = unsafe { CreateStreamOnHGlobal(HGLOBAL::default(), true) }.unwrap();
         unsafe { stream.Write(b"ctx".as_ptr().cast(), 3, None) }
             .ok()
@@ -1326,28 +1477,375 @@ mod tests {
         drop(m);
         assert_eq!(query(&data, ctx, TYMED_ISTREAM), S_OK);
         assert_eq!(query(&data, ctx, TYMED_HGLOBAL), DV_E_TYMED);
-        let got = get(&data, ctx, TYMED_ISTREAM).unwrap();
-        assert_eq!(got.0.tymed, TYMED_ISTREAM.0 as u32);
-        let s = unsafe { (*got.0.u.pstm).clone() }.unwrap();
-        let mut buf = [0u8; 8];
-        let mut n = 0;
-        unsafe {
-            s.Seek(0, STREAM_SEEK_SET, None).unwrap();
-            s.Read(buf.as_mut_ptr().cast(), 8, Some(&mut n))
+        // Each reader gets the stream from its start, with a seek pointer
+        // of its own (the setter left it at the end, after writing).
+        let read_all = |m: &Medium| {
+            assert_eq!(m.0.tymed, TYMED_ISTREAM.0 as u32);
+            let s = unsafe { (*m.0.u.pstm).clone() }.unwrap();
+            let mut buf = [0u8; 8];
+            let mut n = 0;
+            unsafe { s.Read(buf.as_mut_ptr().cast(), 8, Some(&mut n)) }
                 .ok()
                 .unwrap();
-        }
-        assert_eq!(&buf[..n as usize], b"ctx");
+            buf[..n as usize].to_vec()
+        };
+        let first = get(&data, ctx, TYMED_ISTREAM).unwrap();
+        let second = get(&data, ctx, TYMED_ISTREAM).unwrap();
+        assert_eq!(read_all(&first), b"ctx");
+        assert_eq!(read_all(&second), b"ctx", "not moved by the first reader");
+        assert_eq!(read_all(&first), b"");
         // Listed after what is offered, each format once.
         assert_eq!(enum_formats(&data), [CF_HDROP.0, self_format(), blob, ctx]);
         assert_eq!(
-            query(&data, register("CursorJump.Test.Never"), TYMED_HGLOBAL),
+            query(
+                &data,
+                register_format("CursorJump.Test.Never"),
+                TYMED_HGLOBAL
+            ),
             DV_E_FORMATETC
         );
         assert_eq!(query(&data, self_format(), TYMED_HGLOBAL), S_OK);
         assert_eq!(
             bytes_of(&get(&data, self_format(), TYMED_HGLOBAL).unwrap()),
             std::process::id().to_le_bytes()
+        );
+    }
+
+    #[test]
+    fn both_sources_must_hold_the_button() {
+        // (Raw Input down, OLE key state down) -> held
+        assert!(button_held(true, true));
+        // A Raw Input up that went missing: the key state still drops.
+        assert!(!button_held(true, false));
+        // A stale key state: Raw Input's up still drops.
+        assert!(!button_held(false, true));
+        assert!(!button_held(false, false));
+    }
+
+    #[test]
+    fn the_drop_source_reads_both_buttons_and_the_cancel() {
+        let tmp = tempfile::tempdir().unwrap();
+        let items = [item("a.txt", ItemKind::File)];
+        let incoming = Incoming::create(15, tmp.path().join("15"), &items, emitter().0).unwrap();
+        let shared = Arc::new(DndShared::default());
+        let source: IDropSource = DropSource {
+            shared: shared.clone(),
+            incoming: incoming.clone(),
+            started: AtomicBool::new(false),
+        }
+        .into();
+        let ask = |keys| unsafe { source.QueryContinueDrag(false, keys) };
+        shared.left_down.store(true, Ordering::Release);
+        assert_eq!(ask(MK_LBUTTON), S_OK);
+        assert_eq!(ask(MODIFIERKEYS_FLAGS(0)), DRAGDROP_S_DROP);
+        assert_eq!(*incoming.phase(), Phase::Dropped);
+        incoming.cancel();
+        assert_eq!(ask(MK_LBUTTON), DRAGDROP_S_CANCEL);
+    }
+
+    type Ask = std::thread::JoinHandle<Result<Vec<PathBuf>, HRESULT>>;
+
+    /// An after-drop ask, waiting on `item 0`'s reply on its own thread.
+    fn ask_after_drop(drag: DragId, tmp: &Path) -> (Arc<Incoming>, mpsc::Receiver<WinDndEv>, Ask) {
+        let (emit, events) = emitter();
+        let items = [item("a.bin", ItemKind::File)];
+        let incoming = Incoming::create(drag, tmp.join(drag.to_string()), &items, emit).unwrap();
+        incoming.dropped();
+        let asking = incoming.clone();
+        let ask = std::thread::spawn(move || asking.hdrop_paths());
+        (incoming, events, ask)
+    }
+
+    #[test]
+    fn a_cancel_ends_the_wait_for_an_unanswered_reply() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (incoming, events, ask) = ask_after_drop(16, tmp.path());
+        // Held, never sent.
+        let (_, _, _, _reply) = fetch_of(events.recv_timeout(WAIT).unwrap());
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!ask.is_finished(), "still waiting for the reply");
+        let cancelled = Instant::now();
+        incoming.cancel();
+        assert_eq!(ask.join().unwrap(), Err(E_FAIL));
+        assert!(
+            cancelled.elapsed() < REPLY_POLL * 4,
+            "{:?}",
+            cancelled.elapsed()
+        );
+        // Kept: later asks fail at once, fetching nothing.
+        assert_eq!(incoming.hdrop_paths(), Err(E_FAIL));
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_drag_cancelled_before_the_ask_fetches_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (emit, events) = emitter();
+        let items = [item("a.bin", ItemKind::File)];
+        let incoming = Incoming::create(17, tmp.path().join("17"), &items, emit).unwrap();
+        incoming.dropped();
+        incoming.cancel();
+        assert_eq!(incoming.hdrop_paths(), Err(E_FAIL));
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn the_relay_cancels_live_drags_and_all_at_its_end() {
+        let tmp = tempfile::tempdir().unwrap();
+        let items = [item("a.bin", ItemKind::File)];
+        let make = |drag: DragId| {
+            Incoming::create(drag, tmp.path().join(drag.to_string()), &items, emitter().0).unwrap()
+        };
+        let (a, b) = (make(18), make(19));
+        let live = Live::default();
+        register(&live, &a);
+        register(&live, &b);
+        // A drag no target holds any more is dropped from the list.
+        register(&live, &make(20));
+        assert_eq!(cancel_live(&live, Some(20)), 0);
+        assert_eq!(live_list(&live).len(), 2);
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (relay_tx, relay_rx) = mpsc::channel();
+        let relay = {
+            let live = live.clone();
+            // No window: its wakes just fail.
+            std::thread::spawn(move || super::super::relay(cmd_rx, relay_tx, 0, live))
+        };
+        cmd_tx
+            .send(super::super::DndCmd::CancelIncoming { drag: 18 })
+            .unwrap();
+        // Forwarded too, for cj-dnd to note.
+        assert!(matches!(
+            relay_rx.recv_timeout(WAIT),
+            Ok(super::super::DndCmd::CancelIncoming { drag: 18 })
+        ));
+        assert!(a.is_cancelled() && !b.is_cancelled());
+        // Every sender gone: cj-dnd stops, and every live drag is cancelled.
+        drop(cmd_tx);
+        relay.join().unwrap();
+        assert!(b.is_cancelled());
+    }
+
+    #[test]
+    fn a_fetch_running_at_the_end_still_lands() {
+        // R37: DROP, then the target's ask, then DoDragDrop says NONE (or
+        // returns) while the reply is pending: the received file stays.
+        let tmp = tempfile::tempdir().unwrap();
+        let (incoming, events, ask) = ask_after_drop(21, tmp.path());
+        let (_, _, dir, reply) = fetch_of(events.recv_timeout(WAIT).unwrap());
+        incoming.ended(false);
+        let to = dir.join("a.bin");
+        std::fs::write(&to, b"bytes").unwrap();
+        reply.send(Ok(to.clone())).unwrap();
+        assert_eq!(ask.join().unwrap(), Ok(vec![to.clone()]));
+        assert_eq!(std::fs::read(&to).unwrap(), b"bytes");
+        assert_eq!(incoming.hdrop_paths(), Ok(vec![to]));
+    }
+
+    #[test]
+    fn a_failed_create_leaves_nothing_of_its_own() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("22");
+        // In the way of the second placeholder (a file can't take it).
+        std::fs::create_dir_all(base.join("b.txt").join("keep")).unwrap();
+        let items = [
+            item("a.txt", ItemKind::File),
+            item("A.txt", ItemKind::File),
+            item("b.txt", ItemKind::File),
+        ];
+        assert!(Incoming::create(22, base.clone(), &items, emitter().0).is_err());
+        assert!(!base.join("a.txt").exists());
+        assert!(!base.join("1").exists(), "its collision folder too");
+        assert!(
+            base.join("b.txt").join("keep").is_dir(),
+            "what was there stays"
+        );
+    }
+
+    /// A drop target in another STA whose `DragLeave` takes a while: a call
+    /// to it waits in COM's modal loop, as cj-dnd waits in Explorer's `Drop`.
+    #[implement(windows::Win32::System::Ole::IDropTarget, Agile = false)]
+    struct SlowTarget;
+
+    impl windows::Win32::System::Ole::IDropTarget_Impl for SlowTarget_Impl {
+        fn DragEnter(
+            &self,
+            _: Ref<IDataObject>,
+            _: MODIFIERKEYS_FLAGS,
+            _: &windows::Win32::Foundation::POINTL,
+            _: *mut DROPEFFECT,
+        ) -> windows::core::Result<()> {
+            Ok(())
+        }
+        fn DragOver(
+            &self,
+            _: MODIFIERKEYS_FLAGS,
+            _: &windows::Win32::Foundation::POINTL,
+            _: *mut DROPEFFECT,
+        ) -> windows::core::Result<()> {
+            Ok(())
+        }
+        fn DragLeave(&self) -> windows::core::Result<()> {
+            // SAFETY: plain FFI call.
+            let tid = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
+            PROBE_CALLEE_TID.store(tid, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(800));
+            Ok(())
+        }
+        fn Drop(
+            &self,
+            _: Ref<IDataObject>,
+            _: MODIFIERKEYS_FLAGS,
+            _: &windows::Win32::Foundation::POINTL,
+            _: *mut DROPEFFECT,
+        ) -> windows::core::Result<()> {
+            Ok(())
+        }
+    }
+
+    static PROBE_START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    static PROBE_APP_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static PROBE_TICKS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    static PROBE_CALLEE_TID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+    fn probe_ms() -> u64 {
+        PROBE_START.get_or_init(Instant::now).elapsed().as_millis() as u64 + 1
+    }
+
+    unsafe extern "system" fn probe_proc(
+        hwnd: windows::Win32::Foundation::HWND,
+        msg: u32,
+        wparam: windows::Win32::Foundation::WPARAM,
+        lparam: windows::Win32::Foundation::LPARAM,
+    ) -> windows::Win32::Foundation::LRESULT {
+        use windows::Win32::UI::WindowsAndMessaging::{DefWindowProcW, WM_APP, WM_TIMER};
+        match msg {
+            WM_APP => PROBE_APP_MS.store(probe_ms(), Ordering::SeqCst),
+            WM_TIMER => {
+                PROBE_TICKS.fetch_add(1, Ordering::SeqCst);
+            }
+            _ => {}
+        }
+        // SAFETY: default handling for our own window.
+        unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+    }
+
+    /// Settles, without a person, what the hands-on smoke's PROBE checks for
+    /// real: while an STA thread (cj-dnd) waits in an outgoing COM call (a
+    /// target's synchronous `Drop`), does COM's modal loop dispatch a
+    /// `WM_APP` posted to one of its windows (our commands), or `WM_TIMER`
+    /// (our stuck and keep checks)? The call here is cross-apartment in one
+    /// process, through the same channel and modal loop as cross-process.
+    #[test]
+    #[ignore = "probes COM's modal loop; run with --nocapture to read the answer"]
+    fn probe_posted_messages_during_an_outgoing_com_call() {
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
+        use windows::Win32::System::Com::{
+            COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize, IGlobalInterfaceTable,
+        };
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::System::Ole::IDropTarget;
+        use windows::Win32::System::Threading::GetCurrentThreadId;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, DispatchMessageW, GetMessageW, KillTimer, MSG,
+            PM_REMOVE, PeekMessageW, PostMessageW, PostThreadMessageW, RegisterClassExW, SetTimer,
+            WINDOW_EX_STYLE, WM_APP, WM_QUIT, WNDCLASSEXW, WS_POPUP,
+        };
+        use windows::core::w;
+
+        // CLSID_StdGlobalInterfaceTable: hands an interface to another
+        // apartment as a proxy.
+        const GIT: windows::core::GUID =
+            windows::core::GUID::from_u128(0x00000323_0000_0000_c000_000000000046);
+        let git = || unsafe {
+            CoCreateInstance::<_, IGlobalInterfaceTable>(&GIT, None, CLSCTX_INPROC_SERVER).unwrap()
+        };
+        probe_ms();
+        // The callee's STA: the object lives there and its loop serves calls.
+        let (tx, rx) = mpsc::channel::<(usize, u32)>();
+        let callee = std::thread::spawn(move || unsafe {
+            CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok().unwrap();
+            let target: IDropTarget = SlowTarget.into();
+            let cookie = git()
+                .RegisterInterfaceInGlobal(&target, &IDropTarget::IID)
+                .unwrap();
+            tx.send((cookie as usize, GetCurrentThreadId())).unwrap();
+            let mut msg = MSG::default();
+            while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
+                DispatchMessageW(&msg);
+            }
+            drop(target);
+            CoUninitialize();
+        });
+        let (raw, callee_tid) = rx.recv().unwrap();
+        // The caller's STA, like cj-dnd: a window, a timer, a posted WM_APP.
+        let (during, call_ms, ticks_during, app_ms) = std::thread::spawn(move || unsafe {
+            CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok().unwrap();
+            let hinst = GetModuleHandleW(None).unwrap().into();
+            let wc = WNDCLASSEXW {
+                cbSize: size_of::<WNDCLASSEXW>() as u32,
+                lpfnWndProc: Some(probe_proc),
+                hInstance: hinst,
+                lpszClassName: w!("CursorJumpComProbe"),
+                ..Default::default()
+            };
+            RegisterClassExW(&wc);
+            let hwnd = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("CursorJumpComProbe"),
+                w!("probe"),
+                WS_POPUP,
+                0,
+                0,
+                0,
+                0,
+                None,
+                None,
+                Some(hinst),
+                None,
+            )
+            .unwrap();
+            let mut p = std::ptr::null_mut();
+            git()
+                .GetInterfaceFromGlobal(raw as u32, &IDropTarget::IID, &mut p)
+                .unwrap();
+            let proxy = IDropTarget::from_raw(p);
+            SetTimer(Some(hwnd), 1, 50, None);
+            PostMessageW(Some(hwnd), WM_APP, WPARAM(0), LPARAM(0)).unwrap();
+            let t0 = probe_ms();
+            proxy.DragLeave().unwrap();
+            let t1 = probe_ms();
+            let ticks_during = PROBE_TICKS.load(Ordering::SeqCst);
+            let app = PROBE_APP_MS.load(Ordering::SeqCst);
+            let during = app != 0 && app <= t1;
+            // Afterwards, a plain pump gets whatever was held back.
+            let mut msg = MSG::default();
+            let until = Instant::now() + Duration::from_millis(200);
+            while Instant::now() < until {
+                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                    DispatchMessageW(&msg);
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let app_after = PROBE_APP_MS.load(Ordering::SeqCst);
+            let _ = KillTimer(Some(hwnd), 1);
+            drop(proxy);
+            let _ = git().RevokeInterfaceFromGlobal(raw as u32);
+            let _ = DestroyWindow(hwnd);
+            CoUninitialize();
+            (during, t1 - t0, ticks_during, app_after.saturating_sub(t0))
+        })
+        .join()
+        .unwrap();
+        unsafe { PostThreadMessageW(callee_tid, WM_QUIT, WPARAM(0), LPARAM(0)) }.unwrap();
+        callee.join().unwrap();
+        // Through a proxy, served by the callee's own loop: a direct call
+        // would pump nothing either, and prove nothing.
+        assert_eq!(PROBE_CALLEE_TID.load(Ordering::SeqCst), callee_tid);
+        eprintln!(
+            "probe: an outgoing COM call of {call_ms} ms from an STA: posted WM_APP dispatched \
+             during it: {} (seen at +{app_ms} ms); WM_TIMER ticks during it: {ticks_during}",
+            if during { "YES" } else { "NO" },
         );
     }
 
@@ -1362,8 +1860,8 @@ mod tests {
         let data: IDataObject = DataObject::new(incoming.clone()).into();
         let source: IDropSource = DropSource {
             shared: Arc::default(),
-            cancel: Arc::default(),
             incoming,
+            started: AtomicBool::new(false),
         }
         .into();
         assert!(data.cast::<IAgileObject>().is_ok());
@@ -1412,6 +1910,56 @@ mod tests {
         path
     }
 
+    /// I2, for real: 2 s into a long fetch, a cheap command (`Shield(true)`)
+    /// goes through the real `WM_APP` path, and the shield showing says
+    /// cj-dnd took it. Decisive with Explorer, whose synchronous `Drop`
+    /// holds cj-dnd in an outgoing COM call (and `DoDragDrop` running)
+    /// for the whole fetch; with Chromium targets `DoDragDrop` has returned
+    /// by then.
+    fn probe_commands(
+        drag: DragId,
+        cmds: &mpsc::Sender<super::super::DndCmd>,
+        shared: &DndShared,
+        ended: &Mutex<HashSet<DragId>>,
+        fetch_for: Duration,
+    ) {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::IsWindowVisible;
+        std::thread::sleep(Duration::from_secs(2));
+        let returned = || ended.lock().unwrap().contains(&drag);
+        let running_at_send = !returned();
+        let hwnd = HWND(shared.shield.load(Ordering::Acquire) as *mut _);
+        // SAFETY: plain FFI call on a window handle.
+        let shown = || unsafe { IsWindowVisible(hwnd) }.as_bool();
+        if shown() {
+            eprintln!("smoke: PROBE {drag}: the shield is already shown; no answer");
+            return;
+        }
+        let sent = Instant::now();
+        let _ = cmds.send(super::super::DndCmd::Shield(true));
+        while !shown() && sent.elapsed() < fetch_for + Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let (took, applied, running_at_apply) = (sent.elapsed(), shown(), !returned());
+        let verdict = match (running_at_send, applied, running_at_apply) {
+            (false, _, _) => "INCONCLUSIVE: DoDragDrop had already returned (a Chromium target?)",
+            (true, true, true) => "commands DO drain while the target's Drop holds cj-dnd",
+            (true, true, false) => {
+                "commands do NOT drain while the target's Drop holds cj-dnd:                  applied only once DoDragDrop returned"
+            }
+            (true, false, _) => "commands do NOT drain: never applied",
+        };
+        eprintln!(
+            "smoke: PROBE {drag}: Shield(true) sent with DoDragDrop {}; applied {applied}              after {took:?} => {verdict}",
+            if running_at_send {
+                "RUNNING"
+            } else {
+                "returned"
+            }
+        );
+        let _ = cmds.send(super::super::DndCmd::Shield(false));
+    }
+
     /// cj-dnd alone (the app isn't running) with a session marked up: drags
     /// "from the Mac" backed by a local 50 MB file, fetched slowly through
     /// the real `Fetch` path after the drop.
@@ -1424,7 +1972,9 @@ mod tests {
     /// shield comes back for the next drag.
     ///
     /// - `CJ_SMOKE_FETCH_SECS` (default 5): how long each fetch takes; try
-    ///   60 to see targets survive a long wait.
+    ///   60 to see targets survive a long wait. From 10 s up, a "PROBE" line
+    ///   says whether cj-dnd still takes commands while the target holds
+    ///   it: drop into an Explorer folder for the answer.
     /// - `CJ_SMOKE_MODE`: unset; `shield-first` (the shield's hide is sent
     ///   before `StartIncoming`, as the input thread may); `cancel`
     ///   (`CancelIncoming` 2 s in: the drag must end with no drop, even
@@ -1493,9 +2043,14 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let fetching = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (ended_tx, ended_rx) = mpsc::channel::<(DragId, bool)>();
+        // The drags whose DoDragDrop returned, and a PROBE running (I2).
+        let ended = Arc::new(Mutex::new(HashSet::<DragId>::new()));
+        let probing = Arc::new(AtomicBool::new(false));
         let app = {
             let (stop, fetching, file, name) =
                 (stop.clone(), fetching.clone(), file.clone(), name.clone());
+            let (ended, probing, probe_cmds) = (ended.clone(), probing.clone(), cmds.clone());
+            let shield = shared.clone();
             std::thread::spawn(move || {
                 loop {
                     let ev = match ev_rx.recv_timeout(Duration::from_millis(200)) {
@@ -1518,6 +2073,15 @@ mod tests {
                                 "smoke: Fetch {drag}/{item} into {} over {fetch_for:?}",
                                 dir.display()
                             );
+                            if item == 0 && fetch_for >= Duration::from_secs(10) {
+                                probing.store(true, Ordering::Release);
+                                let (ended, probing) = (ended.clone(), probing.clone());
+                                let (cmds, shield) = (probe_cmds.clone(), shield.clone());
+                                std::thread::spawn(move || {
+                                    probe_commands(drag, &cmds, &shield, &ended, fetch_for);
+                                    probing.store(false, Ordering::Release);
+                                });
+                            }
                             fetching.fetch_add(1, Ordering::AcqRel);
                             let fetching = fetching.clone();
                             std::thread::spawn(move || {
@@ -1533,6 +2097,7 @@ mod tests {
                         }
                         WinDndEv::IncomingEnded { drag, dropped } => {
                             eprintln!("smoke: IncomingEnded {drag}, dropped {dropped}");
+                            ended.lock().unwrap().insert(drag);
                             let _ = ended_tx.send((drag, dropped));
                         }
                         other => eprintln!("smoke: {other:?}"),
@@ -1612,7 +2177,12 @@ mod tests {
                     Err(mpsc::RecvTimeoutError::Disconnected) => panic!("smoke app thread stopped"),
                 }
             }
-            // The shield must be gone once the drag has ended.
+            // The shield must be gone once the drag has ended (a PROBE
+            // shows it for a moment).
+            let until = Instant::now() + fetch_for + Duration::from_secs(15);
+            while probing.load(Ordering::Acquire) && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(50));
+            }
             std::thread::sleep(Duration::from_millis(100));
             eprintln!(
                 "smoke: shield {} after the drag",

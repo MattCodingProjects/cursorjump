@@ -20,7 +20,8 @@
 //!   down: what `DoDragDrop` on this thread needs (it takes the capture
 //!   itself) for a drag from the Mac. The shield ignores the clicks it gets.
 //!   So `Shield(false)` keeps a shown shield while such a drag is starting
-//!   or follows the mouse, or (the button held) may yet start: the app's
+//!   (until its first `QueryContinueDrag`: OLE holds its own capture from
+//!   then on), or (the button held) may yet start: the app's
 //!   `StartIncoming` and the input thread's hide come in either order.
 //! - A drag from the Mac (`StartIncoming`) runs `DoDragDrop` on this thread,
 //!   outside its state, from the command drain; see `source`.
@@ -140,7 +141,13 @@ pub enum DndCmd {
     /// on cj-dnd for `items`, whose bytes are fetched only once a target
     /// takes the drop. `IncomingEnded` follows, whether it ran or not.
     StartIncoming { drag: DragId, items: Vec<DragItem> },
-    /// The drag from the Mac is cancelled: its `DoDragDrop` ends without a drop.
+    /// The drag from the Mac is cancelled: its `DoDragDrop` ends without a
+    /// drop, and a target's wait for its bytes after the drop fails
+    /// (`E_FAIL`) within `source::REPLY_POLL`, as it does when cj-dnd
+    /// stops. Handled by the command relay, so it works even while a
+    /// target's `Drop` holds cj-dnd. The app should still fail its
+    /// outstanding `Fetch` replies with `Err(Cancelled)`: that is the
+    /// cancel's main path once the drop has happened.
     CancelIncoming { drag: DragId },
 }
 
@@ -190,6 +197,22 @@ pub enum WinDndEv {
     /// bytes: receive `item` into `dir` (as `Dest::InDir`) and answer on
     /// `reply` with where it landed. Sent from the COM thread serving the
     /// target's `GetData`, which waits for every item's reply.
+    ///
+    /// The contract for the app:
+    /// - A `Fetch` can come before `IncomingEnded`, and `IncomingEnded` can
+    ///   wait on its reply (Explorer's `Drop` asks for the bytes and holds
+    ///   `DoDragDrop` until it has them). Never hold a `Fetch` back until
+    ///   `IncomingEnded`: Explorer's `Drop` → our `GetData` → the reply →
+    ///   `IncomingEnded` → `DoDragDrop` returns → Explorer's `Drop` is a
+    ///   deadlock.
+    /// - Every reply is answered or dropped, and promptly so when the
+    ///   session ends: a target waits on it.
+    /// - Once the drop has happened, `CancelIncoming` ends nothing the
+    ///   target sees by itself: cancel by failing the replies with
+    ///   `Err(Cancelled)` (the source side's own escape is a backstop).
+    /// - Rarely, a `Fetch` comes and then `IncomingEnded { dropped: false }`:
+    ///   a Chromium hover ask racing a DROP the target then refused. Its
+    ///   reply is still awaited until answered, dropped or cancelled.
     Fetch {
         drag: DragId,
         item: u32,
@@ -286,16 +309,21 @@ pub fn spawn_dnd_thread(
 ) -> Result<mpsc::Sender<DndCmd>> {
     let (cmd_tx, cmd_rx) = mpsc::channel::<DndCmd>();
     let (relay_tx, relay_rx) = mpsc::channel::<DndCmd>();
+    let live = source::Live::default();
+    let live_relay = live.clone();
     let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<isize>>(1);
     std::thread::Builder::new()
         .name("cj-dnd".into())
-        .spawn(move || run(cfg, shared, Emit::new(Box::new(events)), relay_rx, ready_tx))
+        .spawn(move || {
+            let events = Emit::new(Box::new(events));
+            run(cfg, shared, events, live, relay_rx, ready_tx)
+        })
         .context("spawn dnd thread")?;
     // The thread reports its catcher window once it exists.
     let catcher = ready_rx.recv().context("dnd thread exited at start")??;
     std::thread::Builder::new()
         .name("cj-dnd-cmd".into())
-        .spawn(move || relay(cmd_rx, relay_tx, catcher))
+        .spawn(move || relay(cmd_rx, relay_tx, catcher, live_relay))
         .inspect_err(|_| {
             // The relay's sender is gone: let the thread see it and stop.
             last_wake(catcher);
@@ -305,9 +333,27 @@ pub fn spawn_dnd_thread(
 }
 
 /// Forwards commands and wakes cj-dnd; once every sender is gone, drops its
-/// own so the thread stops.
-fn relay(from: mpsc::Receiver<DndCmd>, to: mpsc::Sender<DndCmd>, catcher: isize) {
+/// own so the thread stops. A `CancelIncoming` (and the end, for every live
+/// drag from the Mac) is acted on here as well: cj-dnd may be held in a
+/// target's `Drop`, where its loop takes no `WM_APP`.
+fn relay(
+    from: mpsc::Receiver<DndCmd>,
+    to: mpsc::Sender<DndCmd>,
+    catcher: isize,
+    live: source::Live,
+) {
     for cmd in from {
+        if let DndCmd::CancelIncoming { drag } = cmd {
+            let reached = source::cancel_live(&live, Some(drag));
+            debug!(drag, reached, "dnd relay: CancelIncoming");
+            // OLE asks QueryContinueDrag after each message its loop takes:
+            // one more, now the flag is set, so a still mouse can't hold
+            // the drag off.
+            // SAFETY: plain FFI call; a window that is gone just makes it fail.
+            let _ = unsafe {
+                PostMessageW(Some(HWND(catcher as *mut _)), WM_NULL, WPARAM(0), LPARAM(0))
+            };
+        }
         if to.send(cmd).is_err() {
             return; // The dnd thread is gone.
         }
@@ -316,6 +362,7 @@ fn relay(from: mpsc::Receiver<DndCmd>, to: mpsc::Sender<DndCmd>, catcher: isize)
             warn!("dnd thread wake failed: {e}");
         }
     }
+    source::cancel_live(&live, None);
     drop(to);
     last_wake(catcher);
 }
@@ -422,12 +469,11 @@ struct Modes {
     offer: Option<DragId>,
     /// The drag from the Mac that `DoDragDrop` is starting or running.
     incoming: Option<DragId>,
-    /// ... and still follows the mouse: no drop or cancel yet.
-    tracking: bool,
+    /// ... and its `DoDragDrop` has not called `QueryContinueDrag` yet.
+    starting: bool,
     /// A `Shield(false)` not applied yet: the press the shield got is what
-    /// `DoDragDrop` needs, so the shield stays until the incoming drag lets
-    /// go of the mouse (or, with none started, until Windows sees the
-    /// button up).
+    /// `DoDragDrop` needs, so the shield stays until the incoming drag has
+    /// started (or, with none started, until Windows sees the button up).
     shield_kept: bool,
     /// Windows sees the left button down (`GetAsyncKeyState`), as of the
     /// last command or poll.
@@ -484,9 +530,9 @@ impl Modes {
             DndCmd::Shield(false) => {
                 // The app's StartIncoming and the input thread's hide come
                 // in either order: keep a shown shield while a drag from
-                // the Mac is starting or follows the mouse, or may yet start.
+                // the Mac is starting, or may yet start.
                 let may_start = self.incoming.is_none() && self.held;
-                self.shield_kept |= self.placement().shield && (self.tracking || may_start);
+                self.shield_kept |= self.placement().shield && (self.starting || may_start);
                 self.shield_on = false;
                 if self.shield_kept {
                     debug!(incoming = ?self.incoming, "dnd: shield kept for the press");
@@ -538,16 +584,18 @@ impl Modes {
             return false;
         }
         self.incoming = Some(drag);
-        self.tracking = true;
+        self.starting = true;
         true
     }
 
-    /// Its drop source said DROP or CANCEL: the press has done its work. A
-    /// target may hold `DoDragDrop` much longer (Explorer's `Drop` waits for
-    /// the whole fetch), and the shield would sit on the PC all that time.
+    /// Its `DoDragDrop` called `QueryContinueDrag` for the first time: OLE
+    /// holds its own capture, and the press has done its work (R38b). Not
+    /// when `DoDragDrop` returns (R38a): a target may hold it much longer
+    /// (Explorer's `Drop` waits for the whole fetch), and the shield would
+    /// sit on the PC all that time, a dead square under the drag.
     fn let_go_incoming(&mut self, drag: DragId) {
         if self.incoming == Some(drag) {
-            self.tracking = false;
+            self.starting = false;
             self.shield_kept = false;
         }
     }
@@ -556,7 +604,7 @@ impl Modes {
     fn end_incoming(&mut self, drag: DragId) {
         if self.incoming == Some(drag) {
             self.incoming = None;
-            self.tracking = false;
+            self.starting = false;
             self.shield_kept = false;
         }
     }
@@ -564,7 +612,7 @@ impl Modes {
     /// The button Windows saw is up (or the wait is over) with no drag from
     /// the Mac started: none will start on that press.
     fn release_kept(&mut self) {
-        if !self.tracking {
+        if !self.starting {
             self.shield_kept = false;
         }
     }
@@ -670,8 +718,8 @@ struct State {
     up_since: Option<Instant>,
     /// A drag from the Mac to run once the state is let go of.
     start: Option<source::Run>,
-    /// The running drag from the Mac's cancel flag.
-    cancel: Arc<AtomicBool>,
+    /// Drags from the Mac still served; cancelled when the thread stops.
+    live: source::Live,
     keep_timer: bool,
     /// Since when the shield has been kept with no drag from the Mac running.
     kept_since: Option<Instant>,
@@ -730,6 +778,7 @@ fn run(
     cfg: Config,
     shared: Arc<DndShared>,
     events: Emit,
+    live: source::Live,
     cmds: mpsc::Receiver<DndCmd>,
     ready: mpsc::SyncSender<Result<isize>>,
 ) {
@@ -739,7 +788,7 @@ fn run(
         let _ = ready.send(Err(anyhow!(e).context("OleInitialize")));
         return;
     }
-    match State::new(cfg, shared, events) {
+    match State::new(cfg, shared, events, live) {
         Ok(state) => {
             let catcher = state.catcher.hwnd.0 as isize;
             STATE.with(|cell| *cell.borrow_mut() = Some(state));
@@ -825,7 +874,7 @@ fn create_window(hinst: HINSTANCE, title: PCWSTR) -> windows::core::Result<HWND>
 }
 
 impl State {
-    fn new(cfg: Config, shared: Arc<DndShared>, events: Emit) -> Result<State> {
+    fn new(cfg: Config, shared: Arc<DndShared>, events: Emit, live: source::Live) -> Result<State> {
         let hinst = register_class().context("register catcher window class")?;
         let catcher = create_window(hinst, w!("CursorJump catcher")).context("create catcher")?;
         let shield = match create_window(hinst, w!("CursorJump shield")) {
@@ -851,7 +900,7 @@ impl State {
             stuck_timer: false,
             up_since: None,
             start: None,
-            cancel: Arc::default(),
+            live,
             keep_timer: false,
             kept_since: None,
         };
@@ -905,29 +954,20 @@ impl State {
             });
             return;
         }
-        self.cancel = Arc::default();
         self.start = Some(source::Run {
             drag,
             items,
-            cancel: self.cancel.clone(),
+            live: self.live.clone(),
             shared: self.shared.clone(),
             events: self.events.clone(),
         });
         self.apply();
     }
 
-    /// Arrives through `WM_APP` inside `DoDragDrop`'s modal loop.
+    /// The relay has already cancelled it (see `relay`); this only notes it.
     fn cancel_incoming(&mut self, drag: DragId) {
-        if self.modes.incoming != Some(drag) {
-            debug!(drag, "incoming: CancelIncoming for a drag not running");
-            return;
-        }
-        info!(drag, "incoming: cancelled");
-        self.cancel.store(true, Ordering::Release);
-        // OLE asks QueryContinueDrag after each message its loop takes: one
-        // more, now that the flag is set, so a still mouse can't hold it off.
-        // SAFETY: plain FFI call on our own window.
-        let _ = unsafe { PostMessageW(Some(self.catcher.hwnd), WM_NULL, WPARAM(0), LPARAM(0)) };
+        let running = self.modes.incoming == Some(drag);
+        debug!(drag, running, "incoming: CancelIncoming");
     }
 
     fn incoming_let_go(&mut self, drag: DragId) {
@@ -985,7 +1025,7 @@ impl State {
             .store(self.modes.parked, Ordering::Release);
         self.set_image_hidden(self.modes.image_hidden());
         self.set_stuck_timer(self.modes.parked);
-        self.set_keep_timer(self.modes.shield_kept && !self.modes.tracking);
+        self.set_keep_timer(self.modes.shield_kept && !self.modes.starting);
     }
 
     fn set_keep_timer(&mut self, on: bool) {
@@ -1142,6 +1182,8 @@ impl Drop for State {
     fn drop(&mut self) {
         let released = self.modes.release(false);
         self.settle(released);
+        // A target still waiting for bytes gets E_FAIL, not a hang.
+        source::cancel_live(&self.live, None);
         self.shared.catcher.store(0, Ordering::Release);
         self.shared.shield.store(0, Ordering::Release);
         self.shared.parked.store(false, Ordering::Release);
@@ -1257,15 +1299,15 @@ mod tests {
     }
 
     #[test]
-    fn shield_goes_at_the_release_while_the_target_still_reads() {
+    fn shield_goes_once_dodragdrop_has_the_mouse() {
         let mut m = Modes::default();
         cmd(&mut m, DndCmd::Shield(true));
         assert!(m.begin_incoming(5));
         cmd(&mut m, DndCmd::Shield(false));
-        // Explorer's Drop holds DoDragDrop for the whole fetch: the shield
-        // goes once the mouse part is over, not when DoDragDrop returns.
+        // At the first QueryContinueDrag OLE holds its own capture; and
+        // Explorer's Drop may hold DoDragDrop for the whole fetch after.
         m.let_go_incoming(6);
-        assert!(shield_shown(&m), "another drag's release");
+        assert!(shield_shown(&m), "another drag's start");
         m.let_go_incoming(5);
         assert!(!shield_shown(&m));
         // Still one drag at a time, and no keeping on its behalf.
