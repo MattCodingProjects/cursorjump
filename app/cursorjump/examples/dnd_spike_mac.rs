@@ -28,6 +28,9 @@
 //! - `--move-ms MS` (default 800): how long a scripted drag takes, posting a dragged event
 //!   about every 8 ms; the first three steps are 2.5 pt each to cross the drag threshold.
 //!
+//! `CJ_AT=x,y` (environment, global CG points): no countdown; the cursor is warped to that
+//! point, which is used as T (source) or P (catcher), so runs can be unattended.
+//!
 //! On every exit path (normal quit, Ctrl+C / SIGTERM, a panic) a LeftMouseUp is posted if
 //! a posted LeftMouseDown is still outstanding.
 //!
@@ -38,7 +41,8 @@
 //!     [--size-mb 5] [--from PATH] [--wait-secs 60] [--wait-when drop|first]
 //!     [--end up|esc|esc-then-up|mask-none|hold]
 //!     [--start left-edge|here] [--hover-ms 1500] [--jiggle] [--panel-alpha 0.01]
-//!     [--hold-write rename|inplace]
+//!     [--hold-write rename|inplace] [--start-mode down|late-real|late-synth|late-timer]
+//!     [--late-ms 240]
 //!     [--countdown 5] [--move-ms 800] [--quit-after 20]
 //! ```
 //! 1. Payload: `--from PATH` serves a copy of that file under its name; otherwise
@@ -65,6 +69,16 @@
 //!    it), then writes the real bytes there and answers the same URL. `--wait-when first`:
 //!    the first call blocks, whenever it comes. The summary says whether the provider was
 //!    asked again after the release or the pasteboard served its cached answer.
+//!    `--start-mode` (finding F1: Chrome starts its session late, from a synthesized event):
+//!    `down` (default) starts in `mouseDown:` with the real posted event; `late-real` starts
+//!    on the first `mouseDragged:` >= `--late-ms` (default 240) after the down, passing that
+//!    real event; `late-synth` starts at the same moment with a synthesized
+//!    LeftMouseDragged built like Chromium's (`mouseEventWithType:` with NSApp.currentEvent's
+//!    window location and timestamp, our window number, event number 0, click count 1,
+//!    pressure 1); `late-timer` starts from a `dispatch_after(--late-ms)` on the main queue
+//!    with the synthesized event (closest to Chrome's IPC-driven start). Every
+//!    `mouseDragged:` the view gets, before and after the start, is logged with the drag
+//!    pasteboard's changeCount.
 //! 5. The script drags S to T over `--move-ms`, then hovers `--hover-ms` (default 1500;
 //!    `--jiggle` adds a +-1 pt dragged event every 50 ms).
 //!    `--kind both`: one item whose writer (an `NSFilePromiseProvider` subclass) offers the
@@ -145,9 +159,9 @@ mod mac {
     use objc2_app_kit::{
         NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSColor, NSDragOperation,
         NSDraggingContext, NSDraggingDestination, NSDraggingInfo, NSDraggingItem,
-        NSDraggingSession, NSDraggingSource, NSEvent, NSFilePromiseProvider,
-        NSFilePromiseProviderDelegate, NSFilePromiseReceiver, NSPanel, NSPasteboard,
-        NSPasteboardItem, NSPasteboardItemDataProvider, NSPasteboardTypeFileURL,
+        NSDraggingSession, NSDraggingSource, NSEvent, NSEventModifierFlags, NSEventType,
+        NSFilePromiseProvider, NSFilePromiseProviderDelegate, NSFilePromiseReceiver, NSPanel,
+        NSPasteboard, NSPasteboardItem, NSPasteboardItemDataProvider, NSPasteboardTypeFileURL,
         NSPasteboardURLReadingFileURLsOnlyKey, NSPasteboardWritingOptions, NSResponder,
         NSStatusWindowLevel, NSView, NSWindowCollectionBehavior, NSWindowStyleMask, NSWorkspace,
     };
@@ -158,8 +172,8 @@ mod mac {
         CGMainDisplayID, CGMouseButton, CGPreflightPostEventAccess, CGWarpMouseCursorPosition,
     };
     use objc2_foundation::{
-        NSArray, NSDictionary, NSError, NSNumber, NSOperationQueue, NSPoint, NSRect, NSSize,
-        NSString, NSURL, ns_string,
+        NSArray, NSDictionary, NSError, NSNumber, NSOperationQueue, NSPoint, NSProcessInfo, NSRect,
+        NSSize, NSString, NSURL, ns_string,
     };
     use objc2_uniform_type_identifiers::UTType;
 
@@ -243,6 +257,13 @@ mod mac {
     static CANCEL: AtomicBool = AtomicBool::new(false);
 
     static MOUSE_DOWN_SEEN: AtomicBool = AtomicBool::new(false);
+    /// When `mouseDown:` reached the panel view (µs since start), or NOT_YET.
+    static DOWN_AT: AtomicU64 = AtomicU64::new(NOT_YET);
+    /// `beginDraggingSession` has been called (once per run).
+    static DRAG_STARTED: AtomicBool = AtomicBool::new(false);
+    /// What the session was started from, for the summary.
+    static STARTED_HOW: Mutex<String> = Mutex::new(String::new());
+    static VIEW_DRAGGED_AFTER: AtomicU32 = AtomicU32::new(0);
     static VIEW_DRAGGED: AtomicU32 = AtomicU32::new(0);
     static SESSION_BEGAN: AtomicBool = AtomicBool::new(false);
     static SESSION_ENDED: AtomicBool = AtomicBool::new(false);
@@ -316,6 +337,8 @@ mod mac {
         "--hover-ms",
         "--panel-alpha",
         "--hold-write",
+        "--start-mode",
+        "--late-ms",
     ];
     const SOURCE_FLAGS: &[&str] = &["--jiggle"];
     const CATCHER_VALS: &[&str] = &["--drive", "--alpha", "--hover-ms"];
@@ -663,6 +686,33 @@ mod mac {
         std::process::exit(0);
     }
 
+    /// The point to use: `CJ_AT=x,y` (global CG points; the cursor is warped
+    /// there, no countdown), else where the user points after the countdown.
+    fn pick_point(secs: u64, what: &str) -> (f64, f64) {
+        let Ok(v) = std::env::var("CJ_AT") else {
+            return countdown(secs, what);
+        };
+        let parsed = v
+            .split_once(',')
+            .and_then(|(x, y)| Some((x.trim().parse().ok()?, y.trim().parse().ok()?)));
+        let Some(at) = parsed else {
+            log!("CJ_AT={v} is not x,y; exiting");
+            std::process::exit(2);
+        };
+        log!(
+            "CJ_AT={v}: no countdown; warping the cursor to ({:.1}, {:.1})",
+            at.0,
+            at.1
+        );
+        if let Some(p) = Poster::new() {
+            p.warp(at);
+        }
+        sleep_ms(150);
+        let now = cursor_location();
+        log!("cursor now at ({:.1}, {:.1})", now.0, now.1);
+        at
+    }
+
     fn countdown(secs: u64, what: &str) -> (f64, f64) {
         log!("countdown {secs} s: {what}");
         for i in (1..=secs).rev() {
@@ -799,6 +849,9 @@ mod mac {
 
     struct SourceCfg {
         kind: String,
+        /// When the session starts: `down`, `late-real`, `late-synth`, `late-timer`.
+        start_mode: String,
+        late_ms: u64,
         /// `--end hold`: `rename` (temp file renamed over the placeholder) or
         /// `inplace` (truncate and write the placeholder's own inode).
         hold_write: String,
@@ -926,14 +979,12 @@ mod mac {
 
             #[unsafe(method(mouseDown:))]
             fn mouse_down(&self, event: &NSEvent) {
-                self.start_drag(event);
+                self.on_down(event);
             }
 
             #[unsafe(method(mouseDragged:))]
-            fn mouse_dragged(&self, _event: &NSEvent) {
-                if VIEW_DRAGGED.fetch_add(1, Ordering::SeqCst) == 0 {
-                    log!("mouseDragged: reached the panel view (the drag session is not tracking)");
-                }
+            fn mouse_dragged(&self, event: &NSEvent) {
+                self.on_dragged(event);
             }
 
             #[unsafe(method(mouseUp:))]
@@ -1011,16 +1062,122 @@ mod mac {
             self.ivars().keep.borrow_mut().push(obj);
         }
 
-        fn start_drag(&self, event: &NSEvent) {
+        fn on_down(&self, event: &NSEvent) {
             MOUSE_DOWN_SEEN.store(true, Ordering::SeqCst);
+            DOWN_AT.store(now_us(), Ordering::SeqCst);
             let c = cfg();
             let loc = event.locationInWindow();
             log!(
-                "mouseDown: arrived at the panel view (window point {:.1}, {:.1}; clickCount {}); kind {}",
+                "mouseDown: arrived at the panel view (window point {:.1}, {:.1}; clickCount {}; {}); kind {}, start mode {}",
                 loc.x,
                 loc.y,
                 event.clickCount(),
-                c.kind
+                describe_event(event),
+                c.kind,
+                c.start_mode
+            );
+            match c.start_mode.as_str() {
+                "down" => self.start_drag(event, "the real mouseDown: event"),
+                "late-timer" => schedule_late_start(self, c.late_ms),
+                _ => log!(
+                    "not starting yet: waiting for a mouseDragged: >= {} ms after the down",
+                    c.late_ms
+                ),
+            }
+        }
+
+        fn on_dragged(&self, event: &NSEvent) {
+            let c = cfg();
+            let started = DRAG_STARTED.load(Ordering::SeqCst);
+            let n = VIEW_DRAGGED.fetch_add(1, Ordering::SeqCst) + 1;
+            if started {
+                VIEW_DRAGGED_AFTER.fetch_add(1, Ordering::SeqCst);
+            }
+            let ms = ms_since_down();
+            let loc = event.locationInWindow();
+            log!(
+                "mouseDragged: #{n} at the view, +{ms:.1} ms after the down, window point ({:.1}, {:.1}), {}, session {}, drag pasteboard changeCount {}",
+                loc.x,
+                loc.y,
+                describe_event(event),
+                if started { "STARTED" } else { "not started" },
+                drag_change_count()
+            );
+            if started || ms < c.late_ms as f64 {
+                return;
+            }
+            match c.start_mode.as_str() {
+                "late-real" => self.start_drag(event, "a real mouseDragged: event"),
+                "late-synth" => match self.synth_dragged() {
+                    Some(ev) => {
+                        self.start_drag(&ev, "a synthesized LeftMouseDragged (in mouseDragged:)")
+                    }
+                    None => log!("synthesizing the dragged event failed"),
+                },
+                _ => {}
+            }
+        }
+
+        /// A LeftMouseDragged NSEvent built like Chromium's startDragWithDropData:
+        /// the current event's window location and timestamp, our window number,
+        /// event number 0, click count 1, pressure 1.
+        fn synth_dragged(&self) -> Option<Retained<NSEvent>> {
+            let mtm = self.mtm();
+            let current = NSApplication::sharedApplication(mtm).currentEvent();
+            let window = self.window();
+            let wn = window.as_ref().map_or(0, |w| w.windowNumber());
+            let (loc, ts) = match &current {
+                Some(e) => {
+                    log!("synth: from NSApp.currentEvent ({})", describe_event(e));
+                    (e.locationInWindow(), e.timestamp())
+                }
+                None => {
+                    log!(
+                        "synth: no NSApp.currentEvent; mouseLocationOutsideOfEventStream + systemUptime"
+                    );
+                    (
+                        window.as_ref().map_or(NSPoint::new(0.0, 0.0), |w| {
+                            w.mouseLocationOutsideOfEventStream()
+                        }),
+                        NSProcessInfo::processInfo().systemUptime(),
+                    )
+                }
+            };
+            // SAFETY: the class method's own selector and argument types; the
+            // context argument is documented as unused (pass nil).
+            let ev: Option<Retained<NSEvent>> = unsafe {
+                msg_send![
+                    NSEvent::class(),
+                    mouseEventWithType: NSEventType::LeftMouseDragged,
+                    location: loc,
+                    modifierFlags: NSEventModifierFlags(0),
+                    timestamp: ts,
+                    windowNumber: wn,
+                    context: None::<&AnyObject>,
+                    eventNumber: 0isize,
+                    clickCount: 1isize,
+                    pressure: 1.0f32
+                ]
+            };
+            ev
+        }
+
+        fn start_drag(&self, event: &NSEvent, how: &str) {
+            if DRAG_STARTED.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            if let Ok(mut h) = STARTED_HOW.lock() {
+                *h = format!("{how}, +{:.1} ms after the down", ms_since_down());
+            }
+            let c = cfg();
+            let loc = event.locationInWindow();
+            log!(
+                "STARTING the session from {how}, +{:.1} ms after the down: window point ({:.1}, {:.1}), {}, drag pasteboard changeCount {}",
+                ms_since_down(),
+                loc.x,
+                loc.y,
+                describe_event(event),
+                drag_change_count()
             );
             let item = if c.kind == "both" {
                 let delegate = PromiseDelegate::new();
@@ -1089,9 +1246,90 @@ mod mac {
             );
             session.setAnimatesToStartingPositionsOnCancelOrFail(false);
             log!(
-                "beginDraggingSession returned (sequence number {})",
-                session.draggingSequenceNumber()
+                "beginDraggingSession returned (sequence number {}); drag pasteboard changeCount {}",
+                session.draggingSequenceNumber(),
+                drag_change_count()
             );
+        }
+    }
+
+    fn ms_since_down() -> f64 {
+        match DOWN_AT.load(Ordering::SeqCst) {
+            NOT_YET => -1.0,
+            at => now_us().saturating_sub(at) as f64 / 1000.0,
+        }
+    }
+
+    fn describe_event(e: &NSEvent) -> String {
+        format!(
+            "type {}, eventNumber {}, timestamp {:.3}, window {}, pressure {:.2}",
+            e.r#type().0,
+            e.eventNumber(),
+            e.timestamp(),
+            e.windowNumber(),
+            e.pressure()
+        )
+    }
+
+    /// The drag pasteboard's changeCount (it changes when a session is set up).
+    fn drag_change_count() -> isize {
+        // SAFETY: a static AppKit string.
+        let name = unsafe { objc2_app_kit::NSPasteboardNameDrag };
+        NSPasteboard::pasteboardWithName(name).changeCount()
+    }
+
+    #[repr(C)]
+    struct DispatchQueue {
+        _opaque: [u8; 0],
+    }
+
+    unsafe extern "C" {
+        /// The main queue (`dispatch_get_main_queue()` is an inline function).
+        static _dispatch_main_q: DispatchQueue;
+        fn dispatch_time(when: u64, delta_ns: i64) -> u64;
+        fn dispatch_after_f(
+            when: u64,
+            queue: *const DispatchQueue,
+            context: *mut std::ffi::c_void,
+            work: extern "C" fn(*mut std::ffi::c_void),
+        );
+    }
+
+    /// `--start-mode late-timer`: starts the session from a main-queue timer
+    /// `late_ms` after the down, with a synthesized dragged event.
+    fn schedule_late_start(view: &DragView, late_ms: u64) {
+        log!("not starting yet: dispatch_after({late_ms} ms) on the main queue");
+        let ctx = Retained::into_raw(objc2::Message::retain(view)).cast::<std::ffi::c_void>();
+        // SAFETY: DISPATCH_TIME_NOW is 0; the main queue is a static; the
+        // context is a retained DragView that the callback takes back.
+        unsafe {
+            let when = dispatch_time(0, (late_ms * 1_000_000) as i64);
+            dispatch_after_f(when, &raw const _dispatch_main_q, ctx, late_timer_fired);
+        }
+    }
+
+    static SELFCHECK_TIMER: AtomicBool = AtomicBool::new(false);
+
+    extern "C" fn selfcheck_timer_fired(_ctx: *mut std::ffi::c_void) {
+        SELFCHECK_TIMER.store(MainThreadMarker::new().is_some(), Ordering::SeqCst);
+    }
+
+    unsafe extern "C" {
+        static kCFRunLoopDefaultMode: *const std::ffi::c_void;
+        fn CFRunLoopRunInMode(mode: *const std::ffi::c_void, seconds: f64, once: u8) -> i32;
+    }
+
+    extern "C" fn late_timer_fired(ctx: *mut std::ffi::c_void) {
+        // SAFETY: `ctx` is the pointer `schedule_late_start` leaked from a Retained.
+        let view = unsafe { Retained::from_raw(ctx.cast::<DragView>()) }.expect("view");
+        log!(
+            "late timer fired +{:.1} ms after the down (main thread: {})",
+            ms_since_down(),
+            MainThreadMarker::new().is_some()
+        );
+        match view.synth_dragged() {
+            Some(ev) => view.start_drag(&ev, "a synthesized LeftMouseDragged (main-queue timer)"),
+            None => log!("synthesizing the dragged event failed"),
         }
     }
 
@@ -1402,8 +1640,13 @@ mod mac {
             MOUSE_DOWN_SEEN.load(Ordering::SeqCst)
         );
         log!(
-            "mouseDragged: reached the panel view: {} times",
-            VIEW_DRAGGED.load(Ordering::SeqCst)
+            "mouseDragged: reached the panel view {} times ({} after the session started)",
+            VIEW_DRAGGED.load(Ordering::SeqCst),
+            VIEW_DRAGGED_AFTER.load(Ordering::SeqCst)
+        );
+        log!(
+            "session started from: {}",
+            STARTED_HOW.lock().map(|h| h.clone()).unwrap_or_default()
         );
         log!(
             "session began: {}, ended: {}, operation: {}",
@@ -1581,6 +1824,11 @@ mod mac {
             wait_when: args.choice("--wait-when", &["drop", "first"]),
             end: args.choice("--end", &["up", "esc", "esc-then-up", "mask-none", "hold"]),
             hold_write: args.choice("--hold-write", &["rename", "inplace"]),
+            start_mode: args.choice(
+                "--start-mode",
+                &["down", "late-real", "late-synth", "late-timer"],
+            ),
+            late_ms: args.num("--late-ms", 240),
             hover_ms: args.num("--hover-ms", 1500),
             jiggle: args.flag("--jiggle"),
             move_ms: args.num("--move-ms", 800),
@@ -1598,12 +1846,13 @@ mod mac {
             cfg.hover_ms,
             cfg.move_ms
         );
+        log!("start mode {}, late {} ms", cfg.start_mode, cfg.late_ms);
         let _ = SOURCE.set(cfg);
 
         let mtm = MainThreadMarker::new().expect("main thread");
         let app = new_app(mtm);
         log_frontmost("at start");
-        let t = countdown(
+        let t = pick_point(
             args.num("--countdown", 5),
             "point at the drop target T, then leave the mouse alone",
         );
@@ -1883,7 +2132,7 @@ mod mac {
             );
             finish(quit_after, catcher_summary);
         }
-        let at = countdown(
+        let at = pick_point(
             countdown_secs,
             "point at the file or image to drag, then leave the mouse alone",
         );
@@ -1979,6 +2228,8 @@ mod mac {
         let _ = SOURCE.set(SourceCfg {
             kind: "promise".into(),
             hold_write: "rename".into(),
+            start_mode: "down".into(),
+            late_ms: 240,
             wait_secs: 0,
             wait_when: "drop".into(),
             end: "up".into(),
@@ -1996,7 +2247,34 @@ mod mac {
             ok &= pass;
         };
         let rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(8.0, 8.0));
-        let _drag_view = DragView::new(mtm, rect);
+        let drag_view = DragView::new(mtm, rect);
+        let synth = drag_view.synth_dragged();
+        check(
+            &format!(
+                "synthesized dragged event: {:?}",
+                synth.as_deref().map(describe_event)
+            ),
+            synth.is_some_and(|e| {
+                e.r#type() == NSEventType::LeftMouseDragged
+                    && e.eventNumber() == 0
+                    && e.clickCount() == 1
+            }),
+        );
+        // SAFETY: DISPATCH_TIME_NOW is 0; the main queue is a static; the
+        // callback ignores its context. The run loop drains the main queue.
+        unsafe {
+            dispatch_after_f(
+                dispatch_time(0, 50_000_000),
+                &raw const _dispatch_main_q,
+                std::ptr::null_mut(),
+                selfcheck_timer_fired,
+            );
+            CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.5, 0);
+        }
+        check(
+            "dispatch_after on the main queue fired",
+            SELFCHECK_TIMER.load(Ordering::SeqCst),
+        );
         let _catcher_view = CatcherView::new(mtm, rect, false);
         check("DragView and CatcherView registered", true);
 
