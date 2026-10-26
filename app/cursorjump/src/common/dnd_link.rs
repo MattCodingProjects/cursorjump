@@ -12,9 +12,9 @@
 //! tokens, never aborted, so `transfer` always cleans up on its own path.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Result, bail};
 use cj_core::dnd::{DragId, DragItem, DragOutcome, FailReason, ItemKind, sanitize_component};
@@ -792,6 +792,58 @@ pub fn incoming_outcome(
         Some(why) => DragOutcome::Failed(why.clone()),
         None => DragOutcome::Done,
     })
+}
+
+/// Removes every entry of `root` last modified more than `max_age`
+/// before `now`, folders with everything in them, and returns how many
+/// went. For the drags' own temporary folders (spooled and received items,
+/// and parts a hard kill left behind). An entry that can't be read or
+/// removed is skipped; a missing `root` has nothing to remove.
+pub fn sweep_temp(root: &Path, max_age: Duration, now: SystemTime) -> usize {
+    sweep_temp_except(root, max_age, now, &[])
+}
+
+/// `sweep_temp`, but never the folder of a drag in `live`: the drags'
+/// folders are named after their ids, and a long transfer can outlast any
+/// age.
+pub fn sweep_temp_except(
+    root: &Path,
+    max_age: Duration,
+    now: SystemTime,
+    live: &[DragId],
+) -> usize {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return 0;
+    };
+    let live: Vec<String> = live.iter().map(DragId::to_string).collect();
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        if live.iter().any(|id| entry.file_name() == id.as_str()) {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let old = meta
+            .modified()
+            .ok()
+            .and_then(|at| now.duration_since(at).ok())
+            .is_some_and(|age| age > max_age);
+        if !old {
+            continue;
+        }
+        let gone = if meta.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        match gone {
+            Ok(()) => removed += 1,
+            Err(e) => debug!("{} not swept: {e}", path.display()),
+        }
+    }
+    removed
 }
 
 #[cfg(test)]
@@ -1808,5 +1860,57 @@ mod tests {
         let finished = at(|e| matches!(e, DndEv::Finished { drag: 15, .. }));
         assert!(progress < finished, "progress after the drag finished");
         assert_eq!(p.finished(At::Receiver, 15), [&outcome]);
+    }
+
+    /// Sets `path`'s modification time to `age` before `now`.
+    fn age(path: &Path, age: Duration, now: std::time::SystemTime) {
+        let mut opts = fs::File::options();
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // FILE_WRITE_ATTRIBUTES, and FILE_FLAG_BACKUP_SEMANTICS to open
+            // a folder.
+            opts.access_mode(0x100).custom_flags(0x0200_0000);
+        }
+        #[cfg(not(windows))]
+        opts.read(true);
+        let f = opts.open(path).unwrap();
+        f.set_modified(now - age).unwrap();
+    }
+
+    #[test]
+    fn sweep_temp_removes_only_old_entries() {
+        let root = tempfile::tempdir().unwrap();
+        let now = std::time::SystemTime::now();
+        let hour = Duration::from_secs(3600);
+        let (old, fresh) = (root.path().join("old"), root.path().join("fresh"));
+        fs::create_dir(&old).unwrap();
+        fs::write(old.join("inside.bin"), b"x").unwrap();
+        fs::write(&fresh, b"y").unwrap();
+        age(&old, 2 * hour, now);
+        age(&fresh, Duration::from_secs(60), now);
+
+        assert_eq!(sweep_temp(root.path(), hour, now), 1);
+        assert!(!old.exists(), "the 2 h old folder stays");
+        assert!(fresh.exists(), "the fresh file went");
+        assert_eq!(sweep_temp(root.path(), hour, now), 0);
+        let missing = root.path().join("not there");
+        assert_eq!(sweep_temp(&missing, hour, now), 0);
+    }
+
+    #[test]
+    fn sweep_temp_keeps_a_live_drag() {
+        let root = tempfile::tempdir().unwrap();
+        let now = std::time::SystemTime::now();
+        let hour = Duration::from_secs(3600);
+        let (live, done) = (root.path().join("42"), root.path().join("43"));
+        for dir in [&live, &done] {
+            fs::create_dir(dir).unwrap();
+            age(dir, 2 * hour, now);
+        }
+
+        assert_eq!(sweep_temp_except(root.path(), hour, now, &[42]), 1);
+        assert!(live.exists(), "a live drag's folder went");
+        assert!(!done.exists());
     }
 }

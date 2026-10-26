@@ -2,10 +2,14 @@
 //! `cj-link` thread finds the Mac, keeps one session to it and drives
 //! `PcMachine`: it feeds it events and carries out the actions it returns.
 //!
-//! The input thread and the clipboard watcher are started once and outlive
-//! every reconnect. Two bridge threads (`bridges.rs` and
-//! `common::clipboard_bridge`) move their output into the loop; the session
-//! itself lives in `link.rs`.
+//! The input thread, the clipboard watcher and the drag-and-drop threads
+//! (cj-dnd and the pills) are started once and outlive every reconnect. Two
+//! bridge threads (`bridges.rs` and `common::clipboard_bridge`) move their
+//! output into the loop, and cj-dnd and the pills post to it themselves;
+//! the session itself lives in `link.rs`, and the drags' part of the loop
+//! in `drags.rs`.
+
+mod drags;
 
 use std::collections::VecDeque;
 use std::process::Command;
@@ -16,13 +20,15 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use cj_core::clipboard::ClipboardData;
 use cj_core::config::Config;
+use cj_core::dnd::DragId;
+use cj_core::gaming::game_locked;
 use cj_core::latency::LatencyStats;
 use cj_core::pc_state::{Link, PcAction, PcEvent, PcMachine, Where};
 use cj_core::proto::{Control, Datagram};
 use cj_net::Identity;
 use cj_net::session::Session;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
-use tokio::time::{Instant, MissedTickBehavior, interval, sleep_until};
+use tokio::time::{Instant, MissedTickBehavior, interval, interval_at, sleep_until};
 use tracing::{debug, error, info, warn};
 use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE};
 use windows::Win32::System::Threading::CreateMutexW;
@@ -30,17 +36,21 @@ use windows::core::w;
 
 use super::bridges::bridge_input;
 use super::clipboard::{read_clipboard, spawn_clipboard_watcher, write_clipboard};
+use super::dnd::WinDndEv;
 use super::input_thread::{InputCmd, InputMsg, spawn_input_thread};
 use super::link::{Backoff, Established, Live, establish};
+use super::probe::probe_game;
 use super::settings_window::bring_to_front;
 use crate::common::clipboard_bridge::{ClipboardLink, bridge_clipboard};
 use crate::common::config_file::ConfigFile;
+use crate::common::dnd_link::DndEv;
 use crate::common::paired_fingerprint;
 use crate::common::session_tasks::NetEv;
 use crate::common::settings_window::SettingsWindow;
 use crate::paths;
 use crate::ui::dialogs;
 use crate::ui::tray::{TrayCmd, TrayLoop, TrayModel, latency_text};
+use drags::{DRAG_TICK, Drags, SWEEP_EVERY, start_dnd, start_pills};
 
 const PING_EVERY: Duration = Duration::from_millis(100);
 const CONFIG_POLL: Duration = Duration::from_millis(500);
@@ -71,9 +81,10 @@ pub fn run_pc() -> Result<()> {
 
     // Before the input thread: see `TrayLoop::new`.
     let tray = TrayLoop::new();
-    // Task 13 passes the drag-and-drop thread.
-    let (input, input_rx) = spawn_input_thread(cfg.clone(), None);
     let (events, events_rx) = unbounded_channel();
+    let dnd = start_dnd(&cfg, &events);
+    let pill = start_pills(&events);
+    let (input, input_rx) = spawn_input_thread(cfg.clone(), dnd.clone());
     bridge_input(input_rx, events.clone())?;
     let clip_link = Arc::new(ClipboardLink::new(cfg.clipboard_max_bytes));
     let clip_events = events.clone();
@@ -97,6 +108,7 @@ pub fn run_pc() -> Result<()> {
             tray: model_tx,
             events: events.clone(),
         },
+        Drags::new(dnd, pill),
     );
     std::thread::Builder::new()
         .name("cj-link".into())
@@ -160,6 +172,10 @@ pub(super) enum Ev {
         sid: u64,
         ev: NetEv,
     },
+    /// From cj-dnd.
+    Dnd(WinDndEv),
+    /// A running pill's close button.
+    PillCancel(DragId),
 }
 
 /// The tray's status line.
@@ -255,10 +271,19 @@ struct App {
     settings: SettingsWindow,
     quit_by: Option<Instant>,
     done: bool,
+    drags: Drags,
+    /// Every session's drag events; taken by `run`.
+    drag_events: Option<UnboundedReceiver<DndEv>>,
 }
 
 impl App {
-    fn new(cfg: Config, config_file: ConfigFile, identity: Identity, ch: Channels) -> App {
+    fn new(
+        cfg: Config,
+        config_file: ConfigFile,
+        identity: Identity,
+        ch: Channels,
+        (drags, drag_events): (Drags, UnboundedReceiver<DndEv>),
+    ) -> App {
         let latency = LatencyStats::new();
         App {
             machine: PcMachine::new(cfg.clone()),
@@ -284,6 +309,8 @@ impl App {
             settings: SettingsWindow::default(),
             quit_by: None,
             done: false,
+            drags,
+            drag_events: Some(drag_events),
         }
     }
 
@@ -293,6 +320,12 @@ impl App {
         let mut config_poll = interval(CONFIG_POLL);
         let mut latency_refresh = interval(LATENCY_REFRESH);
         let mut latency_log = interval(LATENCY_LOG);
+        let mut drag_tick = interval(DRAG_TICK);
+        let mut sweep = interval_at(Instant::now() + SWEEP_EVERY, SWEEP_EVERY);
+        let Some(mut drag_events) = self.drag_events.take() else {
+            return;
+        };
+        self.sweep_temp_dirs(true);
         self.publish();
         loop {
             let (retry_at, quit_by) = (self.retry_at, self.quit_by);
@@ -313,6 +346,9 @@ impl App {
                 }
                 _ = latency_refresh.tick() => self.latency_text = latency_text(&self.latency),
                 _ = latency_log.tick() => self.log_latency(),
+                Some(ev) = drag_events.recv() => self.on_link_dnd(ev).await,
+                _ = drag_tick.tick() => self.drag_tick().await,
+                _ = sweep.tick() => self.sweep_temp_dirs(false),
                 _ = sleep_until(quit_by.unwrap_or_else(Instant::now)), if quit_by.is_some() => {
                     warn!("input thread did not stop in time");
                     break;
@@ -324,6 +360,7 @@ impl App {
             }
             self.publish();
         }
+        self.drags.disconnected();
         self.link = None;
         // Every way out (Quit, input thread gone) closes the settings window.
         self.settings.close();
@@ -337,6 +374,8 @@ impl App {
                 self.exec(action).await;
             } else if let Some(reason) = self.dead.take() {
                 info!("disconnected: {reason}");
+                // Before the machine's cancels and returns.
+                self.drags.disconnected();
                 self.feed(PcEvent::Disconnected);
             } else {
                 return;
@@ -357,25 +396,33 @@ impl App {
                     self.update_config(|c| c.paired_peer = Some(fp));
                 }
             }
-            PcAction::EnterMac { mac_edge, frac, .. } => {
-                // Task 13 passes the riding drag, with the catcher wired.
-                self.send_input(InputCmd::EnterMac { drag: None });
+            PcAction::EnterMac {
+                mac_edge,
+                frac,
+                drag,
+            } => {
+                // The offer goes first, on the same control stream. The
+                // input thread covers the screen with the catcher itself.
+                let drag = match drag {
+                    Some(drag) => self.offer_ride(drag).await,
+                    None => None,
+                };
+                self.send_input(InputCmd::EnterMac { drag });
                 self.control(Control::Enter {
                     edge: mac_edge,
                     frac,
-                    drag: None,
+                    drag,
                 })
                 .await;
             }
             PcAction::ReturnToPc { pc_frac } => self.send_input(InputCmd::ReturnToPc { pc_frac }),
             PcAction::SendReleaseAll => self.control(Control::ReleaseAll).await,
             PcAction::Reconnect => self.reconnect(),
-            // No drag rides yet: Task 13 wires these to the catcher and `DoDragDrop`.
             PcAction::CancelSourceDrag { .. }
             | PcAction::SourceDragHome { .. }
             | PcAction::StartIncomingDrag { .. }
             | PcAction::CancelIncomingDrag { .. }
-            | PcAction::RefuseIncomingDrag { .. } => {}
+            | PcAction::RefuseIncomingDrag { .. } => self.exec_drag(action).await,
         }
     }
 
@@ -419,6 +466,8 @@ impl App {
                     self.on_net(ev);
                 }
             }
+            Ev::Dnd(ev) => self.on_dnd(ev).await,
+            Ev::PillCancel(drag) => self.on_pill_cancel(drag).await,
         }
     }
 
@@ -449,10 +498,10 @@ impl App {
 
     fn on_net(&mut self, ev: NetEv) {
         match ev {
-            NetEv::Control(Control::Leave { frac, .. }) => self.feed(PcEvent::MacLeave {
+            NetEv::Control(Control::Leave { frac, drag }) => self.feed(PcEvent::MacLeave {
                 frac,
-                drag: None,
-                game: false,
+                drag,
+                game: game_locked(&probe_game()),
             }),
             NetEv::Control(Control::MacReady { ready }) => {
                 if ready != self.machine.mac_ready() {
@@ -463,8 +512,18 @@ impl App {
             NetEv::Control(Control::PairConfirm { accepted }) => {
                 self.on_remote_pair_answer(accepted)
             }
+            NetEv::Control(
+                c @ (Control::DragOffer { .. }
+                | Control::DragCancel { .. }
+                | Control::DragDropped { .. }
+                | Control::FileFetch { .. }
+                | Control::DragFinished { .. }),
+            ) => self.on_drag_control(c),
             NetEv::Control(other) => debug!(?other, "ignoring unexpected control message"),
-            NetEv::Pong { rtt, at } => self.latency.record(at, rtt),
+            NetEv::Pong { rtt, at } => {
+                self.latency.record(at, rtt);
+                self.on_rtt(rtt, at);
+            }
             NetEv::Clipboard(d) => {
                 if self.paired_session().is_some()
                     && !d.is_empty()
@@ -473,8 +532,7 @@ impl App {
                     warn!("clipboard bridge is gone; clipboard from the Mac dropped");
                 }
             }
-            // Dropping it refuses the stream.
-            NetEv::Files(_) => {}
+            NetEv::Files(files) => self.on_files(files),
             NetEv::Closed(reason) => self.mark_dead(reason),
         }
     }
@@ -525,6 +583,7 @@ impl App {
             &self.ch.events,
         );
         info!(peer = %live.peer_name, paired = code.is_none(), "connected");
+        self.drags.connect(&live.session);
         self.link = Some(live);
         self.reset_latency();
         match code {
@@ -544,6 +603,7 @@ impl App {
 
     /// Drops the session (if any) and schedules the next attempt.
     fn reconnect(&mut self) {
+        self.drags.disconnected();
         self.link = None;
         self.dead = None;
         self.reset_latency();
@@ -758,6 +818,8 @@ impl App {
             .clip_link
             .connected
             .store(self.paired_session().is_some(), Ordering::Relaxed);
+        // Before any crossing: the machine crosses only once paired.
+        self.drags.set_session_up(self.paired_session().is_some());
         let peer = self.link.as_ref().map(|l| l.peer_name.as_str());
         let model = TrayModel {
             status: status_text(

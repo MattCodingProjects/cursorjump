@@ -3,28 +3,34 @@
 pub mod clipboard_bridge;
 pub mod config_file;
 #[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the apps drive drags through it in later tasks")
+    all(not(test), not(windows)),
+    expect(
+        dead_code,
+        reason = "the Mac app drives drags through it in later tasks"
+    )
 )]
 pub mod dnd_link;
 #[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the catchers fetch dragged links through it")
+    all(not(test), not(windows)),
+    expect(
+        dead_code,
+        reason = "the Mac's catcher fetches dragged links through it"
+    )
 )]
 pub mod link_fetch;
 #[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the pill windows draw with it in later tasks")
+    all(not(test), not(windows)),
+    expect(
+        dead_code,
+        reason = "the Mac's pill windows draw with it in a later task"
+    )
 )]
 pub mod pill_render;
 pub mod session_tasks;
 pub mod settings_window;
 #[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "dnd_link and the OS drag code use it in later tasks"
-    )
+    all(not(test), not(windows)),
+    expect(dead_code, reason = "the Mac app uses it in later tasks")
 )]
 pub mod transfer;
 

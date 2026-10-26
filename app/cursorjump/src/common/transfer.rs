@@ -40,6 +40,10 @@ pub type SharedPacer = Arc<std::sync::Mutex<Pacer>>;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Dest {
     /// Exactly this path (a Mac file promise's URL).
+    #[cfg_attr(
+        all(windows, not(test)),
+        expect(dead_code, reason = "only the Mac receives into a file promise")
+    )]
     Exact(PathBuf),
     /// In this folder, under the item's sanitized name.
     InDir(PathBuf),

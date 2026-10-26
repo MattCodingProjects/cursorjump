@@ -35,6 +35,10 @@ pub const SHADOW_PAD: f32 = 12.0;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backdrop {
     /// A blur view (the Mac).
+    #[cfg_attr(
+        all(windows, not(test)),
+        expect(dead_code, reason = "only the Mac's pills are blurred")
+    )]
     Blurred,
     /// Nothing: a layered window can't blur what's behind it (Windows).
     Opaque,

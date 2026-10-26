@@ -4,24 +4,10 @@ pub mod autostart;
 mod bridges;
 pub mod clipboard;
 pub mod cursor;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the app starts the drag-and-drop thread in a later task"
-    )
-)]
 pub mod dnd;
 pub mod input_thread;
 mod link;
 pub mod monitors;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the app shows drags from the Mac through it in a later task"
-    )
-)]
 mod pill;
 pub mod probe;
 mod settings_window;

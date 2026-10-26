@@ -1238,7 +1238,7 @@ pub(super) fn rect_center(r: &Rect) -> (i32, i32) {
     ((r.left + r.right) / 2, (r.top + r.bottom) / 2)
 }
 
-fn cursor_pos() -> Option<(i32, i32)> {
+pub(super) fn cursor_pos() -> Option<(i32, i32)> {
     let mut pt = POINT::default();
     // SAFETY: valid out-pointer to a stack local.
     unsafe { GetCursorPos(&mut pt) }.ok().map(|()| (pt.x, pt.y))
