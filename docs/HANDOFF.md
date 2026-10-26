@@ -2,7 +2,7 @@
 
 ## Phase 2 (file drag-and-drop): all code done; acceptance (Task 18) next
 
-Last updated: 2026-10-26, on the Mac. Branch **`phase2`** holds every task's code, reviewed. Nothing from it is installed yet. The repo is now **public** (the user's choice, for free CI minutes).
+Last updated: 2026-10-26 (evening), on the PC. Branch **`phase2`** holds every task's code, reviewed. **Both machines now run the `phase2` build** (PC installed from 875f8ee and connected to the Mac). Task 18 acceptance is in progress, driven by the Mac session; check the ledger and `docs/ACCEPTANCE.md` for what has been ticked off. The repo is now **public** (the user's choice, for free CI minutes).
 
 - **Spec:** `docs/superpowers/specs/2026-10-25-file-drag-and-drop-design.md`
 - **Plan:** `docs/superpowers/plans/2026-10-25-file-drag-and-drop.md` (Tasks 15–16 carry amendment blocks from the Mac spike)
@@ -28,6 +28,8 @@ Last updated: 2026-10-26, on the Mac. Branch **`phase2`** holds every task's cod
      - the ghost image follows a PC-mouse Chrome drag on the Mac;
      - the earlier PC open item (drag image at the park point) was fixed in 39f70d9, so confirm it.
   4. Then the final whole-branch review (fable), delete the spike examples, update this file, and merge.
+- **Open issue (user-reported, not yet worked on):** with **Roblox** open on the PC (at any window size), clicks made on the Mac also land in Roblox, and Roblox draws its cursor at the PC's park point (the screen centre). Only Roblox does it, and it has been there since the phase 1 build. Workaround: close or minimise Roblox before moving to the Mac. The user asked to leave it for now.
+- **PC drag-image fix (39f70d9) still needs its eye check:** during a PC→Mac drag, confirm no frozen file icon or "+ Copy" stays at the centre of the PC screen. If it does, the smoke test compares three hiding modes: `CJ_SMOKE_MODE=ride`, `CJ_SMOKE_IMAGE=desc-noimage|nodesc|show`, then `cargo test -p cursorjump smoke_catcher_logs_offer -- --ignored --nocapture`.
 - **Polish backlog** (in the ledger): Mac→PC web-link drags (R55), swapped mouse buttons, uniquifying sanitized names, full Unicode case folding, and a few rare few-ms races.
 - **Quarantine:** files received on the Mac get no quarantine flag (R22). They are treated like a local copy.
 

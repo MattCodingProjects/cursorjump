@@ -285,3 +285,10 @@ Task 17: fix round 1 DONE 78b7bef (305 app). Re-review (opus) dispatched.
 Task 17: re-review all addressed (the cj-inject "hold" of source events checked for deadlock/loss/growth: sound). New Minors fixed by the controller: a Leave carries only the PC's own drag (riding here or still known to the link), never an un-offered catcher drag; a test comment corrected. 305 pass; macOS + Windows-target clippy clean.
 Task 17: complete (038ad6c, 78b7bef, controller fix). ALL CODE TASKS DONE on the Mac (1b, 14–17). Full Mac workspace: 579 tests pass. Next: Task 18 acceptance with the user on both machines (install both together, protocol v3), then the final whole-branch review (fable) and merge.
 Polish backlog adds: R55 Mac→PC web-link drags; M6 promise writes hold queue threads while waiting; residual few-ms races (Esc vs session end; live-session go-home Ended vs SendLeave).
+
+## PC session additions (2026-10-26, end of day)
+Task 11c (polish): hide Explorer's drag image + copy cursor while riding — dispatched to impl-task11 (investigate Show(FALSE), DropDescription NOIMAGE, smoke switch; no acting on other processes' windows).
+Task 11c: DONE_WITH_CONCERNS 39f70d9 (249 pass; CI 40311638961 green) — DropDescription NOIMAGE while parked + Show(false) per DragOver; awaiting the user's smoke.
+Task 18 (from the Mac session): PC installed from phase2 875f8ee at 17:52Z.
+Open issue (user, 2026-10-26): with Roblox open on the PC (any size), clicks made on the Mac also register in Roblox; only Roblox does it; present since the phase 1 build. Not worked on in this session.
+Task 11c: its hands-on check is still to do with the user (smoke_catcher_logs_offer in ride mode with CJ_SMOKE_IMAGE=desc-noimage|nodesc|show, or the Task 18 PC→Mac drag: is a file icon or "+ Copy" left frozen at the PC's screen centre?).
