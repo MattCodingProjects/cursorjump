@@ -20,6 +20,7 @@ Last updated: 2026-10-26, on the PC. Branch **`phase2`** is green in CI on Windo
      - The Task 17 bounce path must feed the real drag and suppress BeginDrag/CancelDrag.
      - The Mac injector must count the PC-held left button from BeginDrag on.
      - Reuse `common::link_fetch` for Discord/web links.
+- **PC hands-on demos done (2026-10-26):** the pill, the catcher and the incoming drag all passed with the user. One cosmetic issue is open: while a PC drag rides on the Mac, Explorer's drag image and copy cursor stay visible at the PC park point (see the ledger's Hands-on lines). Fix or accept it before acceptance.
 - **Then:** Task 18, acceptance with the user on both machines. This includes the hands-on smoke tests already built on the PC (pill, catcher, incoming drag; see the ledger's "Hands-on list"). After that, the final whole-branch review, then merge.
 - **Protocol is v3.** Install both machines together, and only once phase 2 is finished. A v2 build and a v3 build won't connect to each other.
 
