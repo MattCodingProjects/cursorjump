@@ -71,7 +71,8 @@ pub(super) const fn not_left(b: MouseButton) -> bool {
     }
 }
 
-/// Every button, for `not_left`; a test checks that none is missing.
+/// Every button, for `not_left`. Keep it in step with `MouseButton`: a new
+/// variant fails `not_left` to compile, but nothing checks this list.
 pub(super) const BUTTONS: [MouseButton; 5] = [
     MouseButton::Left,
     MouseButton::Right,
