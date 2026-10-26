@@ -194,16 +194,26 @@ mod tests {
         hold_back(&mut p, t0 + ms(1050));
         p.on_rtt(ms(2), t0 + ms(1100));
         assert_eq!(p.rate(), 18_000_000);
-        // A spike the 200 ms rule didn't act on still clears the limited flag
-        // and restarts the clock.
-        hold_back(&mut p, t0 + ms(1120));
+        // A spike the 200 ms rule didn't act on still restarts the clock:
+        // only the 50 ms since it counts.
         p.on_rtt(ms(20), t0 + ms(1150));
         assert_eq!(p.rate(), 18_000_000);
+        hold_back(&mut p, t0 + ms(1190));
         p.on_rtt(ms(2), t0 + ms(1200));
-        assert_eq!(p.rate(), 18_000_000);
-        hold_back(&mut p, t0 + ms(1220));
-        p.on_rtt(ms(2), t0 + ms(1300));
-        assert_eq!(p.rate(), 22_000_000);
+        assert_eq!(p.rate(), 20_000_000);
+    }
+
+    #[test]
+    fn a_spike_clears_the_limited_flag() {
+        let t0 = Instant::now();
+        let mut p = Pacer::new(t0);
+        p.on_rtt(ms(2), t0);
+        hold_back(&mut p, t0 + ms(50));
+        p.on_rtt(ms(20), t0 + ms(100));
+        assert_eq!(p.rate(), 14_000_000);
+        // Held back before the spike, not since: no ramp.
+        p.on_rtt(ms(2), t0 + ms(200));
+        assert_eq!(p.rate(), 14_000_000);
     }
 
     #[test]
