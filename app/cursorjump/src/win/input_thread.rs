@@ -944,6 +944,11 @@ impl State {
         if self.mac.is_none() {
             return false;
         }
+        // Volume keys always drive the PC's master volume: let them through
+        // before the held set, the return hotkey and the router see them.
+        if is_volume_key(info.vkCode) {
+            return false;
+        }
         let down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
         if DIAGNOSE_LOG.load(Ordering::Relaxed) {
             info!(
@@ -1309,6 +1314,11 @@ fn is_down(vk: u16) -> bool {
     (unsafe { GetAsyncKeyState(vk as i32) } as u16) & 0x8000 != 0
 }
 
+/// VK_VOLUME_MUTE, VK_VOLUME_DOWN, VK_VOLUME_UP.
+fn is_volume_key(vk: u32) -> bool {
+    matches!(vk, 0xAD..=0xAF)
+}
+
 /// Any mouse button but the left.
 fn other_buttons_held() -> bool {
     [VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2]
@@ -1510,6 +1520,41 @@ mod tests {
     #[test]
     fn key_hook_remote_key_is_swallowed_and_sent() {
         let (mut s, rx) = on_mac(&[]);
+        assert!(key(&mut s, W, true));
+        assert!(key(&mut s, W, false));
+        assert!(matches!(
+            drain(&rx)[..],
+            [
+                InputMsg::Key {
+                    mac_keycode: 0x0D,
+                    down: true
+                },
+                InputMsg::Key {
+                    mac_keycode: 0x0D,
+                    down: false
+                }
+            ]
+        ));
+    }
+
+    #[test]
+    fn key_hook_volume_keys_pass_to_windows_and_stay_off_the_mac() {
+        let (mut s, rx) = on_mac(&[]);
+        // (vkCode, scanCode) for mute, volume down, volume up; all extended.
+        for (vk, scancode) in [(0xADu32, 0x20u32), (0xAE, 0x2E), (0xAF, 0x30)] {
+            for msg in [WM_KEYDOWN, WM_KEYUP] {
+                let info = KBDLLHOOKSTRUCT {
+                    vkCode: vk,
+                    scanCode: scancode,
+                    flags: LLKHF_EXTENDED,
+                    ..Default::default()
+                };
+                assert!(!s.on_key_hook(msg, &info), "vk {vk:#04x} passes to Windows");
+            }
+        }
+        assert!(drain(&rx).is_empty(), "nothing sent to the Mac");
+        assert!(s.held.is_empty(), "volume keys never enter the held set");
+        // A following key is still swallowed and sent.
         assert!(key(&mut s, W, true));
         assert!(key(&mut s, W, false));
         assert!(matches!(
