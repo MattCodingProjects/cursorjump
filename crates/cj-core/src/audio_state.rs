@@ -63,6 +63,9 @@ impl MacAudio {
 
     /// Forgets the PC status unless still within `GRACE` of the drop.
     pub fn connected(&mut self, now: Instant) {
+        if self.connected {
+            return;
+        }
         let within = self
             .dropped_at
             .is_some_and(|t| now.saturating_duration_since(t) < GRACE);
@@ -117,7 +120,7 @@ impl MacAudio {
             sound: tap && self.connected,
             mic: mic_default && self.mic_listening && self.connected,
         };
-        let note = if self.sharing && self.connected {
+        let note = if self.sharing && self.connected && self.pc.is_some() {
             Some(if self.capture == Capture::Denied {
                 NOTE_CAPTURE_DENIED
             } else if out != DeviceState::Ok {
@@ -206,6 +209,8 @@ mod tests {
         a.disconnected(t);
         let p = a.plan(t + GRACE);
         assert!(!p.tap && !p.mic_default);
+        assert_eq!(p.want, AudioWant::default());
+        assert_eq!(p.note, None);
         assert_eq!(p.recheck_at, None);
     }
 
@@ -311,5 +316,28 @@ mod tests {
         let p = a.plan(t);
         assert!(!p.tap && p.mic_default);
         assert_eq!(p.note, Some(NOTE_NO_PC_OUTPUT));
+    }
+
+    #[test]
+    fn no_note_until_the_pc_reports() {
+        let t = Instant::now();
+        let mut a = MacAudio::new(true);
+        a.set_capture(Capture::Allowed);
+        a.set_driver(true);
+        a.connected(t);
+        assert_eq!(a.plan(t).note, None);
+        a.set_pc(AudioStatus {
+            output: DeviceState::Missing,
+            mic: DeviceState::Ok,
+        });
+        assert_eq!(a.plan(t).note, Some(NOTE_NO_PC_OUTPUT));
+    }
+
+    #[test]
+    fn connected_twice_keeps_the_pc_status() {
+        let t = Instant::now();
+        let mut a = up(t);
+        a.connected(t + Duration::from_secs(1));
+        assert!(a.plan(t).tap);
     }
 }
