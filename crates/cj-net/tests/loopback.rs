@@ -521,10 +521,9 @@ async fn audio_datagrams_cross() {
         seq: i,
         pcm: vec![i as u8; 960],
     };
+    // One at a time: the backlog cap admits only a few datagrams at once.
     for i in 0..10 {
         assert!(server.send_audio(&mk(i)).unwrap());
-    }
-    for i in 0..10 {
         let got = timeout(T, client.recv_datagram()).await.unwrap().unwrap();
         assert_eq!(got, mk(i));
     }
