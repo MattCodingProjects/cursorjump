@@ -45,6 +45,8 @@ objc2-core-graphics = { version = "0.3.2", default-features = false, features = 
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "block2", "NSArray", "NSData", "NSDictionary", "NSError", "NSGeometry", "NSNotification", "NSObjCRuntime", "NSOperation", "NSProcessInfo", "NSString", "NSThread", "NSURL", "NSValue"] }
 objc2-io-kit = { version = "0.3.2", default-features = false, features = ["std", "pwr_mgt"] }
 objc2-uniform-type-identifiers = { version = "0.3.2", default-features = false, features = ["std", "UTType"] }
+# The audio restore file (mac/audio/devices.rs).
+toml = "0.8"
 # SIGTERM (launchctl bootout, logout) runs the normal quit.
 tokio = { version = "1.53.3", features = ["signal"] }
 

@@ -614,6 +614,7 @@ dependencies = [
  "tiny-skia",
  "tokio",
  "tokio-util",
+ "toml",
  "tracing",
  "tracing-subscriber",
  "tray-icon",
