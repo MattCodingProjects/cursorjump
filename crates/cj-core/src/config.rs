@@ -17,6 +17,8 @@ pub struct Config {
     pub autostart: bool,
     /// Mac only.
     pub reduce_wifi_hiccups: bool,
+    /// Mac only.
+    pub audio_sharing: bool,
     pub clipboard_max_bytes: u64,
     /// Hex fingerprint of the paired peer.
     pub paired_peer: Option<String>,
@@ -36,6 +38,7 @@ impl Default for Config {
             paused: false,
             autostart: true,
             reduce_wifi_hiccups: false,
+            audio_sharing: true,
             clipboard_max_bytes: 33_554_432,
             paired_peer: None,
             manual_peer_addr: None,
@@ -167,5 +170,23 @@ mod tests {
         assert_eq!(c.pointer_speed, 4.0);
         assert_eq!(c.scroll_speed, 0.25);
         assert_eq!(c.edge_offset, -0.5);
+    }
+
+    #[test]
+    fn audio_sharing_defaults_on() {
+        assert!(Config::default().audio_sharing);
+    }
+
+    #[test]
+    fn old_file_without_audio_sharing_loads_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        std::fs::write(
+            &p,
+            "paused = true
+",
+        )
+        .unwrap();
+        assert!(Config::load(&p).audio_sharing);
     }
 }

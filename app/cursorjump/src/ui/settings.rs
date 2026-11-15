@@ -58,6 +58,7 @@ fn merge_edits(before: &Config, after: &Config, mut disk: Config) -> Config {
         paused,
         autostart,
         reduce_wifi_hiccups,
+        audio_sharing,
         clipboard_max_bytes,
         paired_peer,
         manual_peer_addr,

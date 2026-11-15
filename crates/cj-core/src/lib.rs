@@ -1,5 +1,6 @@
 //! Core types and logic for CursorJump.
 pub mod audio;
+pub mod audio_state;
 pub mod clipboard;
 pub mod config;
 pub mod dnd;
