@@ -3,11 +3,12 @@
 //!
 //! Every break in the audio (a lost packet, an underrun, skipped packets, a
 //! start) fades the 1 ms before it out and the 1 ms after it in. To fade out
-//! *before* a break, the output runs 1 ms behind: `delay` holds the last
+//! *before* a break, the output runs 1 ms behind: `Fader` holds the last
 //! `FADE_FRAMES` frames produced, and a break scales them down before they
 //! are handed out.
-use std::collections::VecDeque;
-
+//!
+//! Nothing allocates or frees after `new`: packets are copied into a ring of
+//! fixed slots, so `push` and `pull` are safe on a real-time audio thread.
 use super::receiver::AudioStats;
 use super::{AudioStream, RATE};
 
@@ -29,17 +30,32 @@ const OVERFLOW_MARGIN: usize = 60 * FRAMES_PER_MS;
 /// new sequence.
 const MAX_BEHIND: i32 = 100;
 const MAX_AHEAD: i32 = 1000;
+/// The ring holds 1 s of packets: far more than the largest target plus the
+/// overflow margin (140 ms). A packet too far ahead to fit also starts a new
+/// sequence, since everything queued before it is stale.
+const RING_FRAMES: usize = RATE as usize;
+/// Most frames the fader holds beyond its delay; `pull` works in pieces of
+/// this size.
+const PIECE_FRAMES: usize = 480;
 
 #[derive(Debug, Clone)]
 pub(crate) struct JitterBuffer {
     channels: usize,
     packet_frames: usize,
-    /// One slot per sequence number from `head` on; `None` is a packet not
-    /// received (yet). Never ends in `None`.
-    slots: VecDeque<Option<Vec<f32>>>,
-    /// Sequence number of `slots[0]`, the slot playing or next to play.
+    /// One slot of `packet_frames` frames per sequence number, `capacity`
+    /// slots in all.
+    ring: Vec<f32>,
+    /// Whether each slot holds a packet. Always false outside the `len`
+    /// slots from `head_slot`.
+    present: Vec<bool>,
+    capacity: usize,
+    /// The ring slot of `head`.
+    head_slot: usize,
+    /// Slots in use from `head_slot` on; the last one is always present.
+    len: usize,
+    /// Sequence number of the slot playing or next to play.
     head: u32,
-    /// Frames of `slots[0]` already played.
+    /// Frames of the head slot already played.
     pos: usize,
     /// The last slot played, concealed or skipped; a packet at or before it
     /// is late. `None` until this sequence has played anything.
@@ -50,13 +66,7 @@ pub(crate) struct JitterBuffer {
     target: usize,
     /// Frames played since the last underrun or calm step.
     calm: usize,
-    /// The last `FADE_FRAMES` frames produced, interleaved, not yet handed
-    /// out (more, partway through a `pull`).
-    delay: Vec<f32>,
-    /// The packet the last frame produced came from; `None` for silence.
-    last_source: Option<u32>,
-    /// Frames of fade-in still to apply.
-    fade_in_left: usize,
+    fader: Fader,
     received: u64,
     lost: u64,
     late: u64,
@@ -67,33 +77,57 @@ pub(crate) struct JitterBuffer {
 impl JitterBuffer {
     pub(crate) fn new(stream: AudioStream) -> Self {
         let channels = stream.channels();
-        JitterBuffer {
+        let capacity = RING_FRAMES / stream.packet_frames();
+        let mut jb = JitterBuffer {
             channels,
             packet_frames: stream.packet_frames(),
-            slots: VecDeque::new(),
+            ring: vec![0.0; capacity * stream.packet_samples()],
+            present: vec![false; capacity],
+            capacity,
+            head_slot: 0,
+            len: 0,
             head: 0,
             pos: 0,
             last_played: None,
             playing: false,
             target: INITIAL_TARGET,
             calm: 0,
-            delay: vec![0.0; FADE_FRAMES * channels],
-            last_source: None,
-            fade_in_left: 0,
+            fader: Fader::new(channels),
             received: 0,
             lost: 0,
             late: 0,
             underruns: 0,
             skips: 0,
-        }
+        };
+        jb.reset();
+        jb
     }
 
-    /// Queues packet `seq`. A packet of the wrong length is padded with
-    /// silence or cut to length.
-    pub(crate) fn push(&mut self, seq: u32, mut samples: Vec<f32>) {
+    /// Back to the state of a new buffer, counters included, without
+    /// allocating.
+    pub(crate) fn reset(&mut self) {
+        self.present.fill(false);
+        self.head_slot = 0;
+        self.len = 0;
+        self.head = 0;
+        self.pos = 0;
+        self.last_played = None;
+        self.playing = false;
+        self.target = INITIAL_TARGET;
+        self.calm = 0;
+        self.fader.reset();
+        self.received = 0;
+        self.lost = 0;
+        self.late = 0;
+        self.underruns = 0;
+        self.skips = 0;
+    }
+
+    /// Copies packet `seq` into its slot. A packet of the wrong length is
+    /// padded with silence or cut to length.
+    pub(crate) fn push(&mut self, seq: u32, samples: &[f32]) {
         self.received += 1;
-        samples.resize(self.packet_frames * self.channels, 0.0);
-        let fresh = self.slots.is_empty() && self.last_played.is_none();
+        let fresh = self.len == 0 && self.last_played.is_none();
         let ahead = seq.wrapping_sub(self.head) as i32;
         if !fresh && !(-MAX_BEHIND..=MAX_AHEAD).contains(&ahead) {
             self.new_sequence();
@@ -104,46 +138,53 @@ impl JitterBuffer {
             self.late += 1;
             return;
         }
-        if self.slots.is_empty() {
+        if self.len == 0 {
             // A new sequence, or the first packet after an underrun: play
             // from here.
-            self.head = seq;
-            self.slots.push_back(Some(samples));
+            self.anchor(seq, samples);
             return;
         }
         let ahead = seq.wrapping_sub(self.head) as i32;
         if ahead < 0 {
             // Earlier than anything queued, and nothing played since: this
             // only happens while waiting to start.
-            for _ in ahead..0 {
-                self.slots.push_front(None);
+            let before = ahead.unsigned_abs() as usize;
+            if self.len + before > self.capacity {
+                self.late += 1;
+                return;
             }
+            self.head_slot = (self.head_slot + self.capacity - before) % self.capacity;
+            self.len += before;
             self.head = seq;
-            self.slots[0] = Some(samples);
+            self.store(0, samples);
             return;
         }
         let i = ahead as usize;
-        if i >= self.slots.len() {
-            self.slots.resize(i + 1, None);
+        if i >= self.capacity {
+            self.new_sequence();
+            self.anchor(seq, samples);
+            return;
         }
-        if self.slots[i].is_some() {
+        self.len = self.len.max(i + 1);
+        if self.present[self.slot(i)] {
             self.late += 1;
         } else {
-            self.slots[i] = Some(samples);
+            self.store(i, samples);
         }
     }
 
     /// Fills `out` (interleaved) with audio or silence.
     pub(crate) fn pull(&mut self, out: &mut [f32]) {
-        let frames = out.len() / self.channels;
-        let mut left = frames;
-        while left > 0 {
-            left -= self.produce(left);
+        let n = out.len() - out.len() % self.channels;
+        let (whole, rest) = out.split_at_mut(n);
+        for piece in whole.chunks_mut(PIECE_FRAMES * self.channels) {
+            let mut left = piece.len() / self.channels;
+            while left > 0 {
+                left -= self.produce(left);
+            }
+            self.fader.take(piece);
         }
-        let n = frames * self.channels;
-        out[..n].copy_from_slice(&self.delay[..n]);
-        self.delay.drain(..n);
-        out[n..].fill(0.0);
+        rest.fill(0.0);
     }
 
     pub(crate) fn is_playing(&self) -> bool {
@@ -152,7 +193,7 @@ impl JitterBuffer {
 
     /// Frames queued from the play position on, gaps included.
     pub(crate) fn fill_frames(&self) -> usize {
-        (self.slots.len() * self.packet_frames).saturating_sub(self.pos)
+        (self.len * self.packet_frames).saturating_sub(self.pos)
     }
 
     pub(crate) fn target_frames(&self) -> usize {
@@ -171,47 +212,77 @@ impl JitterBuffer {
         }
     }
 
+    /// The ring slot `i` slots after the head.
+    fn slot(&self, i: usize) -> usize {
+        (self.head_slot + i) % self.capacity
+    }
+
+    fn store(&mut self, i: usize, samples: &[f32]) {
+        let slot = self.slot(i);
+        let size = self.packet_frames * self.channels;
+        let dst = &mut self.ring[slot * size..(slot + 1) * size];
+        let n = samples.len().min(size);
+        dst[..n].copy_from_slice(&samples[..n]);
+        dst[n..].fill(0.0);
+        self.present[slot] = true;
+    }
+
+    /// Starts an empty queue at `seq`.
+    fn anchor(&mut self, seq: u32, samples: &[f32]) {
+        self.head = seq;
+        self.len = 1;
+        self.store(0, samples);
+    }
+
+    fn pop_front(&mut self) {
+        self.present[self.head_slot] = false;
+        self.head_slot = (self.head_slot + 1) % self.capacity;
+        self.len -= 1;
+        self.head = self.head.wrapping_add(1);
+    }
+
     /// Drops the queue and waits for a new start.
     fn new_sequence(&mut self) {
-        self.slots.clear();
+        while self.len > 0 {
+            self.pop_front();
+        }
         self.pos = 0;
         self.last_played = None;
         self.playing = false;
     }
 
-    /// Adds up to `max` frames to `delay` and returns how many it added.
+    /// Adds up to `max` frames to the fader and returns how many it added.
     fn produce(&mut self, max: usize) -> usize {
         if !self.playing {
-            if self.slots.is_empty() || self.fill_frames() < self.target {
-                self.emit_silence(max);
+            if self.len == 0 || self.fill_frames() < self.target {
+                self.fader.silence(max);
                 return max;
             }
             self.playing = true;
         }
         if self.pos == 0 {
-            if self.slots.is_empty() {
+            if self.len == 0 {
                 self.underrun();
                 return 0;
             }
             self.skip_overflow();
             self.last_played = Some(self.head);
-            if self.slots[0].is_none() {
+            if !self.present[self.head_slot] {
                 self.lost += 1;
             }
         }
         let n = max.min(self.packet_frames - self.pos);
-        match self.slots[0].take() {
-            Some(packet) => {
-                let ch = self.channels;
-                self.emit_audio(self.head, &packet[self.pos * ch..(self.pos + n) * ch]);
-                self.slots[0] = Some(packet);
-            }
-            None => self.emit_silence(n),
+        if self.present[self.head_slot] {
+            let ch = self.channels;
+            let start = (self.head_slot * self.packet_frames + self.pos) * ch;
+            self.fader
+                .audio(self.head, &self.ring[start..start + n * ch]);
+        } else {
+            self.fader.silence(n);
         }
         self.pos += n;
         if self.pos == self.packet_frames {
-            self.slots.pop_front();
-            self.head = self.head.wrapping_add(1);
+            self.pop_front();
             self.pos = 0;
         }
         self.calm += n;
@@ -236,14 +307,49 @@ impl JitterBuffer {
             return;
         }
         while self.fill_frames() >= self.target + self.packet_frames {
-            self.slots.pop_front();
             self.last_played = Some(self.head);
-            self.head = self.head.wrapping_add(1);
+            self.pop_front();
         }
         self.skips += 1;
     }
+}
 
-    fn emit_audio(&mut self, seq: u32, samples: &[f32]) {
+/// Delays the output by `FADE_FRAMES` so that a break can fade out the
+/// frames before it, and fades in the frames after it.
+#[derive(Debug, Clone)]
+struct Fader {
+    channels: usize,
+    /// Frames produced and not yet taken, interleaved: at least
+    /// `FADE_FRAMES`, at most `FADE_FRAMES + PIECE_FRAMES`.
+    buf: Vec<f32>,
+    frames: usize,
+    /// The packet the last frame produced came from; `None` for silence.
+    last_source: Option<u32>,
+    /// Frames of fade-in still to apply.
+    fade_in_left: usize,
+}
+
+impl Fader {
+    fn new(channels: usize) -> Self {
+        Fader {
+            channels,
+            buf: vec![0.0; (FADE_FRAMES + PIECE_FRAMES) * channels],
+            frames: FADE_FRAMES,
+            last_source: None,
+            fade_in_left: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.buf.fill(0.0);
+        self.frames = FADE_FRAMES;
+        self.last_source = None;
+        self.fade_in_left = 0;
+    }
+
+    /// Adds frames of packet `seq`; a packet that doesn't follow the last
+    /// one is a break.
+    fn audio(&mut self, seq: u32, samples: &[f32]) {
         let follows =
             self.last_source == Some(seq) || self.last_source == Some(seq.wrapping_sub(1));
         if !follows {
@@ -251,31 +357,42 @@ impl JitterBuffer {
             self.fade_in_left = FADE_FRAMES;
         }
         self.last_source = Some(seq);
-        let fading = self.fade_in_left.min(samples.len() / self.channels) * self.channels;
-        let (fade, rest) = samples.split_at(fading);
-        for frame in fade.chunks_exact(self.channels) {
+        let start = self.frames * self.channels;
+        let dst = &mut self.buf[start..start + samples.len()];
+        dst.copy_from_slice(samples);
+        let fading = self.fade_in_left.min(samples.len() / self.channels);
+        for frame in dst[..fading * self.channels].chunks_mut(self.channels) {
             self.fade_in_left -= 1;
             let gain = (FADE_FRAMES - self.fade_in_left) as f32 / (FADE_FRAMES + 1) as f32;
-            self.delay.extend(frame.iter().map(|s| s * gain));
+            frame.iter_mut().for_each(|s| *s *= gain);
         }
-        self.delay.extend_from_slice(rest);
+        self.frames += samples.len() / self.channels;
     }
 
-    fn emit_silence(&mut self, frames: usize) {
+    fn silence(&mut self, frames: usize) {
         if self.last_source.take().is_some() {
             self.fade_out_tail();
         }
-        let len = self.delay.len() + frames * self.channels;
-        self.delay.resize(len, 0.0);
+        let start = self.frames * self.channels;
+        self.buf[start..start + frames * self.channels].fill(0.0);
+        self.frames += frames;
     }
 
     /// Fades the last `FADE_FRAMES` frames produced down towards 0.
     fn fade_out_tail(&mut self) {
         let ch = self.channels;
-        let start = self.delay.len() - FADE_FRAMES * ch;
-        for (i, s) in self.delay[start..].iter_mut().enumerate() {
+        let end = self.frames * ch;
+        for (i, s) in self.buf[end - FADE_FRAMES * ch..end].iter_mut().enumerate() {
             *s *= (FADE_FRAMES - i / ch) as f32 / (FADE_FRAMES + 1) as f32;
         }
+    }
+
+    /// Hands out the oldest `out.len()` samples, keeping the delay.
+    fn take(&mut self, out: &mut [f32]) {
+        let n = out.len();
+        out.copy_from_slice(&self.buf[..n]);
+        self.buf.copy_within(n..self.frames * self.channels, 0);
+        self.frames -= n / self.channels;
     }
 }
 
@@ -317,7 +434,7 @@ mod tests {
     /// Push one packet and pull one packet's worth, like a sender and a
     /// sound card running in step.
     fn step(jb: &mut JitterBuffer, seq: u32) -> Vec<f32> {
-        jb.push(seq, packet(seq));
+        jb.push(seq, &packet(seq));
         pull(jb, PF)
     }
 
@@ -325,14 +442,14 @@ mod tests {
     fn jitter_waits_for_the_target_then_plays_in_order() {
         let mut jb = buffer();
         for seq in [3, 1, 2, 0, 4] {
-            jb.push(seq, packet(seq));
+            jb.push(seq, &packet(seq));
             assert!(
                 pull(&mut jb, 10).iter().all(|&s| s == 0.0),
                 "25 ms is short of the target"
             );
         }
         for seq in 5..=9 {
-            jb.push(seq, packet(seq));
+            jb.push(seq, &packet(seq));
         }
         let out = pull(&mut jb, 10 * PF);
         let fade = FADE_FRAMES * CH;
@@ -351,16 +468,16 @@ mod tests {
         let mut clean = buffer();
         let mut messy = buffer();
         for seq in 0..6 {
-            clean.push(seq, packet(seq));
-            messy.push(seq, packet(seq));
+            clean.push(seq, &packet(seq));
+            messy.push(seq, &packet(seq));
         }
-        messy.push(2, vec![0.9; PF * CH]);
+        messy.push(2, &[0.9; PF * CH]);
         let mut a = pull(&mut clean, 3 * PF);
         let mut b = pull(&mut messy, 3 * PF);
-        messy.push(0, packet(0));
+        messy.push(0, &packet(0));
         for seq in 6..10 {
-            clean.push(seq, packet(seq));
-            messy.push(seq, packet(seq));
+            clean.push(seq, &packet(seq));
+            messy.push(seq, &packet(seq));
         }
         a.extend(pull(&mut clean, 6 * PF));
         b.extend(pull(&mut messy, 6 * PF));
@@ -375,7 +492,7 @@ mod tests {
         let mut out = Vec::new();
         for seq in 0..40 {
             if seq != 5 {
-                jb.push(seq, sine_packet(seq));
+                jb.push(seq, &sine_packet(seq));
             }
             out.extend(pull(&mut jb, PF));
         }
@@ -452,7 +569,7 @@ mod tests {
     fn overflow_skips_down_to_the_target() {
         let mut jb = buffer();
         for seq in 0..40 {
-            jb.push(seq, packet(seq));
+            jb.push(seq, &packet(seq));
         }
         pull(&mut jb, PF);
         let stats = jb.stats();
@@ -465,22 +582,30 @@ mod tests {
     fn a_new_sequence_resets() {
         let mut jb = buffer();
         for seq in 0..=10 {
-            jb.push(seq, packet(seq));
+            jb.push(seq, &packet(seq));
         }
-        jb.push(50_000, packet(50_000));
+        jb.push(50_000, &packet(50_000));
         let stats = jb.stats();
         assert_eq!(
             (stats.late, stats.fill_ms),
             (0, 5),
             "only the new packet is left"
         );
-        jb.push(3, packet(3));
+        jb.push(3, &packet(3));
         let stats = jb.stats();
         assert_eq!((stats.late, stats.fill_ms), (0, 5), "far behind is new too");
+        // So is a packet too far ahead to fit in the ring (1 s).
+        let mut jb = buffer();
+        jb.push(0, &packet(0));
+        jb.push(199, &packet(199));
+        assert_eq!(jb.stats().fill_ms, 1000, "199 ahead still fits");
+        jb.push(200, &packet(200));
+        let stats = jb.stats();
+        assert_eq!((stats.late, stats.fill_ms), (0, 5));
         // A wrapping sequence number is not a new sequence.
         let mut jb = buffer();
-        jb.push(u32::MAX, packet(0));
-        jb.push(0, packet(1));
+        jb.push(u32::MAX, &packet(0));
+        jb.push(0, &packet(1));
         let stats = jb.stats();
         assert_eq!((stats.late, stats.fill_ms), (0, 10));
     }

@@ -1,6 +1,9 @@
 //! The receiving end of a stream: a jitter buffer, then a resampler whose
 //! ratio is steered so the buffer's fill holds at its target however far
 //! the sender's clock is from the sound card's.
+//!
+//! Nothing allocates or frees after `new`, so `push`, `pull` and `reset` are
+//! safe on a real-time audio thread.
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
 use rubato::{
     Adjustable, Async, FixedAsync, Resampler, SincInterpolationParameters, SincInterpolationType,
@@ -10,15 +13,20 @@ use rubato::{
 use super::jitter::JitterBuffer;
 use super::{AudioStream, RATE};
 
-/// Proportional gain: correction per ms of fill error.
+/// Proportional gain: correction per ms of (smoothed) fill error.
 ///
-/// With `KI`, a critically damped loop for MacSound (200 packets/s) with a
-/// time constant of about 10 s; PcMic's loop is a little slower and
-/// overdamped. 10 ms of error asks for 2000 ppm (clamped to 1000), a pitch
-/// change of under 2 cents.
+/// With `KI`, MacSound's loop (200 packets/s) is about critically damped
+/// with a time constant of about 10 s; PcMic's is slower and overdamped.
 const KP: f64 = 2e-4;
-/// Integral gain: correction per ms of fill error per packet.
+/// Integral gain: correction per ms of smoothed fill error per packet.
 const KI: f64 = 5e-8;
+/// Time constant of the low-pass on the fill error, in seconds. The raw
+/// fill is a sawtooth of a packet or more (arrivals, and the device pulling
+/// several packets at once) plus network jitter; steering on it directly
+/// would wobble the pitch at 100-200 Hz. Smoothed, a 5 ms step moves the
+/// correction by at most `KP · 5 · packet / SMOOTHING` (5 ppm for
+/// MacSound).
+const SMOOTHING_S: f64 = 1.0;
 /// Largest correction either way: 1000 ppm.
 const MAX_CORRECTION: f64 = 1e-3;
 /// Headroom the resampler is built with, beyond `MAX_CORRECTION`.
@@ -67,13 +75,19 @@ pub struct AudioReceiver {
     jitter: JitterBuffer,
     /// Fixed output of one packet's frames per call; input as needed.
     resampler: Async<f32>,
-    /// Scratch for one call of the resampler, interleaved.
+    /// Room for the most input one resampler call can need, interleaved.
     input: Vec<f32>,
+    /// One packet of resampled output, interleaved.
     output: Vec<f32>,
-    /// Resampled samples not yet pulled.
-    ready: Vec<f32>,
-    /// Sum of the fill error, in ms, once per packet.
+    /// The part of `output` not yet pulled.
+    ready: std::ops::Range<usize>,
+    /// Low-passed fill error in ms; `None` until the first measurement
+    /// after a (re)start.
+    error_ms: Option<f64>,
+    /// Sum of the smoothed fill error, in ms, once per packet.
     integral: f64,
+    #[cfg(test)]
+    corrections: Vec<f64>,
 }
 
 impl AudioReceiver {
@@ -96,35 +110,51 @@ impl AudioReceiver {
             FixedAsync::Output,
         )
         .expect("valid resampler parameters");
+        let ch = stream.channels();
         AudioReceiver {
             stream,
             jitter: JitterBuffer::new(stream),
+            input: vec![0.0; resampler.input_frames_max() * ch],
+            output: vec![0.0; resampler.output_frames_max() * ch],
             resampler,
-            input: Vec::new(),
-            output: Vec::new(),
-            ready: Vec::new(),
+            ready: 0..0,
+            error_ms: None,
             integral: 0.0,
+            #[cfg(test)]
+            corrections: Vec::new(),
         }
     }
 
-    pub fn push(&mut self, seq: u32, samples: Vec<f32>) {
+    /// Copies packet `seq` in; `samples` is one packet, interleaved.
+    pub fn push(&mut self, seq: u32, samples: &[f32]) {
         self.jitter.push(seq, samples);
     }
 
     /// Fills `out` (interleaved, any length) with audio or silence; never blocks.
     pub fn pull(&mut self, out: &mut [f32]) {
         let n = out.len() - out.len() % self.stream.channels();
-        while self.ready.len() < n {
-            self.resample_packet();
+        let (whole, rest) = out.split_at_mut(n);
+        let mut done = 0;
+        while done < n {
+            if self.ready.is_empty() {
+                self.resample_packet();
+            }
+            let k = (n - done).min(self.ready.len());
+            let from = self.ready.start;
+            whole[done..done + k].copy_from_slice(&self.output[from..from + k]);
+            self.ready.start += k;
+            done += k;
         }
-        out[..n].copy_from_slice(&self.ready[..n]);
-        self.ready.drain(..n);
-        out[n..].fill(0.0);
+        rest.fill(0.0);
     }
 
     /// Back to the state of a new receiver, counters included.
     pub fn reset(&mut self) {
-        *self = AudioReceiver::new(self.stream);
+        self.jitter.reset();
+        self.resampler.reset();
+        self.ready = 0..0;
+        self.error_ms = None;
+        self.integral = 0.0;
     }
 
     pub fn stats(&self) -> AudioStats {
@@ -137,35 +167,45 @@ impl AudioReceiver {
         let ch = self.stream.channels();
         let frames_in = self.resampler.input_frames_next();
         let frames_out = self.resampler.output_frames_next();
-        self.input.resize(frames_in * ch, 0.0);
-        self.output.resize(frames_out * ch, 0.0);
-        self.jitter.pull(&mut self.input);
-        let input = InterleavedSlice::new(&self.input[..], ch, frames_in).expect("sized above");
+        let input = &mut self.input[..frames_in * ch];
+        self.jitter.pull(input);
+        let input = InterleavedSlice::new(&*input, ch, frames_in).expect("sized in new");
         let mut output =
-            InterleavedSlice::new_mut(&mut self.output[..], ch, frames_out).expect("sized above");
+            InterleavedSlice::new_mut(&mut self.output[..frames_out * ch], ch, frames_out)
+                .expect("sized in new");
         let (_, written) = self
             .resampler
             .process_into_buffer(&input, &mut output, None)
             .expect("buffers sized to the resampler");
-        self.ready.extend_from_slice(&self.output[..written * ch]);
+        self.ready = 0..written * ch;
         self.steer();
     }
 
-    /// A PI controller on the fill error. Waiting to (re)start resets it.
+    /// A PI controller on the low-passed fill error. Waiting to (re)start
+    /// resets it.
     fn steer(&mut self) {
         let correction = if self.jitter.is_playing() {
-            let error_ms = (self.jitter.fill_frames() as f64 - self.jitter.target_frames() as f64)
+            let raw = (self.jitter.fill_frames() as f64 - self.jitter.target_frames() as f64)
                 / FRAMES_PER_MS;
+            let alpha = self.stream.packet_frames() as f64 / (SMOOTHING_S * f64::from(RATE));
+            let error = match self.error_ms {
+                Some(e) => e + alpha * (raw - e),
+                None => raw,
+            };
+            self.error_ms = Some(error);
             // Never let the integral alone ask for more than the clamp.
             let limit = MAX_CORRECTION / KI;
-            self.integral = (self.integral + error_ms).clamp(-limit, limit);
+            self.integral = (self.integral + error).clamp(-limit, limit);
             // A fill above target means the sender is ahead: play faster,
             // which is a ratio (output / input) below 1.
-            -(KP * error_ms + KI * self.integral).clamp(-MAX_CORRECTION, MAX_CORRECTION)
+            -(KP * error + KI * self.integral).clamp(-MAX_CORRECTION, MAX_CORRECTION)
         } else {
+            self.error_ms = None;
             self.integral = 0.0;
             0.0
         };
+        #[cfg(test)]
+        self.corrections.push(correction);
         self.resampler
             .set_resample_ratio_relative(1.0 + correction, true)
             .expect("correction within the resampler's range");
@@ -193,7 +233,7 @@ mod tests {
         for pull in 0..10 * 60 * 100 {
             owed += BLOCK as f64 * (1.0 + ppm * 1e-6);
             while owed >= frames {
-                rx.push(seq, silence.clone());
+                rx.push(seq, &silence);
                 seq += 1;
                 owed -= frames;
             }
@@ -216,6 +256,46 @@ mod tests {
         });
     }
 
+    /// Packets sent on time but arriving 0-15 ms late at random, against a
+    /// sound card pulling 10 ms (two packets) at a time: the correction
+    /// must move smoothly, not chase every arrival.
+    #[test]
+    fn correction_moves_smoothly_under_jitter() {
+        let mut rx = AudioReceiver::with_sinc_len(AudioStream::MacSound, 8);
+        let packet = [0.0; 480];
+        let mut x: u32 = 0x9e37_79b9;
+        let mut arrivals: Vec<(f64, u32)> = (0..12_000)
+            .map(|seq| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                let late_ms = f64::from(x) / f64::from(u32::MAX) * 15.0;
+                (f64::from(seq) * 5.0 + late_ms, seq)
+            })
+            .collect();
+        arrivals.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut arrivals = arrivals.into_iter().peekable();
+        let mut out = [0.0; BLOCK * 2];
+        for pull in 0..5_900 {
+            let now = f64::from(pull) * 10.0;
+            while let Some((_, seq)) = arrivals.next_if(|&(t, _)| t <= now) {
+                rx.push(seq, &packet);
+            }
+            rx.pull(&mut out);
+        }
+        let s = rx.stats();
+        assert_eq!((s.underruns, s.skips), (0, 0), "{s:?}");
+        // From 5 s on, past the start.
+        let steps = rx.corrections[1000..]
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs());
+        let worst_ppm = steps.fold(0.0, f64::max) * 1e6;
+        assert!(
+            worst_ppm <= 15.0,
+            "the correction jumped {worst_ppm} ppm in one packet"
+        );
+    }
+
     #[test]
     fn a_sine_passes_at_the_same_level_and_pitch() {
         for stream in [AudioStream::MacSound, AudioStream::PcMic] {
@@ -232,7 +312,9 @@ mod tests {
                         std::iter::repeat_n(v as f32, ch)
                     })
                     .collect();
-                packetizer.push(&sent, |seq, pkt| rx.push(seq, decode_pcm(&encode_pcm(pkt))));
+                packetizer.push(&sent, |seq, pkt| {
+                    rx.push(seq, &decode_pcm(&encode_pcm(pkt)))
+                });
                 rx.pull(&mut out);
                 played.extend_from_slice(&out);
             }
@@ -261,7 +343,7 @@ mod tests {
     fn reset_starts_over() {
         let mut rx = AudioReceiver::new(AudioStream::PcMic);
         for seq in 0..20 {
-            rx.push(seq, vec![0.25; 480]);
+            rx.push(seq, &[0.25; 480]);
         }
         let mut out = vec![0.0; 480];
         rx.pull(&mut out);
