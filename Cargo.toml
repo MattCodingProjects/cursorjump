@@ -5,3 +5,8 @@ members = ["crates/cj-core", "crates/cj-net", "app/cursorjump", "app/cursorjump-
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+
+# The audio resampler runs per sample in real time; keep it fast in debug
+# builds and tests too.
+[profile.dev.package.rubato]
+opt-level = 3
