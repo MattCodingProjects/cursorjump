@@ -1,5 +1,10 @@
 //! OS-neutral pieces of the app loop, shared by the PC and Mac apps.
 
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the audio devices plug into these pipes next")
+)]
+pub mod audio_pipe;
 pub mod clipboard_bridge;
 pub mod config_file;
 pub mod dnd_link;
