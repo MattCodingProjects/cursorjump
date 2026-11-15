@@ -39,6 +39,8 @@ use crate::verify::{Trust, client_config, server_config};
 const IDLE_TIMEOUT: Duration = Duration::from_millis(600);
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_millis(100);
 const DATAGRAM_BUFFER_BYTES: usize = 64 * 1024;
+/// Audio is dropped once this much is queued, so it never delays cursor motion.
+const AUDIO_BACKLOG_BYTES: usize = 4 * 1024;
 /// Upper bound for QUIC handshake plus Hello exchange.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
 /// Upper bound for the whole `pair()` exchange.
@@ -433,6 +435,18 @@ impl Session {
             .conn
             .send_datagram(Bytes::from(encode_datagram(d)))?;
         Ok(())
+    }
+
+    /// Sends an audio datagram unless more than `AUDIO_BACKLOG_BYTES` is
+    /// already queued. Returns whether it was sent.
+    pub fn send_audio(&self, d: &Datagram) -> Result<bool> {
+        if self.inner.conn.datagram_send_buffer_space()
+            < DATAGRAM_BUFFER_BYTES - AUDIO_BACKLOG_BYTES
+        {
+            return Ok(false);
+        }
+        self.send_datagram(d)?;
+        Ok(true)
     }
 
     /// Next datagram from the peer. Datagrams that fail to decode are skipped.

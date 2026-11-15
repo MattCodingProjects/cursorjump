@@ -192,6 +192,8 @@ impl Live {
                         }
                         continue;
                     }
+                    // Audio is handled once the Mac audio path exists.
+                    Ok(Datagram::Audio { .. }) => continue,
                     Err(e) => break format!("connection: {e:#}"),
                 };
                 if inj.send(InjectMsg::Input { sid, input }).is_err() {

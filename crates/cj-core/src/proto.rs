@@ -1,11 +1,13 @@
 //! Wire protocol shared by the PC and the Mac client.
 
+use crate::audio::{AudioStatus, AudioStream, AudioWant};
 use crate::dnd::{DragId, DragItem, DragOutcome, FailReason};
 use serde::{Deserialize, Serialize};
 
 /// Peers must match exactly. 2: `Control::MacReady`, which a v1 peer
 /// cannot decode (an undecodable message ends the session). 3: drag-and-drop.
-pub const PROTOCOL_VERSION: u16 = 3;
+/// 4: audio sharing.
+pub const PROTOCOL_VERSION: u16 = 4;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MouseButton {
@@ -44,6 +46,12 @@ pub enum Datagram {
     Pong {
         seq: u32,
         sent_us: u64,
+    },
+    /// One packet of 48 kHz 16-bit LE PCM (appended last: postcard variant index).
+    Audio {
+        stream: AudioStream,
+        seq: u32,
+        pcm: Vec<u8>,
     },
 }
 
@@ -124,6 +132,10 @@ pub enum Control {
         drag: DragId,
         outcome: DragOutcome,
     },
+    /// Mac to PC: which audio streams the Mac wants right now.
+    AudioWant(AudioWant),
+    /// PC to Mac: the state of the PC's default output and microphone.
+    AudioStatus(AudioStatus),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -157,6 +169,7 @@ pub fn decode_control_body(b: &[u8]) -> Result<Control, ProtoError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::DeviceState;
     use crate::dnd::ItemKind;
 
     #[test]
@@ -174,6 +187,16 @@ mod tests {
             Datagram::Pong {
                 seq: u32::MAX,
                 sent_us: 1,
+            },
+            Datagram::Audio {
+                stream: AudioStream::MacSound,
+                seq: u32::MAX,
+                pcm: vec![1, 2, 3, 255],
+            },
+            Datagram::Audio {
+                stream: AudioStream::PcMic,
+                seq: 0,
+                pcm: vec![],
             },
         ];
         for d in all {
@@ -284,6 +307,14 @@ mod tests {
                     name: "東京.mov".into(),
                 }),
             },
+            Control::AudioWant(AudioWant {
+                sound: true,
+                mic: false,
+            }),
+            Control::AudioStatus(AudioStatus {
+                output: DeviceState::Ok,
+                mic: DeviceState::Blocked,
+            }),
         ];
         for c in all {
             let enc = encode_control(&c);
@@ -317,6 +348,27 @@ mod tests {
             })[4],
             15
         );
+        assert_eq!(
+            encode_control(&Control::AudioWant(AudioWant::default()))[4],
+            16
+        );
+        assert_eq!(
+            encode_control(&Control::AudioStatus(AudioStatus {
+                output: DeviceState::Ok,
+                mic: DeviceState::Ok
+            }))[4],
+            17
+        );
+    }
+
+    #[test]
+    fn audio_datagram_fits_one_packet() {
+        let d = Datagram::Audio {
+            stream: AudioStream::MacSound,
+            seq: u32::MAX,
+            pcm: vec![0; 960],
+        };
+        assert!(encode_datagram(&d).len() <= 1000);
     }
 
     #[test]

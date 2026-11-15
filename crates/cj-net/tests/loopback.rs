@@ -4,6 +4,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use cj_core::audio::AudioStream;
 use cj_core::clipboard::{ClipboardData, within_limit};
 use cj_core::dnd::{FileEntry, FilesHeader, ItemKind};
 use cj_core::proto::{
@@ -509,6 +510,50 @@ async fn datagram_and_control_flow() {
         timeout(T, client.recv_control()).await.unwrap().unwrap(),
         back
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn audio_datagrams_cross() {
+    let (a, b) = (ident(), ident());
+    let (_l, server, client) = pair_up(&a, Trust::PairingMode, &b, Trust::PairingMode).await;
+    let mk = |i: u32| Datagram::Audio {
+        stream: AudioStream::MacSound,
+        seq: i,
+        pcm: vec![i as u8; 960],
+    };
+    for i in 0..10 {
+        assert!(server.send_audio(&mk(i)).unwrap());
+    }
+    for i in 0..10 {
+        let got = timeout(T, client.recv_datagram()).await.unwrap().unwrap();
+        assert_eq!(got, mk(i));
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn send_audio_drops_once_the_backlog_is_full() {
+    let (a, b) = (ident(), ident());
+    let (_l, server, client) = pair_up(&a, Trust::PairingMode, &b, Trust::PairingMode).await;
+    let pkt = Datagram::Audio {
+        stream: AudioStream::MacSound,
+        seq: 0,
+        pcm: vec![0; 960],
+    };
+    let sent = (0..50).filter(|_| server.send_audio(&pkt).unwrap()).count();
+    assert!((1..=5).contains(&sent), "sent {sent}");
+    let motion = Datagram::Motion { dx: 3, dy: 4 };
+    server.send_datagram(&motion).unwrap();
+    let got = timeout(T, async {
+        loop {
+            let d = client.recv_datagram().await.unwrap();
+            if d == motion {
+                return d;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(got, motion);
 }
 
 /// The next stream from the peer, which must be a clipboard item.
