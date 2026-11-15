@@ -1,5 +1,33 @@
 # CursorJump — Handoff
 
+## Audio sharing: PC side built (Tasks 2–9); Mac tasks next
+
+Last updated: 2026-11-16, on the PC. On 2026-11-15 the user chose to start audio before phase 2 is merged. Work is on branch **`audio`**, made from `phase2`.
+
+- **Spec:** `docs/superpowers/specs/2026-10-25-audio-sharing-design.md`
+- **Plan:** `docs/superpowers/plans/2026-11-15-audio-sharing.md`
+- **Ledger:** the git-ignored SDD workspace is `.superpowers/sdd/2026-11-15-audio-sharing/progress.md`, on the PC only. It holds rulings P1–P10 and the deferred minors.
+- **Done and reviewed on the PC:**
+  - Task 2: audio core (jitter buffer, drift-correcting receiver, no allocation on audio threads)
+  - Task 3: protocol **v4**, `send_audio`
+  - Task 4: Mac routing rules (5 s grace)
+  - Task 5: PC volume keys pass through to Windows while on the Mac
+  - Task 6: audio pipes
+  - Task 7: WASAPI output
+  - Task 8: WASAPI mic
+  - Task 9: PC app wiring
+- **Not yet run:** the PC hands-on tests, which need the user listening. Run them one at a time:
+  `cargo test -p cursorjump win::audio -- --ignored --nocapture --test-threads=1`
+  The tests are `render_plays_a_tone_through_the_default_output`, `render_follows_a_default_device_change` and `capture_records_the_default_mic`.
+- **Next, on the Mac:**
+  1. Task 1, the process-tap spike, with the user listening.
+  2. Task 10, the HAL driver.
+  3. Tasks 11–14.
+  4. Task 15, acceptance on both machines. Both machines must be reinstalled together, because this is protocol v4.
+
+  Task 14 must drop the non-Windows `expect(dead_code)` on `audio_pipe` in `app/cursorjump/src/common/mod.rs`.
+- **Phase 2 is still open:** the Mac→PC edge-strip misses (see below) block merging `phase2`. `audio` gets rebased onto `main` after that merge.
+
 ## Phase 2 (file drag-and-drop): all code done; acceptance (Task 18) in progress
 
 Last updated: 2026-10-26 (end of day), on the Mac, on top of the PC session's evening update. Branch **`phase2`** holds every task's code, reviewed. **Both machines now run the `phase2` build** (PC installed from 875f8ee and connected to the Mac). Task 18 acceptance is in progress, driven by the Mac session; where it stands is below. The repo is now **public** (the user's choice, for free CI minutes).
