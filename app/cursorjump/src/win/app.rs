@@ -7,8 +7,9 @@
 //! bridge threads (`bridges.rs` and `common::clipboard_bridge`) move their
 //! output into the loop, and cj-dnd and the pills post to it themselves;
 //! the session itself lives in `link.rs`, and the drags' part of the loop
-//! in `drags.rs`.
+//! in `drags.rs`, and audio's in `audio.rs`.
 
+mod audio;
 mod drags;
 
 use std::collections::VecDeque;
@@ -18,6 +19,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use cj_core::audio::{AudioStatus, DeviceState};
 use cj_core::clipboard::ClipboardData;
 use cj_core::config::Config;
 use cj_core::dnd::DragId;
@@ -50,6 +52,7 @@ use crate::common::settings_window::SettingsWindow;
 use crate::paths;
 use crate::ui::dialogs;
 use crate::ui::tray::{TrayCmd, TrayLoop, TrayModel, latency_text};
+use audio::{AUDIO_TICK, PcAudio};
 use drags::{DRAG_TICK, Drags, SWEEP_EVERY, start_dnd, start_pills};
 
 const PING_EVERY: Duration = Duration::from_millis(100);
@@ -178,10 +181,20 @@ pub(super) enum Ev {
     PillCancel(DragId),
     /// A failed pill's close button took it away.
     PillDismissed(DragId),
+    /// From cj-audio-watch: a PC audio device or default changed.
+    AudioDevices,
+    /// From cj-audio-in: the mic's state changed.
+    MicState(DeviceState),
 }
 
 /// The tray's status line.
-fn status_text(link: &Link, peer_name: Option<&str>, mac_ready: bool, paused: bool) -> String {
+fn status_text(
+    link: &Link,
+    peer_name: Option<&str>,
+    mac_ready: bool,
+    paused: bool,
+    mic_blocked: bool,
+) -> String {
     let base = match link {
         Link::Searching => "Searching for your Mac…".to_string(),
         Link::Pairing { code } => format!("Pairing — check that both screens show {code}"),
@@ -193,6 +206,11 @@ fn status_text(link: &Link, peer_name: Option<&str>, mac_ready: bool, paused: bo
                 format!("Connected to {peer} — Mac needs Accessibility")
             }
         }
+    };
+    let base = if mic_blocked {
+        format!("{base} — Windows is blocking the mic for desktop apps")
+    } else {
+        base
     };
     if paused {
         format!("{base} (paused)")
@@ -276,6 +294,7 @@ struct App {
     drags: Drags,
     /// Every session's drag events; taken by `run`.
     drag_events: Option<UnboundedReceiver<DndEv>>,
+    audio: PcAudio,
 }
 
 impl App {
@@ -293,6 +312,7 @@ impl App {
             config_file,
             identity: Arc::new(identity),
             name: computer_name(),
+            audio: PcAudio::new(ch.events.clone()),
             ch,
             last_model: None,
             pending: VecDeque::new(),
@@ -326,6 +346,8 @@ impl App {
         drag_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut sweep = interval_at(Instant::now() + SWEEP_EVERY, SWEEP_EVERY);
         sweep.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut audio_tick = interval(AUDIO_TICK);
+        audio_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let Some(mut drag_events) = self.drag_events.take() else {
             return;
         };
@@ -353,6 +375,10 @@ impl App {
                 Some(ev) = drag_events.recv() => self.on_link_dnd(ev).await,
                 _ = drag_tick.tick() => self.drag_tick().await,
                 _ = sweep.tick() => self.sweep_temp_dirs(false),
+                _ = audio_tick.tick() => {
+                    let status = self.audio.tick();
+                    self.send_audio_status(status).await;
+                }
                 _ = sleep_until(quit_by.unwrap_or_else(Instant::now)), if quit_by.is_some() => {
                     warn!("input thread did not stop in time");
                     break;
@@ -365,13 +391,15 @@ impl App {
             self.publish();
         }
         self.drags.disconnected();
+        self.audio.disconnected();
         self.link = None;
         // Every way out (Quit, input thread gone) closes the settings window.
         self.settings.close();
         info!("stopped");
     }
 
-    /// Carries out pending actions, and handles a failed session, until neither is left.
+    /// Carries out pending actions, handles a failed session, and starts
+    /// audio on a newly paired one, until none is left.
     async fn settle(&mut self) {
         loop {
             if let Some(action) = self.pending.pop_front() {
@@ -380,7 +408,14 @@ impl App {
                 info!("disconnected: {reason}");
                 // Before the machine's cancels and returns.
                 self.drags.disconnected();
+                self.audio.disconnected();
                 self.feed(PcEvent::Disconnected);
+            } else if !self.audio.connected()
+                && let Some(session) = self.paired_session().cloned()
+            {
+                // Paired at connect, or once pairing finished: never during it.
+                let status = self.audio.connect(&session);
+                self.control(Control::AudioStatus(status)).await;
             } else {
                 return;
             }
@@ -474,6 +509,14 @@ impl App {
             Ev::Dnd(ev) => self.on_dnd(ev).await,
             Ev::PillCancel(drag) => self.on_pill_cancel(drag).await,
             Ev::PillDismissed(drag) => self.on_pill_dismissed(drag),
+            Ev::AudioDevices => {
+                let status = self.audio.devices_changed();
+                self.send_audio_status(status).await;
+            }
+            Ev::MicState(state) => {
+                let status = self.audio.mic_state(state);
+                self.send_audio_status(status).await;
+            }
         }
     }
 
@@ -525,6 +568,11 @@ impl App {
                 | Control::FileFetch { .. }
                 | Control::DragFinished { .. }),
             ) => self.on_drag_control(c),
+            NetEv::Control(Control::AudioWant(want)) => {
+                if self.paired_session().is_some() {
+                    self.audio.want(want);
+                }
+            }
             NetEv::Control(other) => debug!(?other, "ignoring unexpected control message"),
             NetEv::Pong { rtt, at } => {
                 self.latency.record(at, rtt);
@@ -587,6 +635,7 @@ impl App {
             self.cfg.clipboard_max_bytes,
             self.epoch,
             &self.ch.events,
+            self.audio.tx(),
         );
         info!(peer = %live.peer_name, paired = code.is_none(), "connected");
         self.drags.connect(&live.session);
@@ -610,6 +659,7 @@ impl App {
     /// Drops the session (if any) and schedules the next attempt.
     fn reconnect(&mut self) {
         self.drags.disconnected();
+        self.audio.disconnected();
         self.link = None;
         self.dead = None;
         self.reset_latency();
@@ -626,11 +676,16 @@ impl App {
         self.latency_text = latency_text(&self.latency);
     }
 
-    /// Logs the latency summary during a paired session with samples.
+    /// Logs the latency summary during a paired session with samples, and
+    /// the Mac sound's counters while it plays.
     fn log_latency(&self) {
-        if self.paired_session().is_some() && !self.latency.is_empty() {
+        if self.paired_session().is_none() {
+            return;
+        }
+        if !self.latency.is_empty() {
             info!("{}", self.latency.log_line());
         }
+        self.audio.log_stats();
     }
 
     // --------------------------------------------------------------- pairing
@@ -720,6 +775,15 @@ impl App {
             && let Err(e) = s.send_datagram(d)
         {
             debug!("datagram not sent: {e:#}");
+        }
+    }
+
+    /// Sends a changed audio status, only ever on a paired session.
+    async fn send_audio_status(&mut self, status: Option<AudioStatus>) {
+        if let Some(status) = status
+            && self.paired_session().is_some()
+        {
+            self.control(Control::AudioStatus(status)).await;
         }
     }
 
@@ -833,6 +897,7 @@ impl App {
                 peer,
                 self.machine.mac_ready(),
                 self.cfg.paused,
+                self.audio.mic_blocked(),
             ),
             latency: self.latency_text.clone(),
             paused: self.cfg.paused,
@@ -852,7 +917,7 @@ mod tests {
     #[test]
     fn status_searching() {
         assert_eq!(
-            status_text(&Link::Searching, None, true, false),
+            status_text(&Link::Searching, None, true, false, false),
             "Searching for your Mac…"
         );
     }
@@ -863,7 +928,7 @@ mod tests {
             code: "123 456".into(),
         };
         assert_eq!(
-            status_text(&link, Some("MacBook"), true, false),
+            status_text(&link, Some("MacBook"), true, false, false),
             "Pairing — check that both screens show 123 456"
         );
     }
@@ -871,11 +936,17 @@ mod tests {
     #[test]
     fn status_connected_names_peer() {
         assert_eq!(
-            status_text(&Link::Connected, Some("Matt's MacBook Pro"), true, false),
+            status_text(
+                &Link::Connected,
+                Some("Matt's MacBook Pro"),
+                true,
+                false,
+                false
+            ),
             "Connected to Matt's MacBook Pro"
         );
         assert_eq!(
-            status_text(&Link::Connected, None, true, true),
+            status_text(&Link::Connected, None, true, true, false),
             "Connected to your Mac (paused)"
         );
     }
@@ -883,17 +954,29 @@ mod tests {
     #[test]
     fn status_connected_says_when_the_mac_needs_accessibility() {
         assert_eq!(
-            status_text(&Link::Connected, Some("MacBook"), false, false),
+            status_text(&Link::Connected, Some("MacBook"), false, false, false),
             "Connected to MacBook — Mac needs Accessibility"
         );
         assert_eq!(
-            status_text(&Link::Connected, None, false, true),
+            status_text(&Link::Connected, None, false, true, false),
             "Connected to your Mac — Mac needs Accessibility (paused)"
         );
         assert_eq!(
-            status_text(&Link::Searching, None, false, false),
+            status_text(&Link::Searching, None, false, false, false),
             "Searching for your Mac…",
             "only a connected Mac's readiness is shown"
+        );
+    }
+
+    #[test]
+    fn status_mentions_a_blocked_mic() {
+        assert_eq!(
+            status_text(&Link::Connected, Some("MacBook"), true, false, true),
+            "Connected to MacBook — Windows is blocking the mic for desktop apps"
+        );
+        assert_eq!(
+            status_text(&Link::Connected, None, true, true, true),
+            "Connected to your Mac — Windows is blocking the mic for desktop apps (paused)"
         );
     }
 

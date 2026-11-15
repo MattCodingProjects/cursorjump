@@ -5,6 +5,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use cj_core::audio::AudioStream;
 use cj_core::clipboard::ClipboardData;
 use cj_core::config::Config;
 use cj_core::proto::Datagram;
@@ -15,6 +16,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 
 use super::app::Ev;
+use crate::common::audio_pipe::AudioTx;
 use crate::common::paired_fingerprint;
 use crate::common::session_tasks::{ClipboardOut, NetEv, pong, spawn_stream_tasks};
 
@@ -96,13 +98,15 @@ pub(super) struct Live {
 
 impl Live {
     /// Starts the readers. Only call once any pairing exchange is done.
-    /// `epoch` is the zero point of this PC's ping timestamps.
+    /// `epoch` is the zero point of this PC's ping timestamps; the Mac's
+    /// sound goes to `audio`.
     pub fn start(
         sid: u64,
         session: Session,
         clip_max: u64,
         epoch: std::time::Instant,
         events: &UnboundedSender<Ev>,
+        audio: AudioTx,
     ) -> Live {
         let net = move |ev| Ev::Net { sid, ev };
         let mut tasks = Vec::new();
@@ -137,6 +141,12 @@ impl Live {
                     Ok(Datagram::Ping { seq, sent_us }) => {
                         let _ = s.send_datagram(&Datagram::Pong { seq, sent_us });
                     }
+                    // Only the Mac's sound comes this way; a PcMic packet is ignored.
+                    Ok(Datagram::Audio {
+                        stream: AudioStream::MacSound,
+                        seq,
+                        pcm,
+                    }) => audio.push(seq, &pcm),
                     Ok(_) => {}
                     Err(e) => break format!("connection: {e:#}"),
                 }

@@ -37,13 +37,11 @@ const RETRY: Duration = Duration::from_millis(500);
 const EVENT_WAIT_MS: u32 = 100;
 
 /// Captures the PC's default microphone while it exists.
-#[cfg_attr(not(test), expect(dead_code, reason = "wired into the app in Task 9"))]
 pub struct PcMicIn {
     reopen: Option<Sender<()>>,
     thread: Option<JoinHandle<()>>,
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "wired into the app in Task 9"))]
 impl PcMicIn {
     /// Starts capturing; `on_state` is told of each change in the mic's state.
     pub fn start(out: AudioOut, on_state: impl Fn(DeviceState) + Send + 'static) -> PcMicIn {
@@ -62,7 +60,6 @@ impl PcMicIn {
 
     /// Moves to the default capture endpoint if it changed, or retries a
     /// missing or blocked mic (call on any device change).
-    #[cfg_attr(test, expect(dead_code, reason = "wired into the app in Task 9"))]
     pub fn reopen(&self) {
         if let Some(tx) = &self.reopen {
             // Full means a reopen is already pending.
