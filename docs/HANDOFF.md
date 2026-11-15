@@ -35,7 +35,7 @@ Last updated: 2026-10-26 (end of day), on the Mac, on top of the PC session's ev
 - **Spec:** `docs/superpowers/specs/2026-10-25-file-drag-and-drop-design.md`
 - **Plan:** `docs/superpowers/plans/2026-10-25-file-drag-and-drop.md` (Tasks 15–16 carry amendment blocks from the Mac spike)
 - **Spike findings:** `docs/superpowers/progress/dnd-spike.md` (PC 1a, Mac 1b, F1)
-- **Ledger:** `docs/superpowers/progress/audio-ledger.md` (rulings P1–P10, deferred minors), shared by both machines: pull before writing, and append only. It is copied from the PC's SDD workspace.
+- **Ledger:** `docs/superpowers/progress/phase2-dnd-ledger.md` (rulings R1–R55, per-task notes, hands-on results). Read it first.
 - **Done:**
   - **PC:** Task 1a, Tasks 2–13 and 11b; hands-on passed.
   - **Mac:** Task 1b (spike) and Tasks 14–17; hands-on smokes passed for the pill, drags arriving from the PC, and the edge catcher.
