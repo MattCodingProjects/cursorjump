@@ -85,3 +85,6 @@ Task 10: implementer DONE w/ concerns (7995ede): ring_test 5/5 (also ASan/UBSan)
 Task 10: review 1 dispatched (opus).
 Task 10: review 1 — Approved (no Critical/Important). Minors 1–2 (install: killall failure swallowed; system_profiler|grep -q pipefail false failure) fixed by the controller in 099cd22. Deferred minors: ring data[] formally racy under C11 (use relaxed __atomic on floats); stream IsActive set sends no PropertiesChanged; plist comment names CJ_FACTORY_UUID (macro is _STRING); -Werror vs CI SDK drift; dispatch_queue_create unchecked; no concurrent writer/reader ring test.
 Task 10: Step 4 (install with the user) next.
+Task 10 Step 4 (user, 2026-11-16 00:43–00:47Z): install.sh signed with CursorJump Dev from the user's Terminal; coreaudiod loaded it (S5 holds, no ad hoc fallback needed); system_profiler lists "CursorJump Microphone" (1 ch, 48 kHz, Virtual), feed hidden; QuickTime recorded from it: silent, no error; --uninstall then reinstall: loaded again.
+Task 10: complete (commits 8b043b9..099cd22, review clean)
+Task 11: dispatched (BASE a63cbe1, implementer opus)
