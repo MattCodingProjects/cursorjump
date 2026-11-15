@@ -375,9 +375,9 @@ mod tests {
     fn capture_records_the_default_mic() {
         let _ = tracing_subscriber::fmt().with_test_writer().try_init();
         println!(
-            "TALK/SILENT: the PC's default microphone is captured for 3 s into a loopback \
-             session. Stay SILENT for the first 1.5 s, then TALK steadily at normal volume for \
-             the last 1.5 s. Capture starts in 3 s."
+            "The PC's default microphone is captured for about 12 s into a loopback session.
+             Stay SILENT for 3 s, then TALK steadily at normal volume for 4 s.
+             Each phase starts after a 3-2-1 countdown."
         );
         let rt = tokio::runtime::Runtime::new().expect("a tokio runtime");
         let ident = || {
@@ -414,7 +414,13 @@ mod tests {
         let out = AudioOut::default();
         out.set(Some(sa));
 
-        std::thread::sleep(Duration::from_secs(3));
+        let countdown = |what: &str| {
+            for n in (1..=3).rev() {
+                println!("{what} in {n}...");
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        };
+        countdown("SILENCE starts");
         let states = Arc::new(Mutex::new(Vec::new()));
         let mic = {
             let states = states.clone();
@@ -423,11 +429,13 @@ mod tests {
                 states.lock().unwrap().push(s);
             })
         };
-        println!("SILENT: say nothing for 1.5 s.");
-        let start = Instant::now();
-        std::thread::sleep(Duration::from_millis(1500));
-        println!("TALK NOW: keep talking for 1.5 s.");
-        std::thread::sleep(Duration::from_millis(1500));
+        println!("SILENCE NOW: say nothing for 3 s.");
+        let silent_start = Instant::now();
+        std::thread::sleep(Duration::from_secs(3));
+        countdown("TALKING starts (stay silent until it does)");
+        println!("TALK NOW: keep talking steadily for 4 s.");
+        let talk_start = Instant::now();
+        std::thread::sleep(Duration::from_secs(4));
         drop(mic);
         reader.abort();
         drop(listener);
@@ -439,31 +447,32 @@ mod tests {
              Settings > Privacy > Microphone > Let desktop apps access your microphone on?",
             states.lock().unwrap()
         );
-        // Skip the first 0.5 s of each half: start-up, and the cue to talk.
-        let window = |from_ms: u64, to_ms: u64| {
+        // Average packet RMS between two instants.
+        let window = |from: Instant, to: Instant| {
             let levels: Vec<f64> = packets
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|(t, _)| {
-                    let ms = t.duration_since(start).as_millis() as u64;
-                    (from_ms..to_ms).contains(&ms)
-                })
+                .filter(|(t, _)| (from..to).contains(t))
                 .map(|&(_, level)| level)
                 .collect();
-            assert!(
-                !levels.is_empty(),
-                "no packets between {from_ms} and {to_ms} ms"
-            );
+            assert!(!levels.is_empty(), "no packets in the window");
             levels.iter().sum::<f64>() / levels.len() as f64
         };
-        let silent = window(500, 1500).max(1e-6);
-        let talking = window(2000, 3000);
-        println!("average packet RMS: silent {silent:.6}, talking {talking:.6}");
+        let s = Duration::from_secs;
+        // Silence: its last 2 s. Talking: 1-4 s in, skipping the reaction time.
+        let silent = window(silent_start + s(1), silent_start + s(3)).max(1e-6);
+        let talking = window(talk_start + s(1), talk_start + s(4));
+        let dbfs = |rms: f64| 20.0 * rms.max(1e-9).log10();
+        println!(
+            "average packet RMS: silent {silent:.6} ({:.1} dBFS), talking {talking:.6} ({:.1} dBFS);              talking is {:.1} dB above silence (the test needs more than 20 dB)",
+            dbfs(silent),
+            dbfs(talking),
+            dbfs(talking) - dbfs(silent),
+        );
         assert!(
             talking > 10.0 * silent,
-            "talking ({talking:.6}) was not more than 10x silent ({silent:.6}): \
-             did you talk, and is this the microphone you mean?"
+            "talking ({talking:.6}) was not more than 10x silent ({silent:.6}):              did you talk, and is this the microphone you mean?"
         );
     }
 }

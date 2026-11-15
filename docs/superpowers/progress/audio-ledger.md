@@ -74,3 +74,4 @@ Task 9: complete (commits 5116cd2..c044765, review clean)
 PC tasks 2–9 complete. Next: P3 hands-on (Task 7 render x2, Task 8 capture) with the user; then [Mac] Tasks 1, 10–14 on the MacBook.
 CI: audio_datagrams_cross (Task 3 test) is flaky on both OSes — 10 back-to-back send_audio calls overrun the 4 KiB backlog before the driver drains; CI red since 04833be. Routed to the Task 3 implementer as a post-completion fix (BASE c044765).
 Flaky-test fix 132cf9e: re-review clean.
+Hands-on (PC, 2026-11-15 22:55Z, user): render_plays_a_tone_through_the_default_output PASS (396 packets, 0 lost; 1 underrun at end of feed, expected). render_follows_a_default_device_change PASS at 22:57Z: user has a single output, so tested by unplugging/replugging the wired headphones — reopened in ~50 ms each time, 0 underruns, 6 notifications. capture_records_the_default_mic: first run FAILED (talk/silent RMS ratio 2.8×, talking −51 dBFS; user had missed the prompts) — rerun pending.
