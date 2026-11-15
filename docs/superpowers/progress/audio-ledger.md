@@ -83,3 +83,5 @@ Task 1: complete. Next: Task 10 (HAL plug-in).
 Task 10: dispatched (BASE 8b043b9, implementer opus)
 Task 10: implementer DONE w/ concerns (7995ede): ring_test 5/5 (also ASan/UBSan), driver builds --no-sign with -Werror, CFPlugIn harness loads it; Step 4 (install into coreaudiod, Audio MIDI Setup, QuickTime) not run — needs the user's sudo; the host may compute IsRunningSomewhere itself (Task 11 must check its listener fires); install exits 1 if the mic isn't listed within ~10 s.
 Task 10: review 1 dispatched (opus).
+Task 10: review 1 — Approved (no Critical/Important). Minors 1–2 (install: killall failure swallowed; system_profiler|grep -q pipefail false failure) fixed by the controller in 099cd22. Deferred minors: ring data[] formally racy under C11 (use relaxed __atomic on floats); stream IsActive set sends no PropertiesChanged; plist comment names CJ_FACTORY_UUID (macro is _STRING); -Werror vs CI SDK drift; dispatch_queue_create unchecked; no concurrent writer/reader ring test.
+Task 10: Step 4 (install with the user) next.
