@@ -607,6 +607,13 @@ C, structured like Apple's public NullAudio AudioServerPlugIn sample. No code fr
 
 Written against S1 to S4. Apply any amendment from Task 1 first.
 
+> **Amended 2026-11-16 after the Task 1 spike (`docs/superpowers/progress/audio-spike.md`).** S1 (speakers), S2 and S4 hold; S3 only half holds. These replace the matching lines below:
+> - **T12-a:** `kAudioAggregateDeviceTapAutoStartKey = false`. With auto-start on, the IOProc doesn't run during silence, which breaks P4.
+> - **T12-b:** set `kAudioDevicePropertyBufferFrameSize = 256` on the aggregate, and log the value read back.
+> - **T12-c:** denial gives no error code; the IOProc just delivers exact zeros. Report `Denied` after 3 s of exact zeros while another process, from `kAudioHardwarePropertyProcessObjectList` minus our own PID, has `kAudioProcessPropertyIsRunningOutput` = 1. Report `Allowed` on the first non-zero sample, `Unknown` before either. Never use the output device's `IsRunningSomewhere`: our own aggregate keeps it at 1.
+> - **T12-d:** create and start the tap only on the `cj-audio` thread. `AudioDeviceStart` blocks while the first-time TCC prompt is on screen (6 s seen).
+> - The output-switch half of S1 is still unproven, so `the_tap_stays_muted_across_an_output_switch` is the real test. It needs AirPods or wired headphones.
+
 **Files:** Create `app/cursorjump/src/mac/audio/tap.rs`.
 
 **Interfaces:**
