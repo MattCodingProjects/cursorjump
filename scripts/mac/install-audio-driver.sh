@@ -60,7 +60,13 @@ run() {
 restart_coreaudiod() {
     local old new
     old="$(pgrep -x coreaudiod || true)"
-    run sudo killall coreaudiod || true
+    if ! run sudo killall coreaudiod; then
+        # killall fails harmlessly when nothing was running; otherwise sudo or the kill failed.
+        if [[ -n "$old" ]]; then
+            echo "error: could not restart coreaudiod (sudo killall failed)." >&2
+            return 1
+        fi
+    fi
     [[ "$dry_run" -eq 1 ]] && return 0
     for _ in $(seq 1 50); do
         new="$(pgrep -x coreaudiod || true)"
@@ -117,7 +123,9 @@ fi
 # Give coreaudiod a moment to load the driver, then look for the mic.
 found=0
 for _ in $(seq 1 10); do
-    if system_profiler SPAudioDataType 2>/dev/null | grep -qF "$mic_name"; then
+    # Capture first: grep -q exiting early would SIGPIPE system_profiler under pipefail.
+    devices="$(system_profiler SPAudioDataType 2>/dev/null || true)"
+    if grep -qF "$mic_name" <<<"$devices"; then
         found=1
         break
     fi
@@ -125,7 +133,7 @@ for _ in $(seq 1 10); do
 done
 if [[ "$found" -eq 0 ]]; then
     echo "\"$mic_name\" did not show up in system_profiler SPAudioDataType." >&2
-    echo "Check Audio MIDI Setup, and the coreaudiod log: log show --last 5m --predicate 'process == \"coreaudiod\"'" >&2
+    echo "Check Audio MIDI Setup, and the coreaudiod log: /usr/bin/log show --last 5m --predicate 'process == \"coreaudiod\"'" >&2
     exit 1
 fi
 
