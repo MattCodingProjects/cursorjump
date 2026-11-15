@@ -11,28 +11,19 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use cj_core::audio::{AudioStream, RATE};
+use cj_core::audio::AudioStream;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, bounded};
 use tracing::{info, warn};
-use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::Media::Audio::{
-    AUDCLNT_E_DEVICE_INVALIDATED, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
+    AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
     AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, IAudioClient,
-    IAudioRenderClient, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator, WAVEFORMATEX,
-    WAVEFORMATEXTENSIBLE, WAVEFORMATEXTENSIBLE_0, eConsole, eRender,
+    IAudioRenderClient, eRender,
 };
-use windows::Win32::Media::KernelStreaming::{
-    SPEAKER_FRONT_LEFT, SPEAKER_FRONT_RIGHT, WAVE_FORMAT_EXTENSIBLE,
-};
-use windows::Win32::Media::Multimedia::KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
-use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance, CoTaskMemFree};
-use windows::Win32::System::Threading::{
-    AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW, CreateEventW,
-    WaitForSingleObject,
-};
-use windows::core::w;
+use windows::Win32::System::Com::CLSCTX_ALL;
+use windows::Win32::System::Threading::WaitForSingleObject;
 
-use super::Com;
+use super::{Com, Event, Mmcss, default_endpoint, endpoint_id, invalidated, stream_format};
 use crate::common::audio_pipe::AudioRx;
 
 const STREAM: AudioStream = AudioStream::MacSound;
@@ -120,29 +111,6 @@ impl Drop for Lent {
     }
 }
 
-/// 48 kHz stereo 32-bit float, front left and right.
-fn stream_format() -> WAVEFORMATEXTENSIBLE {
-    let channels = STREAM.channels() as u16;
-    let bits = 32u16;
-    let block = channels * bits / 8;
-    WAVEFORMATEXTENSIBLE {
-        Format: WAVEFORMATEX {
-            wFormatTag: WAVE_FORMAT_EXTENSIBLE as u16,
-            nChannels: channels,
-            nSamplesPerSec: RATE,
-            nAvgBytesPerSec: RATE * u32::from(block),
-            nBlockAlign: block,
-            wBitsPerSample: bits,
-            cbSize: (size_of::<WAVEFORMATEXTENSIBLE>() - size_of::<WAVEFORMATEX>()) as u16,
-        },
-        Samples: WAVEFORMATEXTENSIBLE_0 {
-            wValidBitsPerSample: bits,
-        },
-        dwChannelMask: SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT,
-        SubFormat: KSDATAFORMAT_SUBTYPE_IEEE_FLOAT,
-    }
-}
-
 /// Why a stream ended.
 enum End {
     /// The MacSoundOut was stopped.
@@ -214,12 +182,12 @@ impl Output {
         // SAFETY: plain COM calls on interfaces this function holds; the
         // format and event outlive the calls that take them.
         unsafe {
-            let device = default_output()?;
+            let device = default_endpoint(eRender)?;
             let id = endpoint_id(&device)?;
             let client: IAudioClient = device
                 .Activate(CLSCTX_ALL, None)
                 .context("activating the audio client")?;
-            let format = stream_format();
+            let format = stream_format(STREAM);
             client
                 .Initialize(
                     AUDCLNT_SHAREMODE_SHARED,
@@ -308,7 +276,7 @@ impl Output {
     /// Whether this stream's endpoint is still the default output.
     fn is_default(&self) -> bool {
         // SAFETY: plain COM calls.
-        let id = unsafe { default_output().and_then(|d| endpoint_id(&d)) };
+        let id = unsafe { default_endpoint(eRender).and_then(|d| endpoint_id(&d)) };
         id.is_ok_and(|id| id == self.id)
     }
 }
@@ -320,89 +288,20 @@ impl Drop for Output {
     }
 }
 
-fn invalidated(e: &anyhow::Error) -> bool {
-    e.downcast_ref::<windows::core::Error>()
-        .is_some_and(|e| e.code() == AUDCLNT_E_DEVICE_INVALIDATED)
-}
-
-/// The eConsole default output.
-unsafe fn default_output() -> Result<IMMDevice> {
-    // SAFETY: plain COM calls; COM is initialized on this thread.
-    unsafe {
-        let en: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
-            .context("audio device enumerator")?;
-        en.GetDefaultAudioEndpoint(eRender, eConsole)
-            .context("no default output")
-    }
-}
-
-/// The endpoint's id string, without its NUL.
-unsafe fn endpoint_id(device: &IMMDevice) -> Result<Vec<u16>> {
-    // SAFETY: GetId returns a NUL-terminated CoTaskMem string, copied then freed.
-    unsafe {
-        let p = device.GetId().context("endpoint id")?;
-        let id = p.as_wide().to_vec();
-        CoTaskMemFree(Some(p.0.cast()));
-        Ok(id)
-    }
-}
-
-/// An auto-reset event for the stream's buffer events, closed on drop.
-struct Event(HANDLE);
-
-impl Event {
-    fn new() -> Result<Event> {
-        // SAFETY: plain FFI call; the handle is closed by Drop.
-        let h = unsafe { CreateEventW(None, false, false, None) }.context("CreateEventW")?;
-        Ok(Event(h))
-    }
-}
-
-impl Drop for Event {
-    fn drop(&mut self) {
-        // SAFETY: our own handle, closed once.
-        let _ = unsafe { CloseHandle(self.0) };
-    }
-}
-
-/// The thread's MMCSS "Pro Audio" membership, left on drop.
-struct Mmcss(Option<HANDLE>);
-
-impl Mmcss {
-    fn join() -> Mmcss {
-        let mut index = 0u32;
-        // SAFETY: plain FFI call; `index` outlives it.
-        match unsafe { AvSetMmThreadCharacteristicsW(w!("Pro Audio"), &mut index) } {
-            Ok(h) => Mmcss(Some(h)),
-            Err(e) => {
-                warn!("MMCSS Pro Audio: {e}; playing at normal priority");
-                Mmcss(None)
-            }
-        }
-    }
-}
-
-impl Drop for Mmcss {
-    fn drop(&mut self) {
-        if let Some(h) = self.0 {
-            // SAFETY: the handle AvSetMmThreadCharacteristicsW returned, on the same thread.
-            let _ = unsafe { AvRevertMmThreadCharacteristics(h) };
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::common::audio_pipe::{AudioTx, audio_pipe};
     use crate::win::audio::devices::DeviceWatch;
-    use cj_core::audio::encode_pcm;
+    use cj_core::audio::{RATE, encode_pcm};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant;
+    use windows::Win32::Media::KernelStreaming::WAVE_FORMAT_EXTENSIBLE;
+    use windows::Win32::Media::Multimedia::KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
 
     #[test]
     fn stream_format_is_48k_stereo_float() {
-        let f = stream_format();
+        let f = stream_format(STREAM);
         let base = f.Format;
         assert_eq!({ base.nChannels }, 2);
         assert_eq!({ base.nSamplesPerSec }, 48_000);
