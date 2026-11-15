@@ -29,3 +29,12 @@ jobs:
         run: cargo test -p cursorjump --locked
       - if: matrix.os == 'macos-latest'
         run: cargo test -p cursorjump --no-run --locked
+      # The Core Audio driver (C): build it unsigned, and test its ring.
+      - if: matrix.os == 'macos-latest'
+        run: ./scripts/mac/build-audio-driver.sh --no-sign
+      - if: matrix.os == 'macos-latest'
+        run: >-
+          mkdir -p target &&
+          clang -std=c11 -O2 app/cursorjump-audio-driver/src/ring.c
+          app/cursorjump-audio-driver/tests/ring_test.c -o target/ring_test &&
+          target/ring_test
