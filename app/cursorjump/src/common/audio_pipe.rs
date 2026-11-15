@@ -25,6 +25,9 @@ pub fn audio_pipe(stream: AudioStream) -> (AudioTx, AudioRx) {
     debug_assert_eq!(stream.packet_samples(), PACKET);
     let (tx, rx) = bounded(QUEUE);
     let stats = Arc::new(Mutex::new(AudioStats::default()));
+    // On macOS std's Mutex boxes its pthread mutex on first use; lock it once
+    // here so `publish`'s try_lock never allocates on the real-time thread.
+    drop(stats.lock());
     (
         AudioTx { tx },
         AudioRx {

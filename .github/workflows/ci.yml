@@ -29,6 +29,10 @@ jobs:
         run: cargo test -p cursorjump --locked
       - if: matrix.os == 'macos-latest'
         run: cargo test -p cursorjump --no-run --locked
+      # Hermetic: checks the audio pipe never touches the heap on the
+      # real-time thread (macOS std mutexes allocate on first use).
+      - if: matrix.os == 'macos-latest'
+        run: cargo test -p cursorjump --test audio_pipe_no_alloc --locked
       # The Core Audio driver (C): build it unsigned, and test its ring.
       - if: matrix.os == 'macos-latest'
         run: ./scripts/mac/build-audio-driver.sh --no-sign
