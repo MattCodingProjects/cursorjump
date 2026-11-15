@@ -1,5 +1,7 @@
 //! Windows platform layer.
 pub mod app;
+#[cfg_attr(not(test), expect(dead_code, reason = "wired into the app in Task 9"))]
+pub mod audio;
 pub mod autostart;
 mod bridges;
 pub mod clipboard;
