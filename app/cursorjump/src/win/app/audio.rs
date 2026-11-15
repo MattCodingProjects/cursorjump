@@ -9,8 +9,9 @@
 //!   only post to the loop: `Ev::AudioDevices` and `Ev::MicState`.
 //! - The mic's state as the capture thread last reported it (Blocked or
 //!   Missing) overrides the probe until it reports Ok. Once the mic stops,
-//!   nothing reports any more, so a device change or a change in the probe
-//!   hands the mic's state back to the probe.
+//!   nothing reports any more, so the next tick or device change hands the
+//!   mic's state back to the probe: the Mac may then ask again, at most
+//!   once a tick, and a mic that really is missing or blocked reads so.
 //! - While the mic is wanted but not working, [`PcAudio::tick`] pokes it
 //!   (ruling P10); while the mic reads as not Ok, the tick probes again,
 //!   which catches Windows' privacy switch, a change no device event reports.
@@ -249,25 +250,24 @@ impl PcAudio {
         self.changed()
     }
 
-    /// Every [`AUDIO_TICK`]: pokes a wanted mic that isn't working, and
-    /// probes again while the mic reads as not Ok.
+    /// Every [`AUDIO_TICK`]: pokes a wanted mic that isn't working, hands a
+    /// stopped mic's state back to the probe, and probes again while the
+    /// mic reads as not Ok.
     pub fn tick(&mut self) -> Option<AudioStatus> {
         if !self.connected {
             return None;
         }
-        if let Some(m) = &self.mic
-            && self.mic_last != Some(DeviceState::Ok)
-        {
-            m.reopen();
+        match &self.mic {
+            Some(m) if self.mic_last != Some(DeviceState::Ok) => m.reopen(),
+            Some(_) => {}
+            // Nothing reports on a stopped mic: a failure it reported (a
+            // one-off, or a format change no device event follows) would
+            // otherwise stand for the whole session.
+            None => self.mic_failed = None,
         }
-        if self.status().mic == DeviceState::Ok {
-            return None;
+        if self.status().mic != DeviceState::Ok {
+            self.probed = (self.devices.status)();
         }
-        let probed = (self.devices.status)();
-        if probed != self.probed && self.mic.is_none() {
-            self.mic_failed = None;
-        }
-        self.probed = probed;
         self.changed()
     }
 
@@ -536,7 +536,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stopped_mic_falls_back_to_the_probe_on_a_device_change() {
+    fn a_stopped_mic_falls_back_to_the_probe_on_the_next_tick() {
         let mut r = rig();
         r.audio.on_connect();
         r.audio.want(want(false, true));
@@ -544,11 +544,46 @@ mod tests {
             mic: DeviceState::Missing,
             ..OK
         };
+        // A one-off failure, with the probe still saying Ok.
         assert_eq!(r.audio.mic_state(DeviceState::Missing), Some(missing));
         // The Mac stops asking once the mic is reported missing.
         r.audio.want(want(false, false));
-        assert_eq!(r.audio.tick(), None, "the report stands");
+        assert_eq!(r.audio.tick(), Some(OK), "the Mac may ask again");
+        assert_eq!(r.audio.tick(), None);
+    }
+
+    #[test]
+    fn a_stopped_mic_falls_back_to_the_probe_on_a_device_change() {
+        let mut r = rig();
+        r.audio.on_connect();
+        r.audio.want(want(false, true));
+        r.audio.mic_state(DeviceState::Missing);
+        r.audio.want(want(false, false));
         // A mic plugged in: nothing runs to say so, so the probe decides.
         assert_eq!(r.audio.devices_changed(), Some(OK));
+    }
+
+    #[test]
+    fn a_mic_blocked_while_running_ends_up_blocked() {
+        let mut r = rig();
+        r.audio.on_connect();
+        r.audio.want(want(false, true));
+        // The privacy switch goes off: the stream dies as Missing.
+        let missing = AudioStatus {
+            mic: DeviceState::Missing,
+            ..OK
+        };
+        assert_eq!(r.audio.mic_state(DeviceState::Missing), Some(missing));
+        let blocked = AudioStatus {
+            mic: DeviceState::Blocked,
+            ..OK
+        };
+        *r.probe.lock().unwrap() = blocked;
+        // The running mic's report still stands; the tick records the probe.
+        assert_eq!(r.audio.tick(), None);
+        r.audio.want(want(false, false));
+        assert_eq!(r.audio.tick(), Some(blocked));
+        assert!(r.audio.mic_blocked(), "the tray says so");
+        assert_eq!(r.audio.tick(), None, "a blocked mic does not loop");
     }
 }
