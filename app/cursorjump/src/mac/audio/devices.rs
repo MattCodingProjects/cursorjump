@@ -290,7 +290,7 @@ pub enum AudioDevEv {
 
 /// Background listeners that always record the default input, and so
 /// would keep the PC's mic open for good: Siri's voice trigger.
-const BACKGROUND_LISTENERS: [&str; 2] = ["com.apple.CoreSpeech", "com.apple.corespeechd"];
+const BACKGROUND_LISTENERS: [&str; 1] = ["com.apple.CoreSpeech"];
 
 /// A process in Core Audio's process list, as [`someone_listens`] sees it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -302,23 +302,44 @@ struct InputClient {
     devices: Vec<AudioObjectID>,
 }
 
-/// Whether a process other than `us` and the background listeners runs
-/// input on `mic`.
-fn someone_listens(clients: &[InputClient], mic: AudioObjectID, us: &[i32]) -> bool {
-    clients.iter().any(|c| {
+/// What [`someone_listens`] decides from, read in one go.
+#[derive(Clone, Debug, Default)]
+struct Snapshot {
+    clients: Vec<InputClient>,
+    /// Our mic's `IsRunningSomewhere`.
+    mic_running: bool,
+    /// The devices we can see (`kAudioHardwarePropertyDevices`).
+    visible: Vec<AudioObjectID>,
+}
+
+/// Whether a process other than `us` and the background listeners records
+/// from `mic`.
+///
+/// A voice-processing client (a call) may record through a private
+/// aggregate, so our mic is not in its input devices: a device we can't
+/// see (or an unknown ID) stands for it, and counts while our mic runs.
+fn someone_listens(snap: &Snapshot, mic: AudioObjectID, us: &[i32]) -> bool {
+    snap.clients.iter().any(|c| {
         c.running_input
             && !us.contains(&c.pid)
-            && c.devices.contains(&mic)
             && !c
                 .bundle_id
                 .as_deref()
                 .is_some_and(|b| BACKGROUND_LISTENERS.contains(&b))
+            && (c.devices.contains(&mic)
+                || snap.mic_running
+                    && c.devices
+                        .iter()
+                        .any(|d| *d == kAudioObjectUnknown || !snap.visible.contains(d)))
     })
 }
 
-/// Every process Core Audio knows, with what it records from.
-fn input_clients() -> Vec<InputClient> {
-    object_list(SYSTEM, global(kAudioHardwarePropertyProcessObjectList))
+/// Every process Core Audio knows, with what it records from, and what we
+/// know about our mic. None if a list can't be read.
+fn snapshot(mic: AudioObjectID) -> Option<Snapshot> {
+    let processes = try_object_list(SYSTEM, global(kAudioHardwarePropertyProcessObjectList))?;
+    let visible = try_object_list(SYSTEM, global(kAudioHardwarePropertyDevices))?;
+    let clients = processes
         .into_iter()
         .map(|p| {
             let running_input = get::<u32>(p, global(kAudioProcessPropertyIsRunningInput), None)
@@ -335,7 +356,12 @@ fn input_clients() -> Vec<InputClient> {
                 },
             }
         })
-        .collect()
+        .collect();
+    Some(Snapshot {
+        clients,
+        mic_running: running_somewhere(mic),
+        visible,
+    })
 }
 
 /// The process properties [`AudioWatch`] follows. On macOS 26.5 a process
@@ -569,7 +595,12 @@ impl Shared {
     /// [`process_properties`]), then works `MicListening` out again. Runs on
     /// the queue.
     fn follow_processes(self: &Arc<Self>) {
-        let now = object_list(SYSTEM, global(kAudioHardwarePropertyProcessObjectList));
+        let Some(now) = try_object_list(SYSTEM, global(kAudioHardwarePropertyProcessObjectList))
+        else {
+            // Keep the listeners we have; the next change retries.
+            debug!("audio watch: the process list can't be read");
+            return;
+        };
         let mut mic = self.mic();
         let mut kept = Vec::with_capacity(now.len());
         for (process, block) in mic.processes.drain(..) {
@@ -614,7 +645,12 @@ impl Shared {
         if mic.id == kAudioObjectUnknown {
             return;
         }
-        let listening = someone_listens(&input_clients(), mic.id, &self.us);
+        let Some(snap) = snapshot(mic.id) else {
+            // Keep the last value; the next change retries.
+            debug!("audio watch: the process or device list can't be read");
+            return;
+        };
+        let listening = someone_listens(&snap, mic.id, &self.us);
         debug!("audio watch: someone listens to our mic: {listening}");
         if mic.last == Some(listening) {
             return;
@@ -732,15 +768,37 @@ fn device_ids() -> Vec<AudioObjectID> {
     object_list(SYSTEM, global(kAudioHardwarePropertyDevices))
 }
 
-/// Reads a list of objects, such as the system object's devices.
+/// Reads a list of objects, such as the system object's devices; empty if
+/// it can't be read.
 pub(super) fn object_list(
     obj: AudioObjectID,
-    mut address: AudioObjectPropertyAddress,
+    address: AudioObjectPropertyAddress,
 ) -> Vec<AudioObjectID> {
-    let mut size = property_size(obj, address);
+    try_object_list(obj, address).unwrap_or_default()
+}
+
+/// Reads a list of objects; None if it can't be read.
+fn try_object_list(
+    obj: AudioObjectID,
+    mut address: AudioObjectPropertyAddress,
+) -> Option<Vec<AudioObjectID>> {
+    let mut size = 0u32;
+    // SAFETY: every pointer outlives the call.
+    let st = unsafe {
+        AudioObjectGetPropertyDataSize(
+            obj,
+            NonNull::from(&mut address),
+            0,
+            std::ptr::null(),
+            NonNull::from(&mut size),
+        )
+    };
+    if st != 0 {
+        return None;
+    }
     let mut ids = vec![kAudioObjectUnknown; size as usize / size_of::<AudioObjectID>()];
     if ids.is_empty() {
-        return ids;
+        return Some(ids);
     }
     // SAFETY: every pointer outlives the call, and `size` is `ids`' size in bytes.
     let st = unsafe {
@@ -754,11 +812,11 @@ pub(super) fn object_list(
         )
     };
     if st != 0 {
-        return Vec::new();
+        return None;
     }
     // The list may have shrunk since the size was read.
     ids.truncate(size as usize / size_of::<AudioObjectID>());
-    ids
+    Some(ids)
 }
 
 /// `selector` in the input scope.
@@ -774,7 +832,6 @@ fn input_streams(id: AudioObjectID) -> u32 {
     property_size(id, input(kAudioDevicePropertyStreams)) / size_of::<AudioObjectID>() as u32
 }
 
-#[cfg(test)]
 fn running_somewhere(id: AudioObjectID) -> bool {
     get::<u32>(
         id,
@@ -1120,26 +1177,62 @@ mod tests {
         }
     }
 
+    const SPEAKER: AudioObjectID = 79;
+    const BUILTIN_MIC: AudioObjectID = 80;
     const OUR_MIC: AudioObjectID = 90;
+    const OTHER_MIC: AudioObjectID = 91;
+    /// A private aggregate: not in the device list.
+    const PRIVATE: AudioObjectID = 555;
     const ME: i32 = 500;
+
+    fn snap(clients: &[InputClient], mic_running: bool) -> Snapshot {
+        Snapshot {
+            clients: clients.to_vec(),
+            mic_running,
+            visible: vec![SPEAKER, BUILTIN_MIC, OUR_MIC, OTHER_MIC],
+        }
+    }
+
+    fn listens(clients: &[InputClient], mic_running: bool) -> bool {
+        someone_listens(&snap(clients, mic_running), OUR_MIC, &[ME])
+    }
 
     #[test]
     fn only_real_apps_on_our_mic_count_as_listening() {
         let us = client(ME, "com.cursorjump.app", true, &[OUR_MIC]);
         let siri = client(400, "com.apple.CoreSpeech", true, &[OUR_MIC]);
-        let siri_daemon = client(401, "com.apple.corespeechd", true, &[OUR_MIC]);
         let zoom = client(600, "us.zoom.xos", true, &[OUR_MIC]);
-        let other_device = client(601, "com.apple.VoiceMemos", true, &[91]);
+        let other_device = client(601, "com.apple.VoiceMemos", true, &[OTHER_MIC]);
         let idle = client(602, "com.apple.FaceTime", false, &[]);
-        let no_bundle = client(603, "", true, &[91, OUR_MIC]);
+        let no_bundle = client(603, "", true, &[OTHER_MIC, OUR_MIC]);
 
-        let background = [us.clone(), siri.clone(), siri_daemon, other_device, idle];
-        assert!(!someone_listens(&background, OUR_MIC, &[ME]));
-        assert!(!someone_listens(&[], OUR_MIC, &[ME]));
-        assert!(someone_listens(&[us.clone(), zoom], OUR_MIC, &[ME]));
-        assert!(someone_listens(&[siri, no_bundle], OUR_MIC, &[ME]));
+        let background = [us.clone(), siri.clone(), other_device, idle];
+        assert!(!listens(&background, true));
+        assert!(!listens(&[], true));
+        assert!(listens(&[us.clone(), zoom.clone()], true));
+        assert!(listens(&[zoom], false));
+        assert!(listens(&[siri, no_bundle], true));
         // Another copy of us, say a test process, is a real client.
-        assert!(someone_listens(&[us], OUR_MIC, &[ME + 1]));
+        assert!(someone_listens(&snap(&[us], true), OUR_MIC, &[ME + 1]));
+    }
+
+    #[test]
+    fn a_call_through_a_private_aggregate_counts_while_our_mic_runs() {
+        // Voice processing: the speaker as reference, the device it
+        // records from hidden in an aggregate we can't see.
+        let facetime = client(700, "com.apple.FaceTime", true, &[SPEAKER, 0]);
+        let discord = client(701, "com.hnc.Discord", true, &[PRIVATE]);
+        assert!(listens(std::slice::from_ref(&facetime), true));
+        assert!(listens(std::slice::from_ref(&discord), true));
+        // Our mic idle: the aggregate records from some other mic.
+        assert!(!listens(&[facetime.clone(), discord], false));
+        // Everything visible and not ours: on another mic.
+        let builtin_only = client(702, "com.apple.VoiceMemos", true, &[BUILTIN_MIC]);
+        assert!(!listens(&[builtin_only], true));
+        // Siri and we never count, hidden device or not.
+        let siri = client(400, "com.apple.CoreSpeech", true, &[SPEAKER, 0]);
+        let us = client(ME, "com.cursorjump.app", true, &[PRIVATE]);
+        assert!(!listens(&[siri, us], true));
     }
 
     /// Waits up to `within` for `want`, skipping other events.
@@ -1219,42 +1312,80 @@ mod tests {
     #[ignore = "reads this Mac's audio processes; needs the CursorJump audio driver"]
     fn mic_listening_ignores_siri_and_us() {
         let mic = device_id(MIC_UID).expect("the CursorJump audio driver is installed");
-        let clients = input_clients();
+        let snap = snapshot(mic).expect("the process and device lists");
+        let me = std::process::id() as i32;
         println!(
-            "our mic is object {mic}; this test is pid {}",
-            std::process::id()
+            "our mic is object {mic}, running somewhere: {}; this test is pid {me}",
+            snap.mic_running
         );
-        for c in clients.iter().filter(|c| c.running_input) {
+        for c in snap.clients.iter().filter(|c| c.running_input) {
             let devices: Vec<String> = c
                 .devices
                 .iter()
-                .map(|&d| format!("{d} ({})", device_uid(d).as_deref().unwrap_or("?")))
+                .map(|&d| match device_uid(d) {
+                    Some(uid) if snap.visible.contains(&d) => format!("{d} ({uid})"),
+                    _ => format!("{d} (hidden)"),
+                })
                 .collect();
+            let counts = someone_listens(
+                &Snapshot {
+                    clients: vec![c.clone()],
+                    ..snap.clone()
+                },
+                mic,
+                &[me],
+            );
             println!(
                 "pid {:>6} {:<40} input on {}{}",
                 c.pid,
                 c.bundle_id.as_deref().unwrap_or("<no bundle id>"),
                 devices.join(", "),
-                if c.devices.contains(&mic) {
-                    "  <- our mic"
-                } else {
-                    ""
-                }
+                if counts { "  <- listens" } else { "" }
             );
         }
-        let not_running = clients.iter().filter(|c| !c.running_input).count();
+        let not_running = snap.clients.iter().filter(|c| !c.running_input).count();
         println!("{not_running} more processes run no input");
         println!(
             "someone listens to our mic: {}",
-            someone_listens(&clients, mic, &[std::process::id() as i32])
+            someone_listens(&snap, mic, &[me])
         );
-        let siri = clients.iter().filter(|c| {
+
+        // As if our mic were running and every one of them recorded from it.
+        let on_our_mic = |c: &InputClient| InputClient {
+            running_input: true,
+            devices: vec![mic, kAudioObjectUnknown],
+            ..c.clone()
+        };
+        let running = |clients: Vec<InputClient>| Snapshot {
+            clients,
+            mic_running: true,
+            ..snap.clone()
+        };
+        // Siri never counts.
+        for c in snap.clients.iter().filter(|c| {
             c.bundle_id
                 .as_deref()
                 .is_some_and(|b| BACKGROUND_LISTENERS.contains(&b))
-        });
-        for c in siri {
-            assert!(!someone_listens(std::slice::from_ref(c), mic, &[]), "{c:?}");
+        }) {
+            assert!(
+                !someone_listens(&running(vec![on_our_mic(c)]), mic, &[]),
+                "{c:?}"
+            );
+        }
+        // Nor do we: this test process and the installed app, as `us`.
+        let us: Vec<&InputClient> = snap
+            .clients
+            .iter()
+            .filter(|c| c.pid == me || c.bundle_id.as_deref() == Some("com.cursorjump.app"))
+            .collect();
+        assert!(us.iter().any(|c| c.pid == me), "this process is a client");
+        for c in us {
+            let alone = running(vec![on_our_mic(c)]);
+            assert!(!someone_listens(&alone, mic, &[c.pid]), "{c:?}");
+            assert!(
+                someone_listens(&alone, mic, &[]),
+                "{c:?} counts as someone else"
+            );
         }
     }
 
@@ -1282,9 +1413,18 @@ mod tests {
         let mic = device_id(MIC_UID).expect("the CursorJump audio driver is installed");
         // Apps already recording from our mic (the Sound settings pane's
         // meter, say) would hide the change: the watch counts them as us.
-        let others: Vec<i32> = input_clients()
-            .into_iter()
-            .filter(|c| someone_listens(std::slice::from_ref(c), mic, &[]))
+        let snap = snapshot(mic).expect("the process and device lists");
+        let others: Vec<i32> = snap
+            .clients
+            .iter()
+            .filter(|c| {
+                let alone = Snapshot {
+                    clients: vec![(*c).clone()],
+                    mic_running: true,
+                    ..snap.clone()
+                };
+                someone_listens(&alone, mic, &[])
+            })
             .map(|c| c.pid)
             .collect();
         println!("already recording from our mic, ignored: {others:?}");
@@ -1339,12 +1479,6 @@ mod tests {
             started,
             "MicListening(true) within 2 s (IsRunningSomewhere polled: {polled})"
         );
-        assert!(
-            !us_rx
-                .try_iter()
-                .any(|ev| ev == AudioDevEv::MicListening(true)),
-            "our own recording doesn't count"
-        );
         let stopped = wait_for(&rx, AudioDevEv::MicListening(false), Duration::from_secs(2));
         assert!(
             stopped,
@@ -1352,6 +1486,16 @@ mod tests {
             running_somewhere(mic)
         );
         drop(watch);
+        // Dropping flushes its queue: every event it sends is in by now.
         drop(as_us);
+        let seen: Vec<AudioDevEv> = us_rx
+            .try_iter()
+            .filter(|ev| matches!(ev, AudioDevEv::MicListening(_)))
+            .collect();
+        assert_eq!(
+            seen,
+            [AudioDevEv::MicListening(false)],
+            "our own recording doesn't count"
+        );
     }
 }
