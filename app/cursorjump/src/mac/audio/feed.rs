@@ -28,12 +28,12 @@ pub struct MicFeed {
     proc_id: AudioDeviceIOProcID,
     started: bool,
     /// From `Box::leak`; the IOProc's alone while it runs. `None` once
-    /// taken back.
+    /// torn down (taken back or leaked).
     rx: Option<NonNull<AudioRx>>,
 }
 
 // SAFETY: the `rx` is owned, and is touched only by the IOProc while it
-// runs and by `take_back` after it is destroyed; `AudioRx` is Send.
+// runs and by `teardown` once it is done; `AudioRx` is Send.
 unsafe impl Send for MicFeed where AudioRx: Send {}
 
 impl MicFeed {
@@ -68,7 +68,7 @@ impl MicFeed {
             rx: Some(state),
         };
         // SAFETY: the rx stays valid until after the IOProc is destroyed
-        // (take_back), and only the IOProc uses it until then.
+        // (teardown), and only the IOProc uses it until then.
         let st = unsafe {
             AudioDeviceCreateIOProcID(
                 dev,
@@ -79,13 +79,13 @@ impl MicFeed {
         };
         if st != 0 {
             let e = anyhow!("creating an IOProc on the CursorJump Mic Feed: OSStatus {st}");
-            return Err((e, feed.take_back()));
+            return Err((e, feed.rx_never_started()));
         }
         // SAFETY: our own IOProc on this device.
         let st = unsafe { AudioDeviceStart(dev, feed.proc_id) };
         if st != 0 {
             let e = anyhow!("starting the CursorJump Mic Feed: OSStatus {st}");
-            return Err((e, feed.take_back()));
+            return Err((e, feed.rx_never_started()));
         }
         feed.started = true;
         info!(
@@ -94,47 +94,75 @@ impl MicFeed {
         Ok(feed)
     }
 
-    /// Stops and destroys the IOProc, then hands the `rx` back.
-    pub fn stop(mut self) -> AudioRx {
-        let rx = self.take_back();
+    /// Tears down an IOProc that never started: Core Audio can't call it,
+    /// so the rx always comes back.
+    fn rx_never_started(&mut self) -> AudioRx {
+        debug_assert!(!self.started);
+        self.teardown()
+            .expect("an IOProc that never started can't be running")
+    }
+
+    /// Stops and destroys the IOProc, then hands the `rx` back. `None`
+    /// means Core Audio didn't confirm the IOProc is gone, so the `rx` is
+    /// leaked (it may still be in use): make a fresh
+    /// `audio_pipe(AudioStream::PcMic)` and give its `AudioTx` to the network.
+    pub fn stop(mut self) -> Option<AudioRx> {
+        let rx = self.teardown();
         info!("PC mic: stopped playing into the CursorJump Mic Feed");
         rx
     }
 
-    /// Stops and destroys the IOProc, if any, then takes the rx back. Once
-    /// both calls have returned, Core Audio never calls the IOProc again;
-    /// if either fails, the device is gone and the IOProc with it.
-    fn take_back(&mut self) -> AudioRx {
+    /// Stops and destroys the IOProc, if any, then takes the rx back if
+    /// Core Audio provably won't call the IOProc again; else leaks it.
+    fn teardown(&mut self) -> Option<AudioRx> {
         let rx = self.rx.take().expect("the rx is taken back once");
         // SAFETY: our own IOProc on this device, each step done once.
-        unsafe {
-            if self.started {
-                let st = AudioDeviceStop(self.dev, self.proc_id);
-                if st != 0 {
-                    warn!("PC mic: stopping the feed's IOProc: OSStatus {st}");
-                }
+        let (stopped, destroyed) = unsafe {
+            let stopped = if self.started {
+                AudioDeviceStop(self.dev, self.proc_id)
+            } else {
+                0
+            };
+            if stopped != 0 {
+                warn!("PC mic: stopping the feed's IOProc: OSStatus {stopped}");
             }
-            if self.proc_id.is_some() {
-                let st = AudioDeviceDestroyIOProcID(self.dev, self.proc_id);
-                if st != 0 {
-                    warn!("PC mic: destroying the feed's IOProc: OSStatus {st}");
-                }
+            let destroyed = if self.proc_id.is_some() {
+                AudioDeviceDestroyIOProcID(self.dev, self.proc_id)
+            } else {
+                0
+            };
+            if destroyed != 0 {
+                warn!("PC mic: destroying the feed's IOProc: OSStatus {destroyed}");
             }
-        }
+            (stopped, destroyed)
+        };
+        let started = self.started;
         self.started = false;
         self.proc_id = None;
+        if !ioproc_is_done(started, stopped, destroyed) {
+            warn!("PC mic: the feed's IOProc may still run; leaking its rx");
+            return None;
+        }
         // SAFETY: from Box::leak in `start`; no IOProc can run on it now.
-        *unsafe { Box::from_raw(rx.as_ptr()) }
+        Some(*unsafe { Box::from_raw(rx.as_ptr()) })
     }
 }
 
 impl Drop for MicFeed {
     fn drop(&mut self) {
         if self.rx.is_some() {
-            drop(self.take_back());
+            drop(self.teardown());
             info!("PC mic: stopped playing into the CursorJump Mic Feed");
         }
     }
+}
+
+/// Whether Core Audio will never call an IOProc again: it never started,
+/// or `AudioDeviceStop` returned 0 (`stopped`), or
+/// `AudioDeviceDestroyIOProcID` did (`destroyed`). A failed status proves
+/// neither.
+fn ioproc_is_done(started: bool, stopped: i32, destroyed: i32) -> bool {
+    !started || stopped == 0 || destroyed == 0
 }
 
 /// Real-time: plays the PC's mic into the feed's output buffer.
@@ -274,6 +302,19 @@ mod tests {
         assert_eq!(fill_list(&mut list), 0);
     }
 
+    #[test]
+    fn the_rx_comes_back_only_once_the_ioproc_provably_is_done() {
+        // Never started: whatever the statuses.
+        assert!(ioproc_is_done(false, -1, -1));
+        // Started: stopped, or destroyed, or both.
+        assert!(ioproc_is_done(true, 0, 0));
+        assert!(ioproc_is_done(true, 0, -1));
+        assert!(ioproc_is_done(true, -1, 0));
+        // Started, and neither confirmed: leaked.
+        assert!(!ioproc_is_done(true, -1, -1));
+        assert!(!ioproc_is_done(true, 560947818, 560947818));
+    }
+
     /// The test recorder's IOProc state: a preallocated buffer it fills.
     struct Recording {
         samples: Box<[f32]>,
@@ -392,17 +433,30 @@ mod tests {
         // SAFETY: `recording` is live until taken back below; `len` is atomic.
         let len = unsafe { &(*recording).len };
         let deadline = Instant::now() + Duration::from_secs(RECORD_S as u64 + 3);
+        let mut window_start = None;
         while len.load(Relaxed) < RECORD_S * RATE as usize && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(20));
+            if window_start.is_none() && len.load(Relaxed) >= MEASURE_FROM {
+                window_start = Some(stats.snapshot());
+            }
+            std::thread::sleep(Duration::from_millis(5));
         }
+        let window_end = stats.snapshot();
         // SAFETY: as above; stopped, then destroyed once.
-        unsafe {
-            AudioDeviceStop(mic, proc_id);
-            AudioDeviceDestroyIOProcID(mic, proc_id);
-        }
-        // SAFETY: from Box::into_raw above; its IOProc is destroyed.
+        let (stopped, destroyed) = unsafe {
+            (
+                AudioDeviceStop(mic, proc_id),
+                AudioDeviceDestroyIOProcID(mic, proc_id),
+            )
+        };
+        assert!(
+            ioproc_is_done(true, stopped, destroyed),
+            "the recorder's IOProc may still run (stop {stopped}, destroy {destroyed}); \
+             leaking its recording"
+        );
+        // SAFETY: from Box::into_raw above; its IOProc is stopped or destroyed.
         let recording = unsafe { Box::from_raw(recording) };
-        let _rx = feed.stop();
+        assert_eq!((stopped, destroyed), (0, 0), "stopping the recorder");
+        assert!(feed.stop().is_some(), "the feed hands its rx back");
         done.store(true, Relaxed);
         feeder.join().unwrap();
 
@@ -413,6 +467,15 @@ mod tests {
             "the mic's buffers weren't one mono buffer"
         );
         assert_eq!(got.len(), RECORD_S * RATE as usize, "recorded 2 s in time");
+        let window_start = window_start.expect("a snapshot as the measured window began");
+        assert_eq!(
+            (
+                window_end.underruns - window_start.underruns,
+                window_end.skips - window_start.skips
+            ),
+            (0, 0),
+            "underruns and skips in the measured window"
+        );
         let measured = &got[MEASURE_FROM..];
         let crossings = rising_crossings(measured);
         assert!(crossings.len() > 2, "no tone in the recording");
