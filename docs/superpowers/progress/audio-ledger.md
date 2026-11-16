@@ -109,3 +109,7 @@ Task 12: fix round 2/5 (4 addressed, 0 open; commits fd7c92c..6695a1e); re-revie
 Task 13: dispatched (BASE 6695a1e, implementer opus)
 Task 12 hands-on rerun on 6695a1e (user, 2026-11-16 00:51Z): probe Allowed in 68 ms; the_tap_captures_and_the_speakers_stay_quiet PASS (1802 packets/10 s, buffer 256); the user confirmed silent.
 Task 12: complete (commits 8ef6ad1..6695a1e, review clean)
+Task 13: implementer DONE w/ concerns (d1e9749): hands-on tone test PASS 4/4 (999.001 Hz, −0.000 dB, 0 lost/underruns); the pitch sits at the receiver's −1000 ppm clamp while it converges (accepted: 1.7 cents, inaudible).
+Task 13: review 1 — Needs fixes. Important: stop/Drop freed and returned the Box<AudioRx> even when AudioDeviceStop and DestroyIOProcID both failed (possible use-after-free / aliased &mut).
+Ruling P13: MicFeed::stop -> Option<AudioRx>; the rx comes back only if the IOProc never started, or Stop or Destroy returned 0; otherwise it is leaked with a warn, and Task 14 makes a fresh PcMic pipe and swaps its AudioTx — cost: Task 14's tx() must be swappable.
+Task 13: fix round 1/5 dispatched (Important 1, Minors 1 and 3; deferred: Minor 2 pitch margin, Minor 4 unwind into the HAL).
