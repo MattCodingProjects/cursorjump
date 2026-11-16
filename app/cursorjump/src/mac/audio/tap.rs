@@ -75,15 +75,19 @@ const RING: usize = 48_000;
 const BUFFER_FRAMES: u32 = 256;
 /// Longest `cj-audio-send` sleeps without an unpark.
 const PARK: Duration = Duration::from_millis(2);
-/// How often `cj-audio-send` reports dropped frames.
-const REPORT: Duration = Duration::from_millis(500);
+/// How often `cj-audio-send` may warn about dropped or refused buffers.
+const REPORT: Duration = Duration::from_secs(1);
 /// Frames per resampler call when the tap isn't at 48 kHz.
 const RESAMPLE_CHUNK: usize = 256;
 /// Where an output device keeps its volume and mute: the main element,
 /// else channel 1.
 const ELEMENTS: [AudioObjectPropertyElement; 2] = [kAudioObjectPropertyElementMain, 1];
-/// How long the probe listens for its own noise before calling it refused.
+/// How long the probe listens to its own noise, from the first callback
+/// that played it, before calling capture refused.
 const PROBE_WINDOW: Duration = Duration::from_millis(500);
+/// The longest the probe waits for an answer once its IOProcs started:
+/// then it gives up (Failed, never Denied).
+const PROBE_CAP: Duration = Duration::from_secs(15);
 /// The probe's noise: ±1e-4, -80 dBFS, inaudible.
 const PROBE_LEVEL: f32 = 1e-4;
 
@@ -219,15 +223,11 @@ impl SoundTap {
         info!(
             "Mac sound: asked for {BUFFER_FRAMES} frames (OSStatus {st}); the buffer is {frames:?}"
         );
-        let tap_stream = device.tap_stream(out)?;
-        let rate = read_rate(device.0).unwrap_or_else(|| {
-            warn!("Mac sound: can't read the aggregate's rate; assuming {RATE} Hz");
-            RATE
-        });
+        let layout = device.tap_layout(out, tap.channels)?;
         let (ring, consumer) = RingBuffer::new(RING);
         let capturer = Capturer {
             ring,
-            tap_stream,
+            layout,
             shared: Arc::clone(&self.shared),
             sender: self.sender_thread.clone(),
         };
@@ -237,9 +237,8 @@ impl SoundTap {
             Some(capture_proc),
             Box::new(capturer),
         )?;
-        io.use_streams(kAudioObjectPropertyScopeInput, |i| i == tap_stream)?;
+        io.use_streams(kAudioObjectPropertyScopeInput, |i| i == layout.index)?;
         io.use_streams(kAudioObjectPropertyScopeOutput, |_| false)?;
-        self.shared.rate.store(rate, Relaxed);
         self.rings
             .as_ref()
             .context("cj-audio-send is gone")?
@@ -247,6 +246,12 @@ impl SoundTap {
             .map_err(|_| anyhow!("cj-audio-send is gone"))?;
         // Declared after `io`, so on an error it drops first.
         let watch = DeviceWatch::start(out, io.dev, Arc::clone(&self.shared));
+        // Read after the watch starts, so no change falls in between.
+        let rate = read_rate(io.dev).unwrap_or_else(|| {
+            warn!("Mac sound: can't read the aggregate's rate; assuming {RATE} Hz");
+            RATE
+        });
+        self.shared.rate.store(rate, Relaxed);
         let gain = read_gain(out);
         self.shared.gain.store(gain.to_bits(), Relaxed);
         io.start()?;
@@ -317,14 +322,14 @@ fn probe(me: AudioObjectID) -> Result<(), TapError> {
     let (out, out_uid) = default_output()?;
     let tap = Tap::new(TapKind::OnlyUs, me)?;
     let device = AggregateDevice::create(&tap.uid, &out_uid, "CursorJump probe")?;
-    let tap_stream = device.tap_stream(out)?;
+    let layout = device.tap_layout(out, tap.channels)?;
     let counts = Arc::new(ProbeCounts::default());
     let listener = ProbeListener {
-        tap_stream,
+        layout,
         counts: Arc::clone(&counts),
     };
     let mut listen = Io::new(device.0, Some(device), Some(probe_proc), Box::new(listener))?;
-    listen.use_streams(kAudioObjectPropertyScopeInput, |i| i == tap_stream)?;
+    listen.use_streams(kAudioObjectPropertyScopeInput, |i| i == layout.index)?;
     listen.use_streams(kAudioObjectPropertyScopeOutput, |_| false)?;
     let t = Instant::now();
     listen.start()?;
@@ -336,12 +341,20 @@ fn probe(me: AudioObjectID) -> Result<(), TapError> {
     let mut play = Io::new(out, None, Some(noise_proc), Box::new(noise))?;
     play.use_streams(kAudioObjectPropertyScopeInput, |_| false)?;
     play.start()?;
+    // The starts aren't timed: the first one waits on the user's answer to
+    // macOS's prompt. The window runs from the first noise played.
     let t0 = Instant::now();
+    // When the noise began, and how many tap callbacks had come by then.
+    let mut noise_began: Option<(Instant, u64)> = None;
     let verdict = loop {
+        let listened = counts.listened.load(Relaxed);
+        if noise_began.is_none() && counts.played.load(Relaxed) > 0 {
+            noise_began = Some((Instant::now(), listened));
+        }
         let v = verdict(
             counts.heard.load(Relaxed),
-            counts.listened.load(Relaxed),
-            counts.played.load(Relaxed),
+            noise_began.map_or(0, |(_, before)| listened - before),
+            noise_began.map(|(at, _)| at.elapsed()),
             t0.elapsed(),
         );
         if v != Verdict::Wait {
@@ -354,15 +367,20 @@ fn probe(me: AudioObjectID) -> Result<(), TapError> {
     drop(play);
     drop(listen);
     drop(tap);
+    let refused = counts.mismatched.load(Relaxed);
     info!(
-        "Mac sound: probe {verdict:?} after {waited:?} ({} tap callbacks, {} noise callbacks)",
+        "Mac sound: probe {verdict:?} after {waited:?} ({} tap callbacks, {} noise callbacks, \
+         {refused} with an unexpected stream layout)",
         counts.listened.load(Relaxed),
         counts.played.load(Relaxed)
     );
+    if refused > 0 {
+        warn!("Mac sound: the probe refused {refused} buffers with an unexpected stream layout");
+    }
     match verdict {
         Verdict::Allowed => Ok(()),
         Verdict::Denied => Err(TapError::Denied),
-        _ => Err(anyhow!("the probe's tap or noise never ran").into()),
+        _ => Err(anyhow!("the probe got no answer: its tap or its noise never ran").into()),
     }
 }
 
@@ -373,34 +391,44 @@ enum Verdict {
     Wait,
     Allowed,
     Denied,
-    /// The window passed without the tap or the noise running: no answer.
+    /// No answer: the tap heard no buffer through the window, or the
+    /// noise never played before [`PROBE_CAP`].
     Stalled,
 }
 
-/// The probe's decision: any non-zero sample is allowed; exact zeros for
-/// the whole [`PROBE_WINDOW`], with both IOProcs running, are refused.
-fn verdict(heard: bool, listened: u64, played: u64, elapsed: Duration) -> Verdict {
+/// The probe's decision. Any non-zero sample is allowed. Exact zeros for
+/// [`PROBE_WINDOW`] from the first noise played, with the tap's buffers
+/// arriving (`listened` of them since the noise began), are refused.
+/// `noise_for` is how long ago the noise began, `elapsed` the time since
+/// both IOProcs started.
+fn verdict(heard: bool, listened: u64, noise_for: Option<Duration>, elapsed: Duration) -> Verdict {
     if heard {
         Verdict::Allowed
-    } else if elapsed < PROBE_WINDOW {
-        Verdict::Wait
-    } else if listened == 0 || played == 0 {
+    } else if elapsed >= PROBE_CAP {
         Verdict::Stalled
     } else {
-        Verdict::Denied
+        match noise_for {
+            Some(d) if d >= PROBE_WINDOW && listened == 0 => Verdict::Stalled,
+            Some(d) if d >= PROBE_WINDOW => Verdict::Denied,
+            _ => Verdict::Wait,
+        }
     }
 }
 
 #[derive(Default)]
 struct ProbeCounts {
     heard: AtomicBool,
+    /// Callbacks that brought the tap's buffer.
     listened: AtomicU64,
+    /// Callbacks that wrote noise.
     played: AtomicU64,
+    /// Callbacks whose stream layout wasn't the one set up.
+    mismatched: AtomicU64,
 }
 
 /// The probe tap's IOProc state.
 struct ProbeListener {
-    tap_stream: usize,
+    layout: TapLayout,
     counts: Arc<ProbeCounts>,
 }
 
@@ -424,12 +452,18 @@ unsafe extern "C-unwind" fn probe_proc(
     // SAFETY: `client` is this IOProc's own state (Io::new).
     let p = unsafe { &*client.cast::<ProbeListener>() };
     // SAFETY: Core Audio passes a valid list for this callback.
-    if let Some((samples, _)) = unsafe { tap_samples(input, p.tap_stream) }
-        && samples.iter().any(|&x| x != 0.0)
-    {
-        p.counts.heard.store(true, Relaxed);
+    match unsafe { tap_samples(input, &p.layout) } {
+        Tapped::Samples(samples) => {
+            if samples.iter().any(|&x| x != 0.0) {
+                p.counts.heard.store(true, Relaxed);
+            }
+            p.counts.listened.fetch_add(1, Relaxed);
+        }
+        Tapped::Off => {}
+        Tapped::Mismatch => {
+            p.counts.mismatched.fetch_add(1, Relaxed);
+        }
     }
-    p.counts.listened.fetch_add(1, Relaxed);
     0
 }
 
@@ -445,11 +479,13 @@ unsafe extern "C-unwind" fn noise_proc(
 ) -> i32 {
     // SAFETY: `client` is this IOProc's own state (Io::new).
     let n = unsafe { &mut *client.cast::<Noise>() };
+    let mut wrote = false;
     // SAFETY: Core Audio passes a valid list for this callback.
     for b in unsafe { buffers(output) } {
-        if b.mData.is_null() {
+        if b.mData.is_null() || b.mDataByteSize < 4 {
             continue;
         }
+        wrote = true;
         // SAFETY: an output buffer of `mDataByteSize` bytes of float32.
         let samples = unsafe {
             std::slice::from_raw_parts_mut(b.mData.cast::<f32>(), b.mDataByteSize as usize / 4)
@@ -465,7 +501,9 @@ unsafe extern "C-unwind" fn noise_proc(
             };
         }
     }
-    n.counts.played.fetch_add(1, Relaxed);
+    if wrote {
+        n.counts.played.fetch_add(1, Relaxed);
+    }
     0
 }
 
@@ -484,6 +522,8 @@ enum TapKind {
 struct Tap {
     id: AudioObjectID,
     uid: String,
+    /// Channels in its stream: 2.
+    channels: usize,
 }
 
 impl Tap {
@@ -514,13 +554,17 @@ impl Tap {
         let mut tap = Tap {
             id,
             uid: String::new(),
+            channels: 2,
         };
         tap.uid = string_property(id, kAudioTapPropertyUID).context("reading the tap's UID")?;
         match get::<AudioStreamBasicDescription>(id, global(kAudioTapPropertyFormat), None) {
-            Ok(f) => info!(
-                "Mac sound: {kind:?} tap {id}: {} Hz, {} ch, flags {:#x}",
-                f.mSampleRate, f.mChannelsPerFrame, f.mFormatFlags
-            ),
+            Ok(f) => {
+                info!(
+                    "Mac sound: {kind:?} tap {id}: {} Hz, {} ch, flags {:#x}",
+                    f.mSampleRate, f.mChannelsPerFrame, f.mFormatFlags
+                );
+                tap.channels = f.mChannelsPerFrame as usize;
+            }
             Err(st) => warn!("Mac sound: reading the tap's format: OSStatus {st}"),
         }
         Ok(tap)
@@ -585,9 +629,9 @@ impl AggregateDevice {
         Ok(AggregateDevice(dev))
     }
 
-    /// The index of the tap's input stream: the aggregate lists the output
+    /// Where the tap's input stream is: the aggregate lists the output
     /// device's own input streams first, then the tap's one.
-    fn tap_stream(&self, out: AudioObjectID) -> Result<usize> {
+    fn tap_layout(&self, out: AudioObjectID, channels: usize) -> Result<TapLayout> {
         let own = stream_count(out, kAudioObjectPropertyScopeInput);
         let all = stream_count(self.0, kAudioObjectPropertyScopeInput);
         info!(
@@ -598,7 +642,11 @@ impl AggregateDevice {
             all == own + 1,
             "the aggregate has {all} input streams; expected {own} + the tap's"
         );
-        Ok(own)
+        Ok(TapLayout {
+            index: own,
+            buffers: all,
+            channels,
+        })
     }
 
     /// Destroys it now; Err is the OSStatus.
@@ -803,24 +851,52 @@ unsafe fn buffers<'a>(list: NonNull<AudioBufferList>) -> &'a [AudioBuffer] {
     }
 }
 
-/// The samples and channel count of input stream `index` of `list`, if it
-/// is there and on.
+/// Where an aggregate's IOProc finds the tap, as set up at open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TapLayout {
+    /// The tap's input buffer.
+    index: usize,
+    /// Input buffers in each callback.
+    buffers: usize,
+    /// Channels in the tap's buffer.
+    channels: usize,
+}
+
+/// What a callback's input list holds for the tap.
+#[derive(Debug, PartialEq)]
+enum Tapped<'a> {
+    /// The tap's samples, interleaved, [`TapLayout::channels`] a frame.
+    Samples(&'a [f32]),
+    /// The tap's buffer is there but off.
+    Off,
+    /// Not the layout set up (say, the output device's inputs changed):
+    /// use nothing, so a wrong stream (a microphone) is never sent.
+    Mismatch,
+}
+
+/// The tap's buffer in `list`, checked against `layout`.
 ///
 /// # Safety
 /// As [`buffers`]; the buffers hold float32 samples.
-unsafe fn tap_samples<'a>(
-    list: NonNull<AudioBufferList>,
-    index: usize,
-) -> Option<(&'a [f32], usize)> {
+unsafe fn tap_samples<'a>(list: NonNull<AudioBufferList>, layout: &TapLayout) -> Tapped<'a> {
     // SAFETY: as documented.
-    let b = unsafe { buffers(list) }.get(index)?;
+    let buffers = unsafe { buffers(list) };
+    if buffers.len() != layout.buffers {
+        return Tapped::Mismatch;
+    }
+    let Some(b) = buffers.get(layout.index) else {
+        return Tapped::Mismatch;
+    };
     if b.mData.is_null() {
-        return None;
+        return Tapped::Off;
+    }
+    if b.mNumberChannels as usize != layout.channels {
+        return Tapped::Mismatch;
     }
     // SAFETY: the buffer holds `mDataByteSize` bytes of float32 samples.
-    let samples =
-        unsafe { std::slice::from_raw_parts(b.mData.cast::<f32>(), b.mDataByteSize as usize / 4) };
-    Some((samples, b.mNumberChannels as usize))
+    Tapped::Samples(unsafe {
+        std::slice::from_raw_parts(b.mData.cast::<f32>(), b.mDataByteSize as usize / 4)
+    })
 }
 
 // Capture.
@@ -828,8 +904,7 @@ unsafe fn tap_samples<'a>(
 /// The capture IOProc's own state.
 struct Capturer {
     ring: Producer<f32>,
-    /// Which input buffer is the tap's.
-    tap_stream: usize,
+    layout: TapLayout,
     shared: Arc<Shared>,
     /// `cj-audio-send`, woken after each callback.
     sender: Thread,
@@ -849,8 +924,14 @@ unsafe extern "C-unwind" fn capture_proc(
     // touches it while the IOProc exists.
     let c = unsafe { &mut *client.cast::<Capturer>() };
     // SAFETY: Core Audio passes a valid list of float32 buffers.
-    if let Some((samples, channels)) = unsafe { tap_samples(input, c.tap_stream) } {
-        push_frames(&mut c.ring, samples, channels, &c.shared);
+    match unsafe { tap_samples(input, &c.layout) } {
+        Tapped::Samples(samples) => {
+            push_frames(&mut c.ring, samples, c.layout.channels, &c.shared);
+        }
+        Tapped::Off => {}
+        Tapped::Mismatch => {
+            c.shared.mismatched.fetch_add(1, Relaxed);
+        }
     }
     c.sender.unpark();
     0
@@ -862,6 +943,8 @@ struct Shared {
     gain: AtomicU32,
     /// Frames lost to a full ring.
     dropped: AtomicU64,
+    /// Callbacks refused for an unexpected stream layout.
+    mismatched: AtomicU64,
     /// The rate the IOProc gets, in Hz.
     rate: AtomicU32,
 }
@@ -871,6 +954,7 @@ impl Shared {
         Shared {
             gain: AtomicU32::new(1.0f32.to_bits()),
             dropped: AtomicU64::new(0),
+            mismatched: AtomicU64::new(0),
             rate: AtomicU32::new(RATE),
         }
     }
@@ -903,7 +987,7 @@ fn push_frames(ring: &mut Producer<f32>, samples: &[f32], channels: usize, share
 fn send(rings: &Receiver<Consumer<f32>>, shared: &Shared, mut sender: AudioSender) {
     let mut drain = Drain::new();
     let mut next_report = Instant::now() + REPORT;
-    let mut dropped = 0;
+    let (mut dropped, mut mismatched) = (0, 0);
     loop {
         loop {
             match rings.try_recv() {
@@ -924,6 +1008,14 @@ fn send(rings: &Receiver<Consumer<f32>>, shared: &Shared, mut sender: AudioSende
                     d - dropped
                 );
                 dropped = d;
+            }
+            let m = shared.mismatched.load(Relaxed);
+            if m != mismatched {
+                warn!(
+                    "Mac sound: {} callbacks had an unexpected stream layout; sent silence",
+                    m - mismatched
+                );
+                mismatched = m;
             }
         }
         std::thread::park_timeout(PARK);
@@ -1227,26 +1319,57 @@ mod tests {
 
     #[test]
     fn the_probe_allows_on_any_sound() {
-        assert_eq!(verdict(true, 1, 1, MS), Verdict::Allowed);
-        // Even if it came just as the window closed.
-        assert_eq!(verdict(true, 50, 50, PROBE_WINDOW * 2), Verdict::Allowed);
+        assert_eq!(verdict(true, 1, Some(MS), MS), Verdict::Allowed);
+        // Even before the noise counted as begun, or at the cap.
+        assert_eq!(verdict(true, 0, None, MS), Verdict::Allowed);
+        assert_eq!(verdict(true, 50, Some(MS), PROBE_CAP), Verdict::Allowed);
     }
 
     #[test]
     fn the_probe_waits_out_its_window_on_zeros() {
-        assert_eq!(verdict(false, 0, 0, Duration::ZERO), Verdict::Wait);
-        assert_eq!(verdict(false, 40, 40, PROBE_WINDOW - MS), Verdict::Wait);
+        assert_eq!(verdict(false, 0, None, Duration::ZERO), Verdict::Wait);
+        assert_eq!(
+            verdict(false, 40, Some(PROBE_WINDOW - MS), PROBE_WINDOW - MS),
+            Verdict::Wait
+        );
+    }
+
+    #[test]
+    fn the_window_runs_from_the_first_noise() {
+        // The noise began late (a slow output waking): 6 s after the start,
+        // 10 ms of it is no answer yet.
+        let late = Duration::from_secs(6);
+        assert_eq!(verdict(false, 0, None, late), Verdict::Wait);
+        assert_eq!(verdict(false, 2, Some(10 * MS), late), Verdict::Wait);
+        assert_eq!(
+            verdict(false, 40, Some(PROBE_WINDOW), late + PROBE_WINDOW),
+            Verdict::Denied
+        );
     }
 
     #[test]
     fn the_probe_denies_after_a_window_of_zeros() {
-        assert_eq!(verdict(false, 40, 40, PROBE_WINDOW), Verdict::Denied);
+        assert_eq!(
+            verdict(false, 40, Some(PROBE_WINDOW), PROBE_WINDOW),
+            Verdict::Denied
+        );
     }
 
     #[test]
-    fn zeros_from_a_probe_that_never_ran_are_no_answer() {
-        assert_eq!(verdict(false, 0, 40, PROBE_WINDOW), Verdict::Stalled);
-        assert_eq!(verdict(false, 40, 0, PROBE_WINDOW), Verdict::Stalled);
+    fn zeros_without_the_taps_buffer_are_no_answer() {
+        // A window of noise, but the tap's buffer never came.
+        assert_eq!(
+            verdict(false, 0, Some(PROBE_WINDOW), PROBE_WINDOW),
+            Verdict::Stalled
+        );
+    }
+
+    #[test]
+    fn the_cap_gives_no_answer_never_denied() {
+        // The noise never played.
+        assert_eq!(verdict(false, 0, None, PROBE_CAP), Verdict::Stalled);
+        // It began just before the cap.
+        assert_eq!(verdict(false, 3, Some(MS), PROBE_CAP), Verdict::Stalled);
     }
 
     /// An AudioBufferList with three buffers, laid out as Core Audio does.
@@ -1283,14 +1406,56 @@ mod tests {
             ],
         };
         let list = NonNull::from(&mut list).cast::<AudioBufferList>();
+        let layout = |index, buffers, channels| TapLayout {
+            index,
+            buffers,
+            channels,
+        };
         // SAFETY: `list` is a valid three-buffer list of float32 buffers.
         unsafe {
             assert_eq!(buffers(list).len(), 3);
-            assert_eq!(tap_samples(list, 2), Some((&tap[..], 2)));
-            assert_eq!(tap_samples(list, 1), Some((&mic[..], 1)));
-            // A stream turned off, and one that isn't there.
-            assert_eq!(tap_samples(list, 0), None);
-            assert_eq!(tap_samples(list, 3), None);
+            assert_eq!(tap_samples(list, &layout(2, 3, 2)), Tapped::Samples(&tap));
+            // A stream turned off.
+            assert_eq!(tap_samples(list, &layout(0, 3, 1)), Tapped::Off);
+        }
+    }
+
+    #[test]
+    fn a_changed_stream_layout_sends_nothing() {
+        let mut mic = [0.7f32; 4];
+        let mut tap = [0.1f32; 4];
+        let mut list = ThreeBuffers {
+            number: 3,
+            buffers: [
+                buffer(1, &mut mic),
+                buffer(1, &mut mic.clone()),
+                buffer(2, &mut tap),
+            ],
+        };
+        let list = NonNull::from(&mut list).cast::<AudioBufferList>();
+        // SAFETY: `list` is a valid three-buffer list of float32 buffers.
+        unsafe {
+            // Set up for two buffers, the tap second: it now has three.
+            let two = TapLayout {
+                index: 1,
+                buffers: 2,
+                channels: 2,
+            };
+            assert_eq!(tap_samples(list, &two), Tapped::Mismatch);
+            // The count matches, but the buffer there is a mono mic.
+            let mono = TapLayout {
+                index: 1,
+                buffers: 3,
+                channels: 2,
+            };
+            assert_eq!(tap_samples(list, &mono), Tapped::Mismatch);
+            // An index past the list.
+            let past = TapLayout {
+                index: 3,
+                buffers: 3,
+                channels: 2,
+            };
+            assert_eq!(tap_samples(list, &past), Tapped::Mismatch);
         }
     }
 
