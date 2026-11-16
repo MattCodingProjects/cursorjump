@@ -7,45 +7,52 @@
 //! the thread `cj-audio-send` drains the ring into the `MacSound` sender,
 //! resampling to 48 kHz if the tap runs at another rate.
 //!
-//! macOS gives no error when the user refused capture: the tap just
-//! delivers exact zeros. [`SoundTap::capture`] tells that apart from
-//! silence (T12-c).
+//! macOS gives no error when the user refused capture: a refused tap
+//! delivers exact zeros, and still mutes (F6). So before the global tap,
+//! [`SoundTap::start`] probes (P12): an unmuted tap of only our own process
+//! listens while we play inaudible noise. Exact zeros mean refused, and no
+//! global tap is made.
 
 use std::ffi::{CStr, c_void};
-use std::ptr::NonNull;
+use std::ptr::{NonNull, addr_of};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::thread::{JoinHandle, Thread};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, ensure};
 use block2::RcBlock;
 use cj_core::audio::{AudioStream, RATE};
-use cj_core::audio_state::Capture;
+use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
 use dispatch2::{DispatchQueue, DispatchQueueAttr, DispatchRetained};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{AnyThread, Message};
 use objc2_core_audio::{
-    AudioDeviceCreateIOProcID, AudioDeviceDestroyIOProcID, AudioDeviceIOProcID, AudioDeviceStart,
-    AudioDeviceStop, AudioHardwareCreateAggregateDevice, AudioHardwareCreateProcessTap,
-    AudioHardwareDestroyAggregateDevice, AudioHardwareDestroyProcessTap,
-    AudioObjectAddPropertyListenerBlock, AudioObjectGetPropertyData, AudioObjectHasProperty,
-    AudioObjectID, AudioObjectPropertyAddress, AudioObjectPropertyElement,
-    AudioObjectPropertySelector, AudioObjectRemovePropertyListenerBlock, CATapDescription,
+    AudioDeviceCreateIOProcID, AudioDeviceDestroyIOProcID, AudioDeviceIOProc, AudioDeviceIOProcID,
+    AudioDeviceStart, AudioDeviceStop, AudioHardwareCreateAggregateDevice,
+    AudioHardwareCreateProcessTap, AudioHardwareDestroyAggregateDevice,
+    AudioHardwareDestroyProcessTap, AudioObjectAddPropertyListenerBlock,
+    AudioObjectGetPropertyData, AudioObjectHasProperty, AudioObjectID, AudioObjectPropertyAddress,
+    AudioObjectPropertyElement, AudioObjectPropertyScope, AudioObjectPropertySelector,
+    AudioObjectRemovePropertyListenerBlock, AudioObjectSetPropertyData, CATapDescription,
     CATapMuteBehavior, kAudioAggregateDeviceIsPrivateKey, kAudioAggregateDeviceMainSubDeviceKey,
     kAudioAggregateDeviceNameKey, kAudioAggregateDeviceSubDeviceListKey,
     kAudioAggregateDeviceTapAutoStartKey, kAudioAggregateDeviceTapListKey,
-    kAudioAggregateDeviceUIDKey, kAudioDevicePropertyBufferFrameSize, kAudioDevicePropertyMute,
-    kAudioDevicePropertyNominalSampleRate, kAudioDevicePropertyVolumeDecibels,
-    kAudioDevicePropertyVolumeScalar, kAudioDevicePropertyVolumeScalarToDecibels,
-    kAudioHardwarePropertyDefaultOutputDevice, kAudioHardwarePropertyProcessObjectList,
+    kAudioAggregateDeviceUIDKey, kAudioDevicePropertyBufferFrameSize,
+    kAudioDevicePropertyIOProcStreamUsage, kAudioDevicePropertyMute,
+    kAudioDevicePropertyNominalSampleRate, kAudioDevicePropertyStreams,
+    kAudioDevicePropertyVolumeDecibels, kAudioDevicePropertyVolumeScalar,
+    kAudioDevicePropertyVolumeScalarToDecibels, kAudioHardwarePropertyDefaultOutputDevice,
     kAudioHardwarePropertyTranslatePIDToProcessObject, kAudioObjectPropertyElementMain,
-    kAudioObjectPropertyScopeOutput, kAudioObjectUnknown, kAudioProcessPropertyIsRunningOutput,
-    kAudioSubDeviceUIDKey, kAudioSubTapDriftCompensationKey, kAudioSubTapUIDKey,
-    kAudioTapPropertyFormat, kAudioTapPropertyUID,
+    kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyScopeInput,
+    kAudioObjectPropertyScopeOutput, kAudioObjectUnknown, kAudioSubDeviceUIDKey,
+    kAudioSubTapDriftCompensationKey, kAudioSubTapUIDKey, kAudioTapPropertyFormat,
+    kAudioTapPropertyUID,
 };
-use objc2_core_audio_types::{AudioBufferList, AudioStreamBasicDescription, AudioTimeStamp};
+use objc2_core_audio_types::{
+    AudioBuffer, AudioBufferList, AudioStreamBasicDescription, AudioTimeStamp,
+};
 use objc2_core_foundation::CFDictionary;
 use objc2_foundation::{NSArray, NSMutableDictionary, NSNumber, NSString};
 use rtrb::{Consumer, Producer, RingBuffer};
@@ -54,10 +61,10 @@ use rubato::{
     Async, FixedAsync, Resampler, SincInterpolationParameters, SincInterpolationType,
     WindowFunction,
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::devices::{
-    Listener, SYSTEM, SendBlock, device_uid, get, global, object_list, set, string_property,
+    Listener, SYSTEM, SendBlock, device_uid, get, global, property_size, set, string_property,
 };
 use crate::common::audio_pipe::{AudioOut, AudioSender};
 
@@ -68,24 +75,23 @@ const RING: usize = 48_000;
 const BUFFER_FRAMES: u32 = 256;
 /// Longest `cj-audio-send` sleeps without an unpark.
 const PARK: Duration = Duration::from_millis(2);
-/// How often `cj-audio-send` looks for denial.
-const LOOK: Duration = Duration::from_millis(500);
-/// How long exact zeros, while another app plays, mean capture is refused.
-const DENIED_AFTER: Duration = Duration::from_secs(3);
+/// How often `cj-audio-send` reports dropped frames.
+const REPORT: Duration = Duration::from_millis(500);
 /// Frames per resampler call when the tap isn't at 48 kHz.
 const RESAMPLE_CHUNK: usize = 256;
 /// Where an output device keeps its volume and mute: the main element,
 /// else channel 1.
 const ELEMENTS: [AudioObjectPropertyElement; 2] = [kAudioObjectPropertyElementMain, 1];
+/// How long the probe listens for its own noise before calling it refused.
+const PROBE_WINDOW: Duration = Duration::from_millis(500);
+/// The probe's noise: ±1e-4, -80 dBFS, inaudible.
+const PROBE_LEVEL: f32 = 1e-4;
 
 #[derive(Debug)]
 pub enum TapError {
-    /// Capture refused. Never returned by [`SoundTap::start`]: refusal
-    /// shows only as zeros, later, so [`SoundTap::capture`] reports it.
-    #[cfg_attr(
-        test,
-        expect(dead_code, reason = "denial is reported through SoundTap::capture")
-    )]
+    /// The user refused capture (System Settings › Privacy & Security ›
+    /// Screen & System Audio Recording). No tap was made: the Mac keeps
+    /// its own sound.
     Denied,
     Failed(anyhow::Error),
 }
@@ -118,122 +124,151 @@ pub fn mix_gain(volume_db: Option<f32>, muted: bool) -> f32 {
 /// IOProc and destroys the aggregate, then the tap: the Mac's speakers play
 /// again.
 ///
-/// Make, rebuild and drop it on the `cj-audio` thread only: starting the
-/// tap blocks while macOS shows its permission prompt (T12-d). It is not
+/// Make, rebuild and drop it on the `cj-audio` thread only: the probe and
+/// the tap block while macOS shows its permission prompt (T12-d). It is not
 /// `Send`, so it stays on the thread that made it.
 pub struct SoundTap {
     /// Our own process object, left out of the tap.
     me: AudioObjectID,
     tap: Option<Tap>,
-    aggregate: Option<Aggregate>,
-    volume: Option<VolumeWatch>,
-    /// The IOProc's state, from `Box::leak`; freed in Drop once no
-    /// aggregate runs the IOProc. It outlives rebuilds, counters and all.
-    io: NonNull<IoProc>,
+    /// Declared before `aggregate`: its listeners go first.
+    watch: Option<DeviceWatch>,
+    aggregate: Option<Io<Capturer>>,
     shared: Arc<Shared>,
+    /// Each new aggregate's ring, to `cj-audio-send`; dropped to stop it.
+    rings: Option<Sender<Consumer<f32>>>,
     sender: Option<JoinHandle<()>>,
+    /// `cj-audio-send`, for the IOProc to wake.
+    sender_thread: Thread,
 }
 
 impl SoundTap {
-    /// Starts a global muted tap excluding our process, a private aggregate
-    /// on the default output and its IOProc. `on_capture` is told, on
-    /// `cj-audio-send`, of each change in [`SoundTap::capture`].
-    pub fn start(
-        out: AudioOut,
-        on_capture: impl Fn(Capture) + Send + 'static,
-    ) -> Result<SoundTap, TapError> {
+    /// Probes whether macOS lets us capture, then starts a global muted
+    /// tap excluding our process, a private aggregate on the default
+    /// output and its IOProc. `Err(Denied)` means refused: nothing was
+    /// made, and the Mac keeps its own sound.
+    pub fn start(out: AudioOut) -> Result<SoundTap, TapError> {
         let me = own_process_object()?;
+        probe(me)?;
         let shared = Arc::new(Shared::new());
-        let (ring, consumer) = RingBuffer::new(RING);
+        let (rings, rings_rx) = unbounded();
         let sender = {
             let shared = Arc::clone(&shared);
             let sender = out.sender(STREAM);
             std::thread::Builder::new()
                 .name("cj-audio-send".into())
-                .spawn(move || send(consumer, &shared, sender, me, on_capture))
+                .spawn(move || {
+                    let run = std::panic::AssertUnwindSafe(|| send(&rings_rx, &shared, sender));
+                    if std::panic::catch_unwind(run).is_err() {
+                        error!("cj-audio-send panicked; no more Mac sound goes to the PC");
+                    }
+                })
                 .context("starting cj-audio-send")?
         };
-        let io = Box::leak(Box::new(IoProc {
-            ring,
-            shared: Arc::clone(&shared),
-            sender: sender.thread().clone(),
-        }));
         // From here on, Drop undoes whatever was made.
         let mut tap = SoundTap {
             me,
             tap: None,
+            watch: None,
             aggregate: None,
-            volume: None,
-            io: NonNull::from(io),
             shared,
+            rings: Some(rings),
+            sender_thread: sender.thread().clone(),
             sender: Some(sender),
         };
-        tap.tap = Some(Tap::new(me)?);
+        tap.tap = Some(Tap::new(TapKind::AllButUs, me)?);
         tap.open_aggregate()?;
         Ok(tap)
     }
 
     /// Moves to the current default output: call on `DefaultOutputChanged`
     /// (S1). Rebuilds the aggregate on the same tap, or on a new tap if
-    /// that fails.
+    /// that fails. It doesn't probe again: the grant is process-wide.
+    ///
+    /// After an `Err` the tap is down, so the Mac plays its own sound; a
+    /// later rebuild tries again.
     pub fn rebuild(&mut self) -> Result<(), TapError> {
         self.close_aggregate();
-        if let Err(e) = self.open_aggregate() {
+        let opened = self.open_aggregate().or_else(|e| {
             warn!("Mac sound: rebuilding on the same tap failed ({e:#}); making a new tap");
             self.close_aggregate();
             self.tap = None;
-            self.tap = Some(Tap::new(self.me)?);
-            self.open_aggregate()?;
+            self.tap = Some(Tap::new(TapKind::AllButUs, self.me)?);
+            self.open_aggregate()
+        });
+        if let Err(e) = opened {
+            // Never leave the Mac muted with nothing reading the tap.
+            self.close_aggregate();
+            self.tap = None;
+            warn!("Mac sound: rebuilding failed ({e:#}); the Mac plays its own sound");
+            return Err(e.into());
         }
         Ok(())
     }
 
-    /// Whether macOS lets us capture, as far as the stream shows yet.
-    pub fn capture(&self) -> Capture {
-        capture_from_u8(self.shared.capture.load(Relaxed))
-    }
-
     fn open_aggregate(&mut self) -> Result<()> {
         let tap = self.tap.as_ref().context("no tap")?;
-        let out = get::<AudioObjectID>(
-            SYSTEM,
-            global(kAudioHardwarePropertyDefaultOutputDevice),
-            None,
-        )
-        .ok()
-        .filter(|&d| d != kAudioObjectUnknown)
-        .context("the Mac has no default output")?;
-        let out_uid = device_uid(out).context("reading the default output's UID")?;
-        // Listen before reading, so no change falls in between.
-        self.volume = Some(VolumeWatch::start(out, Arc::clone(&self.shared)));
+        let (out, out_uid) = default_output()?;
+        let device = AggregateDevice::create(&tap.uid, &out_uid, "CursorJump sound tap")?;
+        let st = set(
+            device.0,
+            global(kAudioDevicePropertyBufferFrameSize),
+            BUFFER_FRAMES,
+        );
+        let frames = get::<u32>(device.0, global(kAudioDevicePropertyBufferFrameSize), None);
+        info!(
+            "Mac sound: asked for {BUFFER_FRAMES} frames (OSStatus {st}); the buffer is {frames:?}"
+        );
+        let tap_stream = device.tap_stream(out)?;
+        let rate = read_rate(device.0).unwrap_or_else(|| {
+            warn!("Mac sound: can't read the aggregate's rate; assuming {RATE} Hz");
+            RATE
+        });
+        let (ring, consumer) = RingBuffer::new(RING);
+        let capturer = Capturer {
+            ring,
+            tap_stream,
+            shared: Arc::clone(&self.shared),
+            sender: self.sender_thread.clone(),
+        };
+        let mut io = Io::new(
+            device.0,
+            Some(device),
+            Some(capture_proc),
+            Box::new(capturer),
+        )?;
+        io.use_streams(kAudioObjectPropertyScopeInput, |i| i == tap_stream)?;
+        io.use_streams(kAudioObjectPropertyScopeOutput, |_| false)?;
+        self.shared.rate.store(rate, Relaxed);
+        self.rings
+            .as_ref()
+            .context("cj-audio-send is gone")?
+            .send(consumer)
+            .map_err(|_| anyhow!("cj-audio-send is gone"))?;
+        // Declared after `io`, so on an error it drops first.
+        let watch = DeviceWatch::start(out, io.dev, Arc::clone(&self.shared));
         let gain = read_gain(out);
         self.shared.gain.store(gain.to_bits(), Relaxed);
-        let mut aggregate = Aggregate::create(&tap.uid, &out_uid, self.io)?;
-        self.shared.rate.store(aggregate.rate, Relaxed);
-        aggregate.start()?;
-        info!(
-            "Mac sound: tapping on {out_uid} at {} Hz, gain {gain:.3}",
-            aggregate.rate
-        );
-        self.aggregate = Some(aggregate);
+        io.start()?;
+        info!("Mac sound: tapping on {out_uid} at {rate} Hz, gain {gain:.3}");
+        self.watch = Some(watch);
+        self.aggregate = Some(io);
         Ok(())
     }
 
     fn close_aggregate(&mut self) {
-        self.volume = None;
+        self.watch = None;
         self.aggregate = None;
     }
 }
 
 impl Drop for SoundTap {
     fn drop(&mut self) {
-        // Stops the IOProc, destroys its ID, then the aggregate.
+        // Stops the IOProc, destroys its ID, the aggregate, then the tap.
         self.close_aggregate();
         self.tap = None;
-        // SAFETY: from Box::leak in `start`; no aggregate runs the IOProc
-        // any more, so nothing else points at it.
-        drop(unsafe { Box::from_raw(self.io.as_ptr()) });
-        // The ring's producer is gone: cj-audio-send drains it and ends.
+        // cj-audio-send ends once the channel is gone.
+        drop(self.rings.take());
         if let Some(t) = self.sender.take() {
             t.thread().unpark();
             let _ = t.join();
@@ -242,7 +277,7 @@ impl Drop for SoundTap {
 }
 
 /// Our own process object, so the tap leaves out the PC's mic that we
-/// play into the feed device.
+/// play into the feed device (and the probe's noise).
 fn own_process_object() -> Result<AudioObjectID> {
     let pid = std::process::id() as i32;
     let id: AudioObjectID = get(
@@ -258,30 +293,224 @@ fn own_process_object() -> Result<AudioObjectID> {
     Ok(id)
 }
 
-/// A global stereo tap of every process but one, muted and private.
+/// The default output and its UID.
+fn default_output() -> Result<(AudioObjectID, String)> {
+    let out = get::<AudioObjectID>(
+        SYSTEM,
+        global(kAudioHardwarePropertyDefaultOutputDevice),
+        None,
+    )
+    .ok()
+    .filter(|&d| d != kAudioObjectUnknown)
+    .context("the Mac has no default output")?;
+    let uid = device_uid(out).context("reading the default output's UID")?;
+    Ok((out, uid))
+}
+
+// The probe (P12).
+
+/// Whether macOS lets us capture: an unmuted tap of only our own process,
+/// on its own aggregate, listens while our process plays ±1e-4 noise to
+/// the default output. Everything is torn down before it returns. Blocks
+/// while macOS asks the user, the first time.
+fn probe(me: AudioObjectID) -> Result<(), TapError> {
+    let (out, out_uid) = default_output()?;
+    let tap = Tap::new(TapKind::OnlyUs, me)?;
+    let device = AggregateDevice::create(&tap.uid, &out_uid, "CursorJump probe")?;
+    let tap_stream = device.tap_stream(out)?;
+    let counts = Arc::new(ProbeCounts::default());
+    let listener = ProbeListener {
+        tap_stream,
+        counts: Arc::clone(&counts),
+    };
+    let mut listen = Io::new(device.0, Some(device), Some(probe_proc), Box::new(listener))?;
+    listen.use_streams(kAudioObjectPropertyScopeInput, |i| i == tap_stream)?;
+    listen.use_streams(kAudioObjectPropertyScopeOutput, |_| false)?;
+    let t = Instant::now();
+    listen.start()?;
+    debug!("Mac sound: the probe's tap started in {:?}", t.elapsed());
+    let noise = Noise {
+        seed: 0x9E37_79B9,
+        counts: Arc::clone(&counts),
+    };
+    let mut play = Io::new(out, None, Some(noise_proc), Box::new(noise))?;
+    play.use_streams(kAudioObjectPropertyScopeInput, |_| false)?;
+    play.start()?;
+    let t0 = Instant::now();
+    let verdict = loop {
+        let v = verdict(
+            counts.heard.load(Relaxed),
+            counts.listened.load(Relaxed),
+            counts.played.load(Relaxed),
+            t0.elapsed(),
+        );
+        if v != Verdict::Wait {
+            break v;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let waited = t0.elapsed();
+    // The noise first, then the probe's aggregate, then its tap.
+    drop(play);
+    drop(listen);
+    drop(tap);
+    info!(
+        "Mac sound: probe {verdict:?} after {waited:?} ({} tap callbacks, {} noise callbacks)",
+        counts.listened.load(Relaxed),
+        counts.played.load(Relaxed)
+    );
+    match verdict {
+        Verdict::Allowed => Ok(()),
+        Verdict::Denied => Err(TapError::Denied),
+        _ => Err(anyhow!("the probe's tap or noise never ran").into()),
+    }
+}
+
+/// What the probe has shown so far.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    /// Keep listening.
+    Wait,
+    Allowed,
+    Denied,
+    /// The window passed without the tap or the noise running: no answer.
+    Stalled,
+}
+
+/// The probe's decision: any non-zero sample is allowed; exact zeros for
+/// the whole [`PROBE_WINDOW`], with both IOProcs running, are refused.
+fn verdict(heard: bool, listened: u64, played: u64, elapsed: Duration) -> Verdict {
+    if heard {
+        Verdict::Allowed
+    } else if elapsed < PROBE_WINDOW {
+        Verdict::Wait
+    } else if listened == 0 || played == 0 {
+        Verdict::Stalled
+    } else {
+        Verdict::Denied
+    }
+}
+
+#[derive(Default)]
+struct ProbeCounts {
+    heard: AtomicBool,
+    listened: AtomicU64,
+    played: AtomicU64,
+}
+
+/// The probe tap's IOProc state.
+struct ProbeListener {
+    tap_stream: usize,
+    counts: Arc<ProbeCounts>,
+}
+
+/// The noise player's IOProc state.
+struct Noise {
+    /// xorshift32.
+    seed: u32,
+    counts: Arc<ProbeCounts>,
+}
+
+/// Real-time: notes whether the probe's tap heard anything.
+unsafe extern "C-unwind" fn probe_proc(
+    _dev: AudioObjectID,
+    _now: NonNull<AudioTimeStamp>,
+    input: NonNull<AudioBufferList>,
+    _input_time: NonNull<AudioTimeStamp>,
+    _output: NonNull<AudioBufferList>,
+    _output_time: NonNull<AudioTimeStamp>,
+    client: *mut c_void,
+) -> i32 {
+    // SAFETY: `client` is this IOProc's own state (Io::new).
+    let p = unsafe { &*client.cast::<ProbeListener>() };
+    // SAFETY: Core Audio passes a valid list for this callback.
+    if let Some((samples, _)) = unsafe { tap_samples(input, p.tap_stream) }
+        && samples.iter().any(|&x| x != 0.0)
+    {
+        p.counts.heard.store(true, Relaxed);
+    }
+    p.counts.listened.fetch_add(1, Relaxed);
+    0
+}
+
+/// Real-time: fills every output buffer with ±[`PROBE_LEVEL`] noise.
+unsafe extern "C-unwind" fn noise_proc(
+    _dev: AudioObjectID,
+    _now: NonNull<AudioTimeStamp>,
+    _input: NonNull<AudioBufferList>,
+    _input_time: NonNull<AudioTimeStamp>,
+    output: NonNull<AudioBufferList>,
+    _output_time: NonNull<AudioTimeStamp>,
+    client: *mut c_void,
+) -> i32 {
+    // SAFETY: `client` is this IOProc's own state (Io::new).
+    let n = unsafe { &mut *client.cast::<Noise>() };
+    // SAFETY: Core Audio passes a valid list for this callback.
+    for b in unsafe { buffers(output) } {
+        if b.mData.is_null() {
+            continue;
+        }
+        // SAFETY: an output buffer of `mDataByteSize` bytes of float32.
+        let samples = unsafe {
+            std::slice::from_raw_parts_mut(b.mData.cast::<f32>(), b.mDataByteSize as usize / 4)
+        };
+        for s in samples {
+            n.seed ^= n.seed << 13;
+            n.seed ^= n.seed >> 17;
+            n.seed ^= n.seed << 5;
+            *s = if n.seed & 1 == 0 {
+                PROBE_LEVEL
+            } else {
+                -PROBE_LEVEL
+            };
+        }
+    }
+    n.counts.played.fetch_add(1, Relaxed);
+    0
+}
+
+// Taps, aggregates and IOProcs.
+
+/// Which processes a tap hears.
+#[derive(Debug, Clone, Copy)]
+enum TapKind {
+    /// Every process but ours, muted: the Mac's sound for the PC.
+    AllButUs,
+    /// Only ours, unmuted: the probe.
+    OnlyUs,
+}
+
+/// A private stereo process tap.
 struct Tap {
     id: AudioObjectID,
     uid: String,
 }
 
 impl Tap {
-    fn new(exclude: AudioObjectID) -> Result<Tap> {
-        let excluded = NSArray::from_retained_slice(&[NSNumber::new_u32(exclude)]);
+    fn new(kind: TapKind, me: AudioObjectID) -> Result<Tap> {
+        let processes = NSArray::from_retained_slice(&[NSNumber::new_u32(me)]);
         // SAFETY: plain Objective-C calls on a description this function owns.
         let desc = unsafe {
-            let desc = CATapDescription::initStereoGlobalTapButExcludeProcesses(
-                CATapDescription::alloc(),
-                &excluded,
-            );
+            let alloc = CATapDescription::alloc();
+            let (desc, mute) = match kind {
+                TapKind::AllButUs => (
+                    CATapDescription::initStereoGlobalTapButExcludeProcesses(alloc, &processes),
+                    CATapMuteBehavior::Muted,
+                ),
+                TapKind::OnlyUs => (
+                    CATapDescription::initStereoMixdownOfProcesses(alloc, &processes),
+                    CATapMuteBehavior::Unmuted,
+                ),
+            };
             desc.setName(&NSString::from_str("CursorJump"));
             desc.setPrivate(true);
-            desc.setMuteBehavior(CATapMuteBehavior::Muted);
+            desc.setMuteBehavior(mute);
             desc
         };
         let mut id = kAudioObjectUnknown;
         // SAFETY: `id` outlives the call.
         let st = unsafe { AudioHardwareCreateProcessTap(Some(&desc), &mut id) };
-        ensure!(st == 0, "creating the tap: OSStatus {st}");
+        ensure!(st == 0, "creating the {kind:?} tap: OSStatus {st}");
         let mut tap = Tap {
             id,
             uid: String::new(),
@@ -289,7 +518,7 @@ impl Tap {
         tap.uid = string_property(id, kAudioTapPropertyUID).context("reading the tap's UID")?;
         match get::<AudioStreamBasicDescription>(id, global(kAudioTapPropertyFormat), None) {
             Ok(f) => info!(
-                "Mac sound: tap {id}: {} Hz, {} ch, flags {:#x}",
+                "Mac sound: {kind:?} tap {id}: {} Hz, {} ch, flags {:#x}",
                 f.mSampleRate, f.mChannelsPerFrame, f.mFormatFlags
             ),
             Err(st) => warn!("Mac sound: reading the tap's format: OSStatus {st}"),
@@ -308,17 +537,12 @@ impl Drop for Tap {
     }
 }
 
-/// A private aggregate device whose input is the tap, on the default output.
-struct Aggregate {
-    dev: AudioObjectID,
-    proc_id: AudioDeviceIOProcID,
-    started: bool,
-    /// The rate the IOProc gets.
-    rate: u32,
-}
+/// A private aggregate device whose input is a tap, on an output device.
+/// Dropping it destroys it; an [`Io`] destroys it only after its IOProc.
+struct AggregateDevice(AudioObjectID);
 
-impl Aggregate {
-    fn create(tap_uid: &str, out_uid: &str, io: NonNull<IoProc>) -> Result<Aggregate> {
+impl AggregateDevice {
+    fn create(tap_uid: &str, out_uid: &str, name: &str) -> Result<AggregateDevice> {
         static BUILT: AtomicU32 = AtomicU32::new(0);
         let n = BUILT.fetch_add(1, Relaxed);
         let uid = format!("com.cursorjump.sound-tap.{}.{n}", std::process::id());
@@ -331,10 +555,7 @@ impl Aggregate {
             ),
         ]);
         let desc = dict(&[
-            (
-                kAudioAggregateDeviceNameKey,
-                obj(ns("CursorJump sound tap")),
-            ),
+            (kAudioAggregateDeviceNameKey, obj(ns(name))),
             (kAudioAggregateDeviceUIDKey, obj(ns(&uid))),
             (
                 kAudioAggregateDeviceIsPrivateKey,
@@ -361,69 +582,189 @@ impl Aggregate {
         // SAFETY: `dev` outlives the call.
         let st = unsafe { AudioHardwareCreateAggregateDevice(cf, NonNull::from(&mut dev)) };
         ensure!(st == 0, "creating the aggregate device: OSStatus {st}");
-        let mut aggregate = Aggregate {
+        Ok(AggregateDevice(dev))
+    }
+
+    /// The index of the tap's input stream: the aggregate lists the output
+    /// device's own input streams first, then the tap's one.
+    fn tap_stream(&self, out: AudioObjectID) -> Result<usize> {
+        let own = stream_count(out, kAudioObjectPropertyScopeInput);
+        let all = stream_count(self.0, kAudioObjectPropertyScopeInput);
+        info!(
+            "Mac sound: aggregate {} has {all} input streams ({own} of the output device's own)",
+            self.0
+        );
+        ensure!(
+            all == own + 1,
+            "the aggregate has {all} input streams; expected {own} + the tap's"
+        );
+        Ok(own)
+    }
+
+    /// Destroys it now; Err is the OSStatus.
+    fn destroy(self) -> Result<(), i32> {
+        let dev = self.0;
+        std::mem::forget(self);
+        // SAFETY: our own aggregate, destroyed once.
+        let st = unsafe { AudioHardwareDestroyAggregateDevice(dev) };
+        if st == 0 { Ok(()) } else { Err(st) }
+    }
+}
+
+impl Drop for AggregateDevice {
+    fn drop(&mut self) {
+        // SAFETY: our own aggregate, destroyed once.
+        let st = unsafe { AudioHardwareDestroyAggregateDevice(self.0) };
+        if st != 0 {
+            warn!("Mac sound: destroying the aggregate: OSStatus {st}");
+        }
+    }
+}
+
+/// An IOProc on a device, with the state it runs on, and the private
+/// aggregate it runs on, if any. Drop stops the IOProc, destroys its ID,
+/// then the aggregate, and only then frees the state; if Core Audio
+/// refused any of that, the state is leaked rather than freed under it.
+struct Io<S> {
+    dev: AudioObjectID,
+    aggregate: Option<AggregateDevice>,
+    proc_id: AudioDeviceIOProcID,
+    started: bool,
+    /// From `Box::leak`; the IOProc's alone while it runs.
+    state: NonNull<S>,
+}
+
+impl<S> Io<S> {
+    fn new(
+        dev: AudioObjectID,
+        aggregate: Option<AggregateDevice>,
+        proc: AudioDeviceIOProc,
+        state: Box<S>,
+    ) -> Result<Io<S>> {
+        let mut io = Io {
             dev,
+            aggregate,
             proc_id: None,
             started: false,
-            rate: RATE,
+            state: NonNull::from(Box::leak(state)),
         };
-
-        let st = set(
-            dev,
-            global(kAudioDevicePropertyBufferFrameSize),
-            BUFFER_FRAMES,
-        );
-        let frames = get::<u32>(dev, global(kAudioDevicePropertyBufferFrameSize), None);
-        info!(
-            "Mac sound: asked for {BUFFER_FRAMES} frames (OSStatus {st}); the buffer is {frames:?}"
-        );
-        match get::<f64>(dev, global(kAudioDevicePropertyNominalSampleRate), None) {
-            Ok(r) if r >= 1.0 => aggregate.rate = r.round() as u32,
-            other => warn!("Mac sound: the aggregate's rate is {other:?}; assuming {RATE} Hz"),
-        }
-
-        // SAFETY: `io` stays valid until after this aggregate is destroyed
-        // (SoundTap's Drop), and only the IOProc uses it.
+        // SAFETY: the state stays valid until after the IOProc is destroyed
+        // (Drop), and only the IOProc uses it.
         let st = unsafe {
             AudioDeviceCreateIOProcID(
                 dev,
-                Some(io_proc),
-                io.as_ptr().cast(),
-                NonNull::from(&mut aggregate.proc_id),
+                proc,
+                io.state.as_ptr().cast(),
+                NonNull::from(&mut io.proc_id),
             )
         };
-        ensure!(st == 0, "creating the IOProc: OSStatus {st}");
-        Ok(aggregate)
+        ensure!(st == 0, "creating an IOProc on device {dev}: OSStatus {st}");
+        Ok(io)
+    }
+
+    /// Turns each of this IOProc's streams in `scope` on or off, so the
+    /// device opens only what it needs (no microphone).
+    fn use_streams(
+        &self,
+        scope: AudioObjectPropertyScope,
+        on: impl Fn(usize) -> bool,
+    ) -> Result<()> {
+        let n = stream_count(self.dev, scope);
+        if n == 0 {
+            return Ok(());
+        }
+        // AudioHardwareIOProcStreamUsage: the IOProc ID, a stream count,
+        // then one UInt32 flag per stream. u64s keep the pointer aligned.
+        let size = 12 + 4 * n;
+        let mut usage = vec![0u64; size.div_ceil(8)];
+        let p = usage.as_mut_ptr().cast::<u8>();
+        let proc_ptr = self
+            .proc_id
+            .map_or(std::ptr::null(), |f| f as *const c_void);
+        // SAFETY: every write is inside `usage`, at its C layout's offsets.
+        unsafe {
+            p.cast::<*const c_void>().write(proc_ptr);
+            p.add(8).cast::<u32>().write(n as u32);
+            for i in 0..n {
+                p.add(12 + 4 * i).cast::<u32>().write(u32::from(on(i)));
+            }
+        }
+        let mut address = AudioObjectPropertyAddress {
+            mSelector: kAudioDevicePropertyIOProcStreamUsage,
+            mScope: scope,
+            mElement: kAudioObjectPropertyElementMain,
+        };
+        // SAFETY: every pointer outlives the call; `size` bytes of `usage`.
+        let st = unsafe {
+            AudioObjectSetPropertyData(
+                self.dev,
+                NonNull::from(&mut address),
+                0,
+                std::ptr::null(),
+                size as u32,
+                NonNull::new(p).unwrap().cast(),
+            )
+        };
+        ensure!(
+            st == 0,
+            "choosing the IOProc's streams on device {}: OSStatus {st}",
+            self.dev
+        );
+        Ok(())
     }
 
     /// Blocks while macOS asks the user for permission, the first time.
     fn start(&mut self) -> Result<()> {
-        let t = Instant::now();
-        // SAFETY: our own device and IOProc.
+        // SAFETY: our own IOProc on this device.
         let st = unsafe { AudioDeviceStart(self.dev, self.proc_id) };
         ensure!(st == 0, "starting the IOProc: OSStatus {st}");
         self.started = true;
-        debug!("Mac sound: AudioDeviceStart took {:?}", t.elapsed());
         Ok(())
     }
 }
 
-impl Drop for Aggregate {
+impl<S> Drop for Io<S> {
     fn drop(&mut self) {
-        // SAFETY: our own device and IOProc, each undone once, in order.
+        let mut failed = Vec::new();
+        // SAFETY: our own IOProc on this device, each step done once.
         unsafe {
             if self.started {
-                AudioDeviceStop(self.dev, self.proc_id);
+                let st = AudioDeviceStop(self.dev, self.proc_id);
+                if st != 0 {
+                    failed.push(("stopping the IOProc", st));
+                }
             }
             if self.proc_id.is_some() {
-                AudioDeviceDestroyIOProcID(self.dev, self.proc_id);
-            }
-            let st = AudioHardwareDestroyAggregateDevice(self.dev);
-            if st != 0 {
-                warn!("Mac sound: destroying the aggregate: OSStatus {st}");
+                let st = AudioDeviceDestroyIOProcID(self.dev, self.proc_id);
+                if st != 0 {
+                    failed.push(("destroying the IOProc", st));
+                }
             }
         }
+        if let Some(aggregate) = self.aggregate.take()
+            && let Err(st) = aggregate.destroy()
+        {
+            failed.push(("destroying the aggregate", st));
+        }
+        if failed.is_empty() {
+            // SAFETY: from Box::leak in `new`; no IOProc can run on it now.
+            drop(unsafe { Box::from_raw(self.state.as_ptr()) });
+        } else {
+            warn!(
+                "Mac sound: on device {}, {failed:?} failed; leaking the IOProc's state",
+                self.dev
+            );
+        }
     }
+}
+
+fn stream_count(dev: AudioObjectID, scope: AudioObjectPropertyScope) -> usize {
+    let address = AudioObjectPropertyAddress {
+        mSelector: kAudioDevicePropertyStreams,
+        mScope: scope,
+        mElement: kAudioObjectPropertyElementMain,
+    };
+    property_size(dev, address) as usize / size_of::<AudioObjectID>()
 }
 
 fn ns(s: &str) -> Retained<NSString> {
@@ -447,16 +788,55 @@ fn dict(
     d
 }
 
-/// The IOProc's own state.
-struct IoProc {
+/// The buffers of `list`.
+///
+/// # Safety
+/// `list` must point at a valid AudioBufferList for the returned lifetime.
+unsafe fn buffers<'a>(list: NonNull<AudioBufferList>) -> &'a [AudioBuffer] {
+    let list = list.as_ptr();
+    // SAFETY: the list holds `mNumberBuffers` buffers; the pointer comes
+    // from the list itself, not from its one-element array.
+    unsafe {
+        let n = (*list).mNumberBuffers as usize;
+        let first = addr_of!((*list).mBuffers).cast::<AudioBuffer>();
+        std::slice::from_raw_parts(first, n)
+    }
+}
+
+/// The samples and channel count of input stream `index` of `list`, if it
+/// is there and on.
+///
+/// # Safety
+/// As [`buffers`]; the buffers hold float32 samples.
+unsafe fn tap_samples<'a>(
+    list: NonNull<AudioBufferList>,
+    index: usize,
+) -> Option<(&'a [f32], usize)> {
+    // SAFETY: as documented.
+    let b = unsafe { buffers(list) }.get(index)?;
+    if b.mData.is_null() {
+        return None;
+    }
+    // SAFETY: the buffer holds `mDataByteSize` bytes of float32 samples.
+    let samples =
+        unsafe { std::slice::from_raw_parts(b.mData.cast::<f32>(), b.mDataByteSize as usize / 4) };
+    Some((samples, b.mNumberChannels as usize))
+}
+
+// Capture.
+
+/// The capture IOProc's own state.
+struct Capturer {
     ring: Producer<f32>,
+    /// Which input buffer is the tap's.
+    tap_stream: usize,
     shared: Arc<Shared>,
     /// `cj-audio-send`, woken after each callback.
     sender: Thread,
 }
 
 /// Runs on Core Audio's real-time thread: no allocation, lock or log.
-unsafe extern "C-unwind" fn io_proc(
+unsafe extern "C-unwind" fn capture_proc(
     _dev: AudioObjectID,
     _now: NonNull<AudioTimeStamp>,
     input: NonNull<AudioBufferList>,
@@ -465,30 +845,14 @@ unsafe extern "C-unwind" fn io_proc(
     _output_time: NonNull<AudioTimeStamp>,
     client: *mut c_void,
 ) -> i32 {
-    // SAFETY: `client` is the IoProc the IOProc was made with; nothing
-    // else touches it while the aggregate runs (see Aggregate::create).
-    let io = unsafe { &mut *client.cast::<IoProc>() };
-    // SAFETY: Core Audio passes `mNumberBuffers` buffers.
-    let buffers = unsafe {
-        let list = input.as_ref();
-        std::slice::from_raw_parts(list.mBuffers.as_ptr(), list.mNumberBuffers as usize)
-    };
-    // The tap is the aggregate's last input, after any of the output
-    // device's own.
-    if let Some(b) = buffers.iter().rev().find(|b| !b.mData.is_null()) {
-        // SAFETY: the buffer holds `mDataByteSize` bytes of float32 samples.
-        let samples = unsafe {
-            std::slice::from_raw_parts(b.mData.cast::<f32>(), b.mDataByteSize as usize / 4)
-        };
-        push_frames(
-            &mut io.ring,
-            samples,
-            b.mNumberChannels as usize,
-            &io.shared,
-        );
+    // SAFETY: `client` is this IOProc's own state (Io::new); nothing else
+    // touches it while the IOProc exists.
+    let c = unsafe { &mut *client.cast::<Capturer>() };
+    // SAFETY: Core Audio passes a valid list of float32 buffers.
+    if let Some((samples, channels)) = unsafe { tap_samples(input, c.tap_stream) } {
+        push_frames(&mut c.ring, samples, channels, &c.shared);
     }
-    io.shared.callbacks.fetch_add(1, Relaxed);
-    io.sender.unpark();
+    c.sender.unpark();
     0
 }
 
@@ -496,43 +860,19 @@ unsafe extern "C-unwind" fn io_proc(
 struct Shared {
     /// [`mix_gain`], as f32 bits.
     gain: AtomicU32,
-    callbacks: AtomicU64,
-    /// A non-zero sample came since `cj-audio-send` last looked.
-    heard: AtomicBool,
     /// Frames lost to a full ring.
     dropped: AtomicU64,
     /// The rate the IOProc gets, in Hz.
     rate: AtomicU32,
-    /// A [`Capture`], as [`capture_to_u8`].
-    capture: AtomicU8,
 }
 
 impl Shared {
     fn new() -> Self {
         Shared {
             gain: AtomicU32::new(1.0f32.to_bits()),
-            callbacks: AtomicU64::new(0),
-            heard: AtomicBool::new(false),
             dropped: AtomicU64::new(0),
             rate: AtomicU32::new(RATE),
-            capture: AtomicU8::new(capture_to_u8(Capture::Unknown)),
         }
-    }
-}
-
-fn capture_to_u8(c: Capture) -> u8 {
-    match c {
-        Capture::Unknown => 0,
-        Capture::Allowed => 1,
-        Capture::Denied => 2,
-    }
-}
-
-fn capture_from_u8(v: u8) -> Capture {
-    match v {
-        1 => Capture::Allowed,
-        2 => Capture::Denied,
-        _ => Capture::Unknown,
     }
 }
 
@@ -541,10 +881,6 @@ fn capture_from_u8(v: u8) -> Capture {
 /// Real-time safe.
 fn push_frames(ring: &mut Producer<f32>, samples: &[f32], channels: usize, shared: &Shared) {
     let ch = channels.max(1);
-    // Whether capture works shows before the gain: muted is still allowed.
-    if samples.iter().any(|&x| x != 0.0) {
-        shared.heard.store(true, Relaxed);
-    }
     let frames = samples.len() / ch;
     let fit = frames.min(ring.slots() / 2);
     if fit < frames {
@@ -562,61 +898,25 @@ fn push_frames(ring: &mut Producer<f32>, samples: &[f32], channels: usize, share
     }
 }
 
-/// `cj-audio-send`: drains the ring into `sender` until the IOProc's state
-/// is freed, and looks for denial every [`LOOK`].
-fn send(
-    mut ring: Consumer<f32>,
-    shared: &Shared,
-    mut sender: AudioSender,
-    me: AudioObjectID,
-    on_capture: impl Fn(Capture),
-) {
-    let mut rate = RATE;
-    let mut resample: Option<Resample> = None;
-    let mut watch = CaptureWatch::new();
-    let mut next_look = Instant::now() + LOOK;
-    let (mut callbacks, mut dropped) = (0, 0);
+/// `cj-audio-send`: drains the current ring into `sender` until `rings`
+/// is dropped.
+fn send(rings: &Receiver<Consumer<f32>>, shared: &Shared, mut sender: AudioSender) {
+    let mut drain = Drain::new();
+    let mut next_report = Instant::now() + REPORT;
+    let mut dropped = 0;
     loop {
-        let r = shared.rate.load(Relaxed);
-        if r != rate {
-            rate = r;
-            resample = (r != RATE).then(|| Resample::new(r));
-            info!("Mac sound: the tap runs at {r} Hz");
-        }
-        let abandoned = ring.is_abandoned();
-        if let Ok(chunk) = ring.read_chunk(ring.slots()) {
-            let (a, b) = chunk.as_slices();
-            for s in [a, b] {
-                match &mut resample {
-                    Some(r) => r.push(s, |o| sender.push(o)),
-                    None => sender.push(s),
-                }
+        loop {
+            match rings.try_recv() {
+                Ok(ring) => drain.set_ring(ring),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => return,
             }
-            chunk.commit_all();
         }
-        if abandoned {
-            return;
-        }
+        drain.set_rate(shared.rate.load(Relaxed));
+        drain.drain(|s| sender.push(s));
         let now = Instant::now();
-        if now >= next_look {
-            next_look = now + LOOK;
-            let c = shared.callbacks.load(Relaxed);
-            let (ran, heard) = (c != callbacks, shared.heard.swap(false, Relaxed));
-            callbacks = c;
-            let seen = Seen {
-                ran,
-                heard,
-                // Asked only while it can matter.
-                others_playing: ran
-                    && !heard
-                    && watch.state != Capture::Allowed
-                    && others_playing(me),
-            };
-            if let Some(state) = watch.observe(now, seen) {
-                info!("Mac sound: capture {state:?}");
-                shared.capture.store(capture_to_u8(state), Relaxed);
-                on_capture(state);
-            }
+        if now >= next_report {
+            next_report = now + REPORT;
             let d = shared.dropped.load(Relaxed);
             if d != dropped {
                 warn!(
@@ -630,67 +930,58 @@ fn send(
     }
 }
 
-/// Whether a process other than `me` plays sound.
-fn others_playing(me: AudioObjectID) -> bool {
-    object_list(kAudioHardwarePropertyProcessObjectList)
-        .into_iter()
-        .filter(|&p| p != me)
-        .any(|p| {
-            get::<u32>(p, global(kAudioProcessPropertyIsRunningOutput), None).is_ok_and(|r| r != 0)
-        })
+/// The ring's far end: samples out at 48 kHz.
+struct Drain {
+    ring: Option<Consumer<f32>>,
+    rate: u32,
+    resample: Option<Resample>,
 }
 
-/// What the IOProc and the HAL showed since the last look.
-#[derive(Debug, Clone, Copy, Default)]
-struct Seen {
-    /// The IOProc ran.
-    ran: bool,
-    /// It saw a non-zero sample.
-    heard: bool,
-    /// A process other than ours plays sound.
-    others_playing: bool,
-}
-
-/// Whether macOS lets us capture (T12-c): `Allowed` on the first non-zero
-/// sample; `Denied` after [`DENIED_AFTER`] of exact zeros while another
-/// process plays; `Unknown` before either. Once allowed, it stays allowed:
-/// an app can keep its output running on silence.
-struct CaptureWatch {
-    state: Capture,
-    /// When the current stretch of zeros while another app plays began.
-    zeros_since: Option<Instant>,
-}
-
-impl CaptureWatch {
-    fn new() -> Self {
-        CaptureWatch {
-            state: Capture::Unknown,
-            zeros_since: None,
+impl Drain {
+    fn new() -> Drain {
+        Drain {
+            ring: None,
+            rate: RATE,
+            resample: None,
         }
     }
 
-    /// Takes one look; returns the new state if it changed.
-    fn observe(&mut self, now: Instant, seen: Seen) -> Option<Capture> {
-        let next = if seen.heard {
-            self.zeros_since = None;
-            Capture::Allowed
-        } else if self.state == Capture::Allowed {
-            Capture::Allowed
-        } else if seen.ran && seen.others_playing {
-            let since = *self.zeros_since.get_or_insert(now);
-            if now.duration_since(since) >= DENIED_AFTER {
-                Capture::Denied
-            } else {
-                self.state
-            }
-        } else {
-            self.zeros_since = None;
-            self.state
+    /// A new aggregate's ring: the old one's samples are dropped.
+    fn set_ring(&mut self, ring: Consumer<f32>) {
+        self.ring = Some(ring);
+    }
+
+    /// The tap's rate now. On a change, the samples already in the ring
+    /// (at the old rate) are dropped, and the resampler starts afresh.
+    fn set_rate(&mut self, rate: u32) {
+        if rate == self.rate {
+            return;
+        }
+        info!("Mac sound: the tap runs at {rate} Hz");
+        self.rate = rate;
+        self.resample = (rate != RATE).then(|| Resample::new(rate));
+        if let Some(ring) = &mut self.ring
+            && let Ok(stale) = ring.read_chunk(ring.slots())
+        {
+            stale.commit_all();
+        }
+    }
+
+    /// Hands everything in the ring to `out`, at 48 kHz.
+    fn drain(&mut self, mut out: impl FnMut(&[f32])) {
+        let Some(ring) = &mut self.ring else {
+            return;
         };
-        (next != self.state).then(|| {
-            self.state = next;
-            next
-        })
+        if let Ok(chunk) = ring.read_chunk(ring.slots()) {
+            let (a, b) = chunk.as_slices();
+            for s in [a, b] {
+                match &mut self.resample {
+                    Some(r) => r.push(s, &mut out),
+                    None => out(s),
+                }
+            }
+            chunk.commit_all();
+        }
     }
 }
 
@@ -751,61 +1042,79 @@ impl Resample {
     }
 }
 
-/// Follows the output device's volume and mute into [`Shared::gain`].
-struct VolumeWatch {
-    dev: AudioObjectID,
+// Volume, mute and rate.
+
+/// Follows the output device's volume and mute into [`Shared::gain`], and
+/// the aggregate's rate (which follows the output device's) into
+/// [`Shared::rate`].
+struct DeviceWatch {
     queue: DispatchRetained<DispatchQueue>,
     block: SendBlock,
-    added: Vec<AudioObjectPropertyAddress>,
+    added: Vec<(AudioObjectID, AudioObjectPropertyAddress)>,
 }
 
-impl VolumeWatch {
-    fn start(dev: AudioObjectID, shared: Arc<Shared>) -> VolumeWatch {
+impl DeviceWatch {
+    fn start(out: AudioObjectID, aggregate: AudioObjectID, shared: Arc<Shared>) -> DeviceWatch {
         let block: Listener =
             RcBlock::new(move |_: u32, _: NonNull<AudioObjectPropertyAddress>| {
-                let gain = read_gain(dev);
+                let gain = read_gain(out);
                 shared.gain.store(gain.to_bits(), Relaxed);
+                if let Some(rate) = read_rate(aggregate) {
+                    shared.rate.store(rate, Relaxed);
+                }
                 debug!("Mac sound: gain {gain:.3}");
             });
-        let mut watch = VolumeWatch {
-            dev,
+        let mut watch = DeviceWatch {
             queue: DispatchQueue::new("com.cursorjump.audio.volume", DispatchQueueAttr::SERIAL),
             block: SendBlock(block),
             added: Vec::new(),
         };
-        for selector in [kAudioDevicePropertyVolumeScalar, kAudioDevicePropertyMute] {
-            for element in ELEMENTS {
-                let mut address = output(selector, element);
-                if !has(dev, address) {
-                    continue;
-                }
-                // SAFETY: the block lives in the watch until it is removed.
-                let st = unsafe {
-                    AudioObjectAddPropertyListenerBlock(
-                        dev,
-                        NonNull::from(&mut address),
-                        Some(&watch.queue),
-                        RcBlock::as_ptr(&watch.block.0),
-                    )
-                };
-                if st == 0 {
-                    watch.added.push(address);
-                } else {
-                    warn!("Mac sound: listening to the volume ({selector:#x}): OSStatus {st}");
-                }
+        let rate = |dev| {
+            (
+                dev,
+                address(
+                    kAudioDevicePropertyNominalSampleRate,
+                    kAudioObjectPropertyScopeGlobal,
+                    kAudioObjectPropertyElementMain,
+                ),
+            )
+        };
+        let volume = [kAudioDevicePropertyVolumeScalar, kAudioDevicePropertyMute]
+            .into_iter()
+            .flat_map(|sel| ELEMENTS.map(|el| (out, output(sel, el))));
+        for (dev, mut address) in volume.chain([rate(out), rate(aggregate)]) {
+            if !has(dev, address) {
+                continue;
+            }
+            // SAFETY: the block lives in the watch until it is removed.
+            let st = unsafe {
+                AudioObjectAddPropertyListenerBlock(
+                    dev,
+                    NonNull::from(&mut address),
+                    Some(&watch.queue),
+                    RcBlock::as_ptr(&watch.block.0),
+                )
+            };
+            if st == 0 {
+                watch.added.push((dev, address));
+            } else {
+                warn!(
+                    "Mac sound: listening to {:#x} on device {dev}: OSStatus {st}",
+                    address.mSelector
+                );
             }
         }
         watch
     }
 }
 
-impl Drop for VolumeWatch {
+impl Drop for DeviceWatch {
     fn drop(&mut self) {
-        for address in &mut self.added {
+        for (dev, address) in &mut self.added {
             // SAFETY: as added: the same object, address, queue and block.
             unsafe {
                 AudioObjectRemovePropertyListenerBlock(
-                    self.dev,
+                    *dev,
                     NonNull::from(address),
                     Some(&self.queue),
                     RcBlock::as_ptr(&self.block.0),
@@ -817,21 +1126,37 @@ impl Drop for VolumeWatch {
     }
 }
 
-fn output(
+fn address(
     selector: AudioObjectPropertySelector,
+    scope: AudioObjectPropertyScope,
     element: AudioObjectPropertyElement,
 ) -> AudioObjectPropertyAddress {
     AudioObjectPropertyAddress {
         mSelector: selector,
-        mScope: kAudioObjectPropertyScopeOutput,
+        mScope: scope,
         mElement: element,
     }
+}
+
+fn output(
+    selector: AudioObjectPropertySelector,
+    element: AudioObjectPropertyElement,
+) -> AudioObjectPropertyAddress {
+    address(selector, kAudioObjectPropertyScopeOutput, element)
 }
 
 fn has(dev: AudioObjectID, address: AudioObjectPropertyAddress) -> bool {
     let mut address = address;
     // SAFETY: `address` outlives the call.
     unsafe { AudioObjectHasProperty(dev, NonNull::from(&mut address)) }
+}
+
+/// A device's nominal rate, in Hz.
+fn read_rate(dev: AudioObjectID) -> Option<u32> {
+    get::<f64>(dev, global(kAudioDevicePropertyNominalSampleRate), None)
+        .ok()
+        .filter(|&r| r >= 1.0)
+        .map(|r| r.round() as u32)
 }
 
 /// [`mix_gain`] for the output device's volume and mute now.
@@ -898,110 +1223,82 @@ mod tests {
         assert_eq!(mix_gain(None, true), 0.0);
     }
 
-    const T: Duration = Duration::from_millis(500);
+    const MS: Duration = Duration::from_millis(1);
 
-    fn seen(ran: bool, heard: bool, others_playing: bool) -> Seen {
-        Seen {
-            ran,
-            heard,
-            others_playing,
+    #[test]
+    fn the_probe_allows_on_any_sound() {
+        assert_eq!(verdict(true, 1, 1, MS), Verdict::Allowed);
+        // Even if it came just as the window closed.
+        assert_eq!(verdict(true, 50, 50, PROBE_WINDOW * 2), Verdict::Allowed);
+    }
+
+    #[test]
+    fn the_probe_waits_out_its_window_on_zeros() {
+        assert_eq!(verdict(false, 0, 0, Duration::ZERO), Verdict::Wait);
+        assert_eq!(verdict(false, 40, 40, PROBE_WINDOW - MS), Verdict::Wait);
+    }
+
+    #[test]
+    fn the_probe_denies_after_a_window_of_zeros() {
+        assert_eq!(verdict(false, 40, 40, PROBE_WINDOW), Verdict::Denied);
+    }
+
+    #[test]
+    fn zeros_from_a_probe_that_never_ran_are_no_answer() {
+        assert_eq!(verdict(false, 0, 40, PROBE_WINDOW), Verdict::Stalled);
+        assert_eq!(verdict(false, 40, 0, PROBE_WINDOW), Verdict::Stalled);
+    }
+
+    /// An AudioBufferList with three buffers, laid out as Core Audio does.
+    #[repr(C)]
+    struct ThreeBuffers {
+        number: u32,
+        buffers: [AudioBuffer; 3],
+    }
+
+    fn buffer(channels: u32, data: &mut [f32]) -> AudioBuffer {
+        AudioBuffer {
+            mNumberChannels: channels,
+            mDataByteSize: (data.len() * 4) as u32,
+            mData: data.as_mut_ptr().cast(),
         }
     }
 
-    /// Feeds `seen` every 500 ms from `t0` for `n` looks; returns the changes.
-    fn run(w: &mut CaptureWatch, t0: Instant, n: u32, s: Seen) -> Vec<Capture> {
-        (1..=n).filter_map(|i| w.observe(t0 + T * i, s)).collect()
-    }
-
     #[test]
-    fn capture_is_unknown_through_silence() {
-        let mut w = CaptureWatch::new();
-        let t0 = Instant::now();
-        // Exact zeros for a minute, but nobody else plays: plain silence.
-        assert_eq!(run(&mut w, t0, 120, seen(true, false, false)), []);
-        assert_eq!(w.state, Capture::Unknown);
+    fn the_tap_buffer_is_chosen_by_its_index() {
+        // A headset: its mic's stream (off, so no data), its second
+        // stream, then the tap.
+        let mut mic = [0.7f32; 4];
+        let mut tap = [0.1f32, 0.2, 0.3, 0.4];
+        let mut list = ThreeBuffers {
+            number: 3,
+            buffers: [
+                AudioBuffer {
+                    mNumberChannels: 1,
+                    mDataByteSize: 0,
+                    mData: std::ptr::null_mut(),
+                },
+                buffer(1, &mut mic),
+                buffer(2, &mut tap),
+            ],
+        };
+        let list = NonNull::from(&mut list).cast::<AudioBufferList>();
+        // SAFETY: `list` is a valid three-buffer list of float32 buffers.
+        unsafe {
+            assert_eq!(buffers(list).len(), 3);
+            assert_eq!(tap_samples(list, 2), Some((&tap[..], 2)));
+            assert_eq!(tap_samples(list, 1), Some((&mic[..], 1)));
+            // A stream turned off, and one that isn't there.
+            assert_eq!(tap_samples(list, 0), None);
+            assert_eq!(tap_samples(list, 3), None);
+        }
     }
 
-    #[test]
-    fn the_first_sound_means_allowed() {
-        let mut w = CaptureWatch::new();
-        let t0 = Instant::now();
-        assert_eq!(
-            w.observe(t0, seen(true, true, false)),
-            Some(Capture::Allowed)
-        );
-        assert_eq!(w.observe(t0 + T, seen(true, true, true)), None);
-        assert_eq!(w.state, Capture::Allowed);
+    fn ring(slots: usize) -> (Producer<f32>, Consumer<f32>) {
+        RingBuffer::new(slots)
     }
 
-    #[test]
-    fn three_seconds_of_zeros_while_another_app_plays_means_denied() {
-        let mut w = CaptureWatch::new();
-        let t0 = Instant::now();
-        // The first look starts the stretch; 2.5 s later it isn't 3 s yet.
-        assert_eq!(run(&mut w, t0, 6, seen(true, false, true)), []);
-        assert_eq!(w.state, Capture::Unknown);
-        assert_eq!(
-            w.observe(t0 + T * 7, seen(true, false, true)),
-            Some(Capture::Denied)
-        );
-        // Reported once.
-        assert_eq!(run(&mut w, t0 + T * 7, 10, seen(true, false, true)), []);
-        assert_eq!(w.state, Capture::Denied);
-    }
-
-    #[test]
-    fn the_stretch_restarts_when_the_other_app_stops() {
-        let mut w = CaptureWatch::new();
-        let t0 = Instant::now();
-        assert_eq!(run(&mut w, t0, 5, seen(true, false, true)), []);
-        assert_eq!(w.observe(t0 + T * 6, seen(true, false, false)), None);
-        // A new stretch: 3 s from its own start.
-        assert_eq!(run(&mut w, t0 + T * 6, 6, seen(true, false, true)), []);
-        assert_eq!(
-            w.observe(t0 + T * 13, seen(true, false, true)),
-            Some(Capture::Denied)
-        );
-    }
-
-    #[test]
-    fn no_callbacks_is_no_evidence() {
-        let mut w = CaptureWatch::new();
-        let t0 = Instant::now();
-        // The IOProc stalled (say, during a rebuild): zeros prove nothing.
-        assert_eq!(run(&mut w, t0, 20, seen(false, false, true)), []);
-        assert_eq!(w.state, Capture::Unknown);
-    }
-
-    #[test]
-    fn allowed_stays_allowed_through_zeros() {
-        let mut w = CaptureWatch::new();
-        let t0 = Instant::now();
-        w.observe(t0, seen(true, true, true));
-        // An app that keeps its output running but plays silence.
-        assert_eq!(run(&mut w, t0, 20, seen(true, false, true)), []);
-        assert_eq!(w.state, Capture::Allowed);
-    }
-
-    #[test]
-    fn sound_after_denied_means_allowed() {
-        let mut w = CaptureWatch::new();
-        let t0 = Instant::now();
-        assert_eq!(
-            run(&mut w, t0, 8, seen(true, false, true)),
-            [Capture::Denied]
-        );
-        assert_eq!(
-            w.observe(t0 + T * 9, seen(true, true, true)),
-            Some(Capture::Allowed)
-        );
-    }
-
-    fn ring(slots: usize) -> (Producer<f32>, rtrb::Consumer<f32>) {
-        rtrb::RingBuffer::new(slots)
-    }
-
-    fn drain(c: &mut rtrb::Consumer<f32>) -> Vec<f32> {
+    fn pop_all(c: &mut Consumer<f32>) -> Vec<f32> {
         std::iter::from_fn(|| c.pop().ok()).collect()
     }
 
@@ -1011,12 +1308,12 @@ mod tests {
         shared.gain.store(0.5f32.to_bits(), Relaxed);
         let (mut p, mut c) = ring(64);
         push_frames(&mut p, &[0.2, -0.4, 0.6, 0.8], 2, &shared);
-        assert_eq!(drain(&mut c), [0.1, -0.2, 0.3, 0.4]);
+        assert_eq!(pop_all(&mut c), [0.1, -0.2, 0.3, 0.4]);
         // Mono is doubled; more than two channels keep the first two.
         push_frames(&mut p, &[0.2, 0.4], 1, &shared);
-        assert_eq!(drain(&mut c), [0.1, 0.1, 0.2, 0.2]);
+        assert_eq!(pop_all(&mut c), [0.1, 0.1, 0.2, 0.2]);
         push_frames(&mut p, &[0.2, 0.4, 0.9, 0.9], 4, &shared);
-        assert_eq!(drain(&mut c), [0.1, 0.2]);
+        assert_eq!(pop_all(&mut c), [0.1, 0.2]);
         assert_eq!(shared.dropped.load(Relaxed), 0);
     }
 
@@ -1026,20 +1323,54 @@ mod tests {
         let (mut p, mut c) = ring(5);
         push_frames(&mut p, &[0.1, 0.2, 0.3, 0.4, 0.5, 0.6], 2, &shared);
         // Two frames fit in five slots; the third is dropped.
-        assert_eq!(drain(&mut c), [0.1, 0.2, 0.3, 0.4]);
+        assert_eq!(pop_all(&mut c), [0.1, 0.2, 0.3, 0.4]);
         assert_eq!(shared.dropped.load(Relaxed), 1);
     }
 
+    fn drained(d: &mut Drain) -> Vec<f32> {
+        let mut out = Vec::new();
+        d.drain(|s| out.extend_from_slice(s));
+        out
+    }
+
     #[test]
-    fn heard_means_a_non_zero_sample_before_the_gain() {
-        let shared = Shared::new();
-        let (mut p, _c) = ring(64);
-        push_frames(&mut p, &[0.0; 8], 2, &shared);
-        assert!(!shared.heard.load(Relaxed));
-        // Muted: the samples sent are zeros, but capture works.
-        shared.gain.store(0.0f32.to_bits(), Relaxed);
-        push_frames(&mut p, &[0.0, 0.0, 1e-6, 0.0], 2, &shared);
-        assert!(shared.heard.load(Relaxed));
+    fn the_drain_passes_48_khz_through() {
+        let (mut p, c) = ring(64);
+        let mut d = Drain::new();
+        assert_eq!(drained(&mut d), [0.0; 0], "no ring yet");
+        d.set_ring(c);
+        p.push_entire_slice(&[0.1, 0.2, 0.3, 0.4]).unwrap();
+        d.set_rate(RATE);
+        assert_eq!(drained(&mut d), [0.1, 0.2, 0.3, 0.4]);
+    }
+
+    #[test]
+    fn a_rate_change_drops_the_stale_samples() {
+        let (mut p, c) = ring(64);
+        let mut d = Drain::new();
+        d.set_ring(c);
+        // 48 kHz samples, then the device moves to 44.1 kHz.
+        p.push_entire_slice(&[0.5; 8]).unwrap();
+        d.set_rate(44_100);
+        assert!(d.resample.is_some());
+        // And back: what is in the ring now is fresh.
+        p.push_entire_slice(&[0.25; 4]).unwrap();
+        d.set_rate(RATE);
+        assert!(d.resample.is_none());
+        p.push_entire_slice(&[0.125; 2]).unwrap();
+        assert_eq!(drained(&mut d), [0.125; 2]);
+    }
+
+    #[test]
+    fn a_new_ring_replaces_the_old_one() {
+        let (mut p1, c1) = ring(64);
+        let (mut p2, c2) = ring(64);
+        let mut d = Drain::new();
+        d.set_ring(c1);
+        p1.push_entire_slice(&[0.9; 4]).unwrap();
+        d.set_ring(c2);
+        p2.push_entire_slice(&[0.1, 0.2]).unwrap();
+        assert_eq!(drained(&mut d), [0.1, 0.2]);
     }
 
     #[test]
@@ -1197,6 +1528,16 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "hands-on: plays inaudible noise for up to 0.5 s; no sandbox"]
+    fn the_probe_says_allowed_from_terminal() {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        let t = Instant::now();
+        let result = probe(own_process_object().unwrap());
+        println!("probe: {result:?} in {:?}", t.elapsed());
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
     #[ignore = "hands-on: mutes this Mac for about 10 s while it plays a sound; no sandbox"]
     fn the_tap_captures_and_the_speakers_stay_quiet() {
         let _ = tracing_subscriber::fmt().with_test_writer().try_init();
@@ -1205,19 +1546,10 @@ mod tests {
              LISTEN: nothing should come from the Mac's speakers until the test ends."
         );
         let lb = Loopback::new();
-        let states = Arc::new(Mutex::new(Vec::new()));
-        let tap = {
-            let states = Arc::clone(&states);
-            SoundTap::start(lb.out.clone(), move |c| states.lock().unwrap().push(c))
-                .expect("the tap starts")
-        };
+        let tap = SoundTap::start(lb.out.clone()).expect("the tap starts");
         let player = Player::start();
         let t0 = Instant::now();
-        std::thread::sleep(Duration::from_secs(5));
-        // The denial check's other input (T12-c): afplay plays.
-        let others = others_playing(own_process_object().unwrap());
-        std::thread::sleep(Duration::from_secs(5));
-        let capture = tap.capture();
+        std::thread::sleep(Duration::from_secs(10));
         let t1 = Instant::now();
         drop(tap);
         drop(player);
@@ -1229,17 +1561,13 @@ mod tests {
         let audible = packets.iter().filter(|&&(_, l)| l > 0.0).count();
         println!(
             "{} packets in all; over seconds 1-10, {n} packets, mean RMS {mean:.4} ({:.1} dBFS); \
-             {audible} packets not silent; capture {capture:?}, changes {:?}; \
-             another process playing: {others}",
+             {audible} packets not silent",
             packets.len(),
             dbfs(mean),
-            states.lock().unwrap()
         );
         // 200 packets a second.
         assert!(n > 1500, "only {n} packets in 9 s");
         assert!(mean > 0.0, "the tap heard nothing");
-        assert_eq!(capture, Capture::Allowed);
-        assert!(others, "afplay counts as another process playing");
     }
 
     #[test]
@@ -1249,7 +1577,8 @@ mod tests {
         println!(
             "The Mac plays the Submarine sound in a loop into a muted tap.
              Within 30 s, CONNECT AirPods or wired headphones so they become the Mac's output.
-             LISTEN: nothing should play from them, or from the Mac's speakers."
+             LISTEN: nothing should play from them, or from the Mac's speakers.
+             WATCH: the mic indicator must stay off, and AirPods must not drop to call quality."
         );
         let lb = Loopback::new();
         let (tx, rx) = std::sync::mpsc::channel();
@@ -1257,7 +1586,7 @@ mod tests {
             let _ = tx.send(ev);
         })
         .unwrap();
-        let mut tap = SoundTap::start(lb.out.clone(), |_| {}).expect("the tap starts");
+        let mut tap = SoundTap::start(lb.out.clone()).expect("the tap starts");
         let player = Player::start();
 
         let deadline = Instant::now() + Duration::from_secs(30);

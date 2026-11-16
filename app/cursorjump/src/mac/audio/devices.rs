@@ -537,7 +537,7 @@ pub(super) fn set<T: Copy>(
     }
 }
 
-fn property_size(obj: AudioObjectID, mut address: AudioObjectPropertyAddress) -> u32 {
+pub(super) fn property_size(obj: AudioObjectID, mut address: AudioObjectPropertyAddress) -> u32 {
     let mut size = 0u32;
     // SAFETY: every pointer outlives the call.
     let st = unsafe {
