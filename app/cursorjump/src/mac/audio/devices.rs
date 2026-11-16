@@ -17,9 +17,11 @@ use objc2_core_audio::{
     kAudioDevicePropertyDeviceUID, kAudioDevicePropertyStreams, kAudioDevicePropertyTransportType,
     kAudioDeviceTransportTypeBuiltIn, kAudioHardwarePropertyDefaultInputDevice,
     kAudioHardwarePropertyDefaultOutputDevice, kAudioHardwarePropertyDevices,
-    kAudioHardwarePropertyTranslateUIDToDevice, kAudioObjectPropertyElementMain,
-    kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyScopeInput, kAudioObjectSystemObject,
-    kAudioObjectUnknown,
+    kAudioHardwarePropertyProcessObjectList, kAudioHardwarePropertyTranslateUIDToDevice,
+    kAudioObjectPropertyElementMain, kAudioObjectPropertyScopeGlobal,
+    kAudioObjectPropertyScopeInput, kAudioObjectSystemObject, kAudioObjectUnknown,
+    kAudioProcessPropertyBundleID, kAudioProcessPropertyDevices,
+    kAudioProcessPropertyIsRunningInput, kAudioProcessPropertyPID,
 };
 use objc2_core_foundation::{CFRetained, CFString};
 use tracing::{debug, info, warn};
@@ -281,8 +283,69 @@ pub enum AudioDevEv {
     DefaultOutputChanged,
     /// A device appeared or went away.
     DevicesChanged,
-    /// Whether some app records from our mic.
+    /// Whether some app records from our mic: not us, and not a system
+    /// background listener (see [`someone_listens`]).
     MicListening(bool),
+}
+
+/// Background listeners that always record the default input, and so
+/// would keep the PC's mic open for good: Siri's voice trigger.
+const BACKGROUND_LISTENERS: [&str; 2] = ["com.apple.CoreSpeech", "com.apple.corespeechd"];
+
+/// A process in Core Audio's process list, as [`someone_listens`] sees it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct InputClient {
+    pid: i32,
+    bundle_id: Option<String>,
+    running_input: bool,
+    /// The devices it runs input on (read only while it runs input).
+    devices: Vec<AudioObjectID>,
+}
+
+/// Whether a process other than `us` and the background listeners runs
+/// input on `mic`.
+fn someone_listens(clients: &[InputClient], mic: AudioObjectID, us: &[i32]) -> bool {
+    clients.iter().any(|c| {
+        c.running_input
+            && !us.contains(&c.pid)
+            && c.devices.contains(&mic)
+            && !c
+                .bundle_id
+                .as_deref()
+                .is_some_and(|b| BACKGROUND_LISTENERS.contains(&b))
+    })
+}
+
+/// Every process Core Audio knows, with what it records from.
+fn input_clients() -> Vec<InputClient> {
+    object_list(SYSTEM, global(kAudioHardwarePropertyProcessObjectList))
+        .into_iter()
+        .map(|p| {
+            let running_input = get::<u32>(p, global(kAudioProcessPropertyIsRunningInput), None)
+                .is_ok_and(|r| r != 0);
+            InputClient {
+                pid: get::<i32>(p, global(kAudioProcessPropertyPID), None).unwrap_or(-1),
+                bundle_id: string_property(p, kAudioProcessPropertyBundleID)
+                    .filter(|b| !b.is_empty()),
+                running_input,
+                devices: if running_input {
+                    object_list(p, input(kAudioProcessPropertyDevices))
+                } else {
+                    Vec::new()
+                },
+            }
+        })
+        .collect()
+}
+
+/// The process properties [`AudioWatch`] follows. On macOS 26.5 a process
+/// starting or stopping input on a device notifies only its input-scope
+/// `Devices`, never `IsRunningInput`; both are followed.
+fn process_properties() -> [AudioObjectPropertyAddress; 2] {
+    [
+        global(kAudioProcessPropertyIsRunningInput),
+        input(kAudioProcessPropertyDevices),
+    ]
 }
 
 pub(super) type Listener = RcBlock<dyn Fn(u32, NonNull<AudioObjectPropertyAddress>)>;
@@ -295,14 +358,20 @@ pub(super) struct SendBlock(pub(super) Listener);
 unsafe impl Send for SendBlock {}
 
 /// The system object's properties [`AudioWatch`] follows.
-const SYSTEM_PROPERTIES: [AudioObjectPropertySelector; 3] = [
+const SYSTEM_PROPERTIES: [AudioObjectPropertySelector; 4] = [
     kAudioHardwarePropertyDefaultInputDevice,
     kAudioHardwarePropertyDefaultOutputDevice,
     kAudioHardwarePropertyDevices,
+    kAudioHardwarePropertyProcessObjectList,
 ];
 
 /// Core Audio notifications for the default devices, the device list and
 /// whether some app records from our mic.
+///
+/// `MicListening` is worked out from the process list, again whenever our
+/// mic's `IsRunningSomewhere`, the process list or a process's
+/// `IsRunningInput` or input `Devices` changes, and sent only when it
+/// changes.
 ///
 /// Every listener runs on a serial queue of its own, so `on` is called
 /// there, one event at a time. Dropping the watch removes the listeners and
@@ -316,22 +385,36 @@ pub struct AudioWatch {
 struct Shared {
     on: Box<dyn Fn(AudioDevEv) + Send + Sync>,
     queue: DispatchRetained<DispatchQueue>,
+    /// Our own process (tests add more), never counted as listening.
+    us: Vec<i32>,
     mic: Mutex<MicListener>,
 }
 
-/// The `IsRunningSomewhere` listener on our mic, while it exists.
+/// The listeners behind `MicListening`, and its last value.
 #[derive(Default)]
 struct MicListener {
+    /// Our mic, while its `IsRunningSomewhere` listener is added.
     id: AudioObjectID,
     block: Option<SendBlock>,
+    /// The listener on each process, added for [`process_properties`].
+    processes: Vec<(AudioObjectID, SendBlock)>,
     last: Option<bool>,
 }
 
 impl AudioWatch {
     pub fn start(on: impl Fn(AudioDevEv) + Send + Sync + 'static) -> Result<AudioWatch> {
+        Self::start_as(on, vec![std::process::id() as i32])
+    }
+
+    /// As [`AudioWatch::start`], counting the processes `us` as us.
+    fn start_as(
+        on: impl Fn(AudioDevEv) + Send + Sync + 'static,
+        us: Vec<i32>,
+    ) -> Result<AudioWatch> {
         let shared = Arc::new(Shared {
             on: Box::new(on),
             queue: DispatchQueue::new("com.cursorjump.audio.watch", DispatchQueueAttr::SERIAL),
+            us,
             mic: Mutex::default(),
         });
         let s = Arc::clone(&shared);
@@ -353,6 +436,10 @@ impl AudioWatch {
                             s.follow_mic();
                             AudioDevEv::DevicesChanged
                         }
+                        sel if sel == kAudioHardwarePropertyProcessObjectList => {
+                            s.follow_processes();
+                            continue;
+                        }
                         _ => continue,
                     };
                     (s.on)(ev);
@@ -365,7 +452,12 @@ impl AudioWatch {
             added: Vec::new(),
         };
         for selector in SYSTEM_PROPERTIES {
-            let st = add_listener(SYSTEM, selector, &watch.shared.queue, &watch.system.0);
+            let st = add_listener(
+                SYSTEM,
+                global(selector),
+                &watch.shared.queue,
+                &watch.system.0,
+            );
             // On failure, Drop removes the ones already added.
             anyhow::ensure!(
                 st == 0,
@@ -374,7 +466,10 @@ impl AudioWatch {
             watch.added.push(selector);
         }
         let s = &watch.shared;
-        s.queue.exec_sync(|| s.follow_mic());
+        s.queue.exec_sync(|| {
+            s.follow_processes();
+            s.follow_mic();
+        });
         Ok(watch)
     }
 }
@@ -383,21 +478,26 @@ impl Drop for AudioWatch {
     fn drop(&mut self) {
         let s = &self.shared;
         for &selector in &self.added {
-            let st = remove_listener(SYSTEM, selector, &s.queue, &self.system.0);
+            let st = remove_listener(SYSTEM, global(selector), &s.queue, &self.system.0);
             if st != 0 {
                 warn!("audio watch: removing listener {selector:#x}: OSStatus {st}");
             }
         }
-        // No system callback runs after this, so the mic listener stays put.
+        // No system callback runs after this, so the other listeners stay put.
         s.queue.exec_sync(|| {});
-        let mut mic = s.mic.lock().unwrap_or_else(|e| e.into_inner());
+        let mut mic = s.mic();
         if let Some(block) = mic.block.take() {
             remove_listener(
                 mic.id,
-                kAudioDevicePropertyDeviceIsRunningSomewhere,
+                global(kAudioDevicePropertyDeviceIsRunningSomewhere),
                 &s.queue,
                 &block.0,
             );
+        }
+        for (process, block) in mic.processes.drain(..) {
+            for address in process_properties() {
+                remove_listener(process, address, &s.queue, &block.0);
+            }
         }
         drop(mic);
         s.queue.exec_sync(|| {});
@@ -407,6 +507,16 @@ impl Drop for AudioWatch {
 impl Shared {
     fn mic(&self) -> std::sync::MutexGuard<'_, MicListener> {
         self.mic.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A listener that works `MicListening` out again.
+    fn reevaluating(self: &Arc<Self>) -> Listener {
+        let weak = Arc::downgrade(self);
+        RcBlock::new(move |_: u32, _: NonNull<AudioObjectPropertyAddress>| {
+            if let Some(s) = weak.upgrade() {
+                s.evaluate();
+            }
+        })
     }
 
     /// Moves the mic listener to our mic's current object, if that changed.
@@ -422,7 +532,7 @@ impl Shared {
             // The old object may be gone already; nothing to undo then.
             remove_listener(
                 mic.id,
-                kAudioDevicePropertyDeviceIsRunningSomewhere,
+                global(kAudioDevicePropertyDeviceIsRunningSomewhere),
                 &self.queue,
                 &block.0,
             );
@@ -432,26 +542,19 @@ impl Shared {
         // is retried on the next DevicesChanged.
         mic.id = kAudioObjectUnknown;
         if id != kAudioObjectUnknown {
-            let weak = Arc::downgrade(self);
-            let block: Listener =
-                RcBlock::new(move |_: u32, _: NonNull<AudioObjectPropertyAddress>| {
-                    if let Some(s) = weak.upgrade() {
-                        s.mic_changed();
-                    }
-                });
+            let block = self.reevaluating();
             let st = add_listener(
                 id,
-                kAudioDevicePropertyDeviceIsRunningSomewhere,
+                global(kAudioDevicePropertyDeviceIsRunningSomewhere),
                 &self.queue,
                 &block,
             );
             if st == 0 {
                 mic.id = id;
                 mic.block = Some(SendBlock(block));
-                let running = running_somewhere(id);
-                mic.last = Some(running);
                 drop(mic);
-                (self.on)(AudioDevEv::MicListening(running));
+                // `last` is unset, so this sends the current value.
+                self.evaluate();
                 return;
             }
             warn!("audio watch: listening to our mic {id}: OSStatus {st}");
@@ -462,20 +565,63 @@ impl Shared {
         }
     }
 
-    /// Our mic's `IsRunningSomewhere` changed. Runs on the queue.
-    fn mic_changed(&self) {
+    /// Keeps listeners on each process in the process list (see
+    /// [`process_properties`]), then works `MicListening` out again. Runs on
+    /// the queue.
+    fn follow_processes(self: &Arc<Self>) {
+        let now = object_list(SYSTEM, global(kAudioHardwarePropertyProcessObjectList));
+        let mut mic = self.mic();
+        let mut kept = Vec::with_capacity(now.len());
+        for (process, block) in mic.processes.drain(..) {
+            if now.contains(&process) {
+                kept.push((process, block));
+            } else {
+                // Gone already, most likely; nothing to undo then.
+                for address in process_properties() {
+                    remove_listener(process, address, &self.queue, &block.0);
+                }
+            }
+        }
+        for &process in &now {
+            if kept.iter().any(|(p, _)| *p == process) {
+                continue;
+            }
+            let block = self.reevaluating();
+            let [running, devices] = process_properties();
+            let st = add_listener(process, running, &self.queue, &block);
+            if st != 0 {
+                // A process that just quit; the next list change retries.
+                debug!("audio watch: listening to process {process}: OSStatus {st}");
+                continue;
+            }
+            let st = add_listener(process, devices, &self.queue, &block);
+            if st != 0 {
+                debug!("audio watch: listening to process {process}: OSStatus {st}");
+                remove_listener(process, running, &self.queue, &block);
+                continue;
+            }
+            kept.push((process, SendBlock(block)));
+        }
+        mic.processes = kept;
+        drop(mic);
+        self.evaluate();
+    }
+
+    /// Works `MicListening` out from the process list; sends it if it
+    /// changed. Runs on the queue.
+    fn evaluate(&self) {
         let mut mic = self.mic();
         if mic.id == kAudioObjectUnknown {
             return;
         }
-        let running = running_somewhere(mic.id);
-        debug!("audio watch: our mic running somewhere: {running}");
-        if mic.last == Some(running) {
+        let listening = someone_listens(&input_clients(), mic.id, &self.us);
+        debug!("audio watch: someone listens to our mic: {listening}");
+        if mic.last == Some(listening) {
             return;
         }
-        mic.last = Some(running);
+        mic.last = Some(listening);
         drop(mic);
-        (self.on)(AudioDevEv::MicListening(running));
+        (self.on)(AudioDevEv::MicListening(listening));
     }
 }
 
@@ -583,13 +729,15 @@ pub(super) fn string_property(
 }
 
 fn device_ids() -> Vec<AudioObjectID> {
-    object_list(kAudioHardwarePropertyDevices)
+    object_list(SYSTEM, global(kAudioHardwarePropertyDevices))
 }
 
-/// Reads a list of objects from the system object, such as its devices.
-pub(super) fn object_list(selector: AudioObjectPropertySelector) -> Vec<AudioObjectID> {
-    let mut address = global(selector);
-    let mut size = property_size(SYSTEM, address);
+/// Reads a list of objects, such as the system object's devices.
+pub(super) fn object_list(
+    obj: AudioObjectID,
+    mut address: AudioObjectPropertyAddress,
+) -> Vec<AudioObjectID> {
+    let mut size = property_size(obj, address);
     let mut ids = vec![kAudioObjectUnknown; size as usize / size_of::<AudioObjectID>()];
     if ids.is_empty() {
         return ids;
@@ -597,7 +745,7 @@ pub(super) fn object_list(selector: AudioObjectPropertySelector) -> Vec<AudioObj
     // SAFETY: every pointer outlives the call, and `size` is `ids`' size in bytes.
     let st = unsafe {
         AudioObjectGetPropertyData(
-            SYSTEM,
+            obj,
             NonNull::from(&mut address),
             0,
             std::ptr::null(),
@@ -613,15 +761,20 @@ pub(super) fn object_list(selector: AudioObjectPropertySelector) -> Vec<AudioObj
     ids
 }
 
-fn input_streams(id: AudioObjectID) -> u32 {
-    let address = AudioObjectPropertyAddress {
-        mSelector: kAudioDevicePropertyStreams,
+/// `selector` in the input scope.
+fn input(selector: AudioObjectPropertySelector) -> AudioObjectPropertyAddress {
+    AudioObjectPropertyAddress {
+        mSelector: selector,
         mScope: kAudioObjectPropertyScopeInput,
         mElement: kAudioObjectPropertyElementMain,
-    };
-    property_size(id, address) / size_of::<AudioObjectID>() as u32
+    }
 }
 
+fn input_streams(id: AudioObjectID) -> u32 {
+    property_size(id, input(kAudioDevicePropertyStreams)) / size_of::<AudioObjectID>() as u32
+}
+
+#[cfg(test)]
 fn running_somewhere(id: AudioObjectID) -> bool {
     get::<u32>(
         id,
@@ -633,11 +786,10 @@ fn running_somewhere(id: AudioObjectID) -> bool {
 
 fn add_listener(
     obj: AudioObjectID,
-    selector: AudioObjectPropertySelector,
+    mut address: AudioObjectPropertyAddress,
     queue: &DispatchQueue,
     block: &Listener,
 ) -> i32 {
-    let mut address = global(selector);
     // SAFETY: the block stays alive (in the watch) until it is removed.
     unsafe {
         AudioObjectAddPropertyListenerBlock(
@@ -651,11 +803,10 @@ fn add_listener(
 
 fn remove_listener(
     obj: AudioObjectID,
-    selector: AudioObjectPropertySelector,
+    mut address: AudioObjectPropertyAddress,
     queue: &DispatchQueue,
     block: &Listener,
 ) -> i32 {
-    let mut address = global(selector);
     // SAFETY: the same object, address, queue and block it was added with.
     unsafe {
         AudioObjectRemovePropertyListenerBlock(
@@ -960,6 +1111,37 @@ mod tests {
         assert_eq!(fake.current().as_deref(), Some(USB));
     }
 
+    fn client(pid: i32, bundle: &str, running: bool, devices: &[AudioObjectID]) -> InputClient {
+        InputClient {
+            pid,
+            bundle_id: (!bundle.is_empty()).then(|| bundle.into()),
+            running_input: running,
+            devices: devices.to_vec(),
+        }
+    }
+
+    const OUR_MIC: AudioObjectID = 90;
+    const ME: i32 = 500;
+
+    #[test]
+    fn only_real_apps_on_our_mic_count_as_listening() {
+        let us = client(ME, "com.cursorjump.app", true, &[OUR_MIC]);
+        let siri = client(400, "com.apple.CoreSpeech", true, &[OUR_MIC]);
+        let siri_daemon = client(401, "com.apple.corespeechd", true, &[OUR_MIC]);
+        let zoom = client(600, "us.zoom.xos", true, &[OUR_MIC]);
+        let other_device = client(601, "com.apple.VoiceMemos", true, &[91]);
+        let idle = client(602, "com.apple.FaceTime", false, &[]);
+        let no_bundle = client(603, "", true, &[91, OUR_MIC]);
+
+        let background = [us.clone(), siri.clone(), siri_daemon, other_device, idle];
+        assert!(!someone_listens(&background, OUR_MIC, &[ME]));
+        assert!(!someone_listens(&[], OUR_MIC, &[ME]));
+        assert!(someone_listens(&[us.clone(), zoom], OUR_MIC, &[ME]));
+        assert!(someone_listens(&[siri, no_bundle], OUR_MIC, &[ME]));
+        // Another copy of us, say a test process, is a real client.
+        assert!(someone_listens(&[us], OUR_MIC, &[ME + 1]));
+    }
+
     /// Waits up to `within` for `want`, skipping other events.
     fn wait_for(
         rx: &std::sync::mpsc::Receiver<AudioDevEv>,
@@ -1033,6 +1215,49 @@ mod tests {
         assert!(!file.exists());
     }
 
+    #[test]
+    #[ignore = "reads this Mac's audio processes; needs the CursorJump audio driver"]
+    fn mic_listening_ignores_siri_and_us() {
+        let mic = device_id(MIC_UID).expect("the CursorJump audio driver is installed");
+        let clients = input_clients();
+        println!(
+            "our mic is object {mic}; this test is pid {}",
+            std::process::id()
+        );
+        for c in clients.iter().filter(|c| c.running_input) {
+            let devices: Vec<String> = c
+                .devices
+                .iter()
+                .map(|&d| format!("{d} ({})", device_uid(d).as_deref().unwrap_or("?")))
+                .collect();
+            println!(
+                "pid {:>6} {:<40} input on {}{}",
+                c.pid,
+                c.bundle_id.as_deref().unwrap_or("<no bundle id>"),
+                devices.join(", "),
+                if c.devices.contains(&mic) {
+                    "  <- our mic"
+                } else {
+                    ""
+                }
+            );
+        }
+        let not_running = clients.iter().filter(|c| !c.running_input).count();
+        println!("{not_running} more processes run no input");
+        println!(
+            "someone listens to our mic: {}",
+            someone_listens(&clients, mic, &[std::process::id() as i32])
+        );
+        let siri = clients.iter().filter(|c| {
+            c.bundle_id
+                .as_deref()
+                .is_some_and(|b| BACKGROUND_LISTENERS.contains(&b))
+        });
+        for c in siri {
+            assert!(!someone_listens(std::slice::from_ref(c), mic, &[]), "{c:?}");
+        }
+    }
+
     unsafe extern "C-unwind" fn record_nothing(
         _: AudioObjectID,
         _: NonNull<objc2_core_audio_types::AudioTimeStamp>,
@@ -1055,10 +1280,33 @@ mod tests {
         use std::time::Duration;
 
         let mic = device_id(MIC_UID).expect("the CursorJump audio driver is installed");
+        // Apps already recording from our mic (the Sound settings pane's
+        // meter, say) would hide the change: the watch counts them as us.
+        let others: Vec<i32> = input_clients()
+            .into_iter()
+            .filter(|c| someone_listens(std::slice::from_ref(c), mic, &[]))
+            .map(|c| c.pid)
+            .collect();
+        println!("already recording from our mic, ignored: {others:?}");
+        // This process records below. For `watch` it is someone else; for
+        // `as_us` it is us, so it doesn't count.
         let (tx, rx) = std::sync::mpsc::channel();
-        let watch = AudioWatch::start(move |ev| {
-            let _ = tx.send(ev);
-        })
+        let watch = AudioWatch::start_as(
+            move |ev| {
+                let _ = tx.send(ev);
+            },
+            others.clone(),
+        )
+        .unwrap();
+        let (us_tx, us_rx) = std::sync::mpsc::channel();
+        let mut us = others;
+        us.push(std::process::id() as i32);
+        let as_us = AudioWatch::start_as(
+            move |ev| {
+                let _ = us_tx.send(ev);
+            },
+            us,
+        )
         .unwrap();
         assert!(
             wait_for(&rx, AudioDevEv::MicListening(false), Duration::from_secs(1)),
@@ -1091,6 +1339,12 @@ mod tests {
             started,
             "MicListening(true) within 2 s (IsRunningSomewhere polled: {polled})"
         );
+        assert!(
+            !us_rx
+                .try_iter()
+                .any(|ev| ev == AudioDevEv::MicListening(true)),
+            "our own recording doesn't count"
+        );
         let stopped = wait_for(&rx, AudioDevEv::MicListening(false), Duration::from_secs(2));
         assert!(
             stopped,
@@ -1098,5 +1352,6 @@ mod tests {
             running_somewhere(mic)
         );
         drop(watch);
+        drop(as_us);
     }
 }
