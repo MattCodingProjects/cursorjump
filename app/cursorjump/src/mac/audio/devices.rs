@@ -553,7 +553,7 @@ pub(super) fn property_size(obj: AudioObjectID, mut address: AudioObjectProperty
 }
 
 /// The device whose UID is `uid`, if it exists.
-fn device_id(uid: &str) -> Option<AudioObjectID> {
+pub(super) fn device_id(uid: &str) -> Option<AudioObjectID> {
     let cf = CFString::from_str(uid);
     let ptr: *const CFString = &*cf;
     // The qualifier is the CFStringRef itself.
