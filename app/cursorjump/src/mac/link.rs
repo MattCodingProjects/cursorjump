@@ -2,13 +2,15 @@
 //! tasks serving a paired session (`Live`).
 //!
 //! Input goes from the readers straight to the injection thread, in arrival
-//! order; only the rest (pongs, clipboard, other control messages, the
-//! session ending) goes to the app's loop.
+//! order, and the PC's mic straight to its pipe; only the rest (pongs,
+//! clipboard, other control messages, the session ending) goes to the app's
+//! loop.
 
 use std::future::Future;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use cj_core::audio::AudioStream;
 use cj_core::clipboard::ClipboardData;
 use cj_core::proto::{Control, Datagram};
 use cj_net::session::Session;
@@ -17,6 +19,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info};
 
 use super::app::Ev;
+use super::audio::MicTx;
 use super::control::{InjectMsg, Input};
 use crate::common::session_tasks::{ClipboardOut, NetEv, pong, spawn_stream_tasks};
 
@@ -131,7 +134,7 @@ pub(super) struct Live {
 impl Live {
     /// Tells the injection thread that session `sid` begins, then starts the
     /// readers. Only call once any pairing exchange is done. `epoch` is the
-    /// zero point of this Mac's ping timestamps.
+    /// zero point of this Mac's ping timestamps; the PC's mic goes to `mic`.
     pub fn start(
         sid: u64,
         session: Session,
@@ -139,6 +142,7 @@ impl Live {
         epoch: std::time::Instant,
         inject: crossbeam_channel::Sender<InjectMsg>,
         events: &UnboundedSender<Ev>,
+        mic: MicTx,
     ) -> Live {
         let _ = inject.send(InjectMsg::Begin { sid });
         let net = move |ev| Ev::Net { sid, ev };
@@ -192,8 +196,18 @@ impl Live {
                         }
                         continue;
                     }
-                    // Audio is handled once the Mac audio path exists.
-                    Ok(Datagram::Audio { .. }) => continue,
+                    Ok(Datagram::Audio {
+                        stream: AudioStream::PcMic,
+                        seq,
+                        pcm,
+                    }) => {
+                        mic.push(seq, &pcm);
+                        continue;
+                    }
+                    Ok(Datagram::Audio { stream, .. }) => {
+                        debug!(?stream, "ignoring audio the Mac does not play");
+                        continue;
+                    }
                     Err(e) => break format!("connection: {e:#}"),
                 };
                 if inj.send(InjectMsg::Input { sid, input }).is_err() {
@@ -494,6 +508,63 @@ mod tests {
             assert!(result.is_err());
         }
 
+        fn mic_pipe() -> (MicTx, crate::common::audio_pipe::AudioRx) {
+            let (tx, rx) = crate::common::audio_pipe::audio_pipe(AudioStream::PcMic);
+            (MicTx::new(tx), rx)
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_pcs_mic_goes_to_its_pipe_and_nothing_else_does() {
+            let (_l, mac, pc) = connected(true).await;
+            let (inject, _inject_rx) = crossbeam_channel::unbounded();
+            let (events, _events_rx) = mpsc::unbounded_channel();
+            let (mic, mut rx) = mic_pipe();
+            let _live = Live::start(
+                1,
+                mac,
+                1000,
+                std::time::Instant::now(),
+                inject,
+                &events,
+                mic,
+            );
+            let pcm = cj_core::audio::encode_pcm(&[0.1; 480]);
+            pc.send_datagram(&Datagram::Audio {
+                stream: AudioStream::MacSound,
+                seq: 0,
+                pcm: pcm.clone(),
+            })
+            .unwrap();
+            for seq in 0..3 {
+                pc.send_datagram(&Datagram::Audio {
+                    stream: AudioStream::PcMic,
+                    seq,
+                    pcm: pcm.clone(),
+                })
+                .unwrap();
+            }
+            let received = timeout(T, async {
+                loop {
+                    rx.pull(&mut [0.0; 480]);
+                    let n = rx.stats().snapshot().received;
+                    if n >= 3 {
+                        return n;
+                    }
+                    sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            sleep(LATER).await;
+            rx.pull(&mut [0.0; 480]);
+            assert_eq!(received, 3);
+            assert_eq!(
+                rx.stats().snapshot().received,
+                3,
+                "the Mac's own sound never comes back into the mic"
+            );
+        }
+
         /// The next message for the injection thread, without blocking the runtime.
         async fn next(rx: &crossbeam_channel::Receiver<InjectMsg>) -> InjectMsg {
             let rx = rx.clone();
@@ -508,7 +579,15 @@ mod tests {
             let (_l, mac, pc) = connected(true).await;
             let (inject, inject_rx) = crossbeam_channel::unbounded();
             let (events, mut events_rx) = mpsc::unbounded_channel();
-            let live = Live::start(5, mac, 1000, std::time::Instant::now(), inject, &events);
+            let live = Live::start(
+                5,
+                mac,
+                1000,
+                std::time::Instant::now(),
+                inject,
+                &events,
+                mic_pipe().0,
+            );
 
             for c in [
                 Control::Enter {

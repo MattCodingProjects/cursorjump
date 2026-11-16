@@ -18,6 +18,8 @@
 	<true/>
 	<key>LSMinimumSystemVersion</key>
 	<string>13.0</string>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>CursorJump plays your Mac's sound through your PC's headphones.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>CursorJump connects to your PC on your home network.</string>
 	<key>NSBonjourServices</key>

@@ -1,9 +1,5 @@
 //! OS-neutral pieces of the app loop, shared by the PC and Mac apps.
 
-#[cfg_attr(
-    all(not(test), not(windows)),
-    expect(dead_code, reason = "the Mac's audio plugs into these pipes next")
-)]
 pub mod audio_pipe;
 pub mod clipboard_bridge;
 pub mod config_file;

@@ -7,8 +7,10 @@
 //! only when to send `Leave`. The listener, the advertiser, the injection
 //! thread, the clipboard bridge, the drag source, the edge catcher and the
 //! pills live as long as the process; the drags' part of the loop is in
-//! `drags.rs`.
+//! `drags.rs`, and audio's in `audio.rs` (the devices themselves are on
+//! `cj-audio`).
 
+mod audio;
 mod drags;
 
 use std::fs::{File, OpenOptions, TryLockError};
@@ -34,6 +36,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior, interval, interval_at, sleep_until};
 use tracing::{debug, error, info, warn};
 
+use super::audio::{MacAudioEv, MacAudioIo};
 use super::clipboard::{read_clipboard, spawn_clipboard_watcher, write_clipboard};
 use super::control::{
     InjectEv, InjectMsg, set_user_interactive_qos, spawn_inject_thread, update_access,
@@ -59,6 +62,7 @@ use crate::common::settings_window::SettingsWindow;
 use crate::paths;
 use crate::ui::dialogs;
 use crate::ui::tray::{TrayCmd, TrayModel, latency_text, run_tray};
+use audio::{AUDIO_QUIT, MacSharing};
 use drags::{Drags, Pills, SWEEP_EVERY};
 
 const PING_EVERY: Duration = Duration::from_millis(100);
@@ -197,6 +201,14 @@ pub fn run_mac() -> Result<()> {
         move |d| clip_events.send(Ev::LocalClipboard(d)).is_ok(),
     )?;
     let (model_tx, model_rx) = std::sync::mpsc::channel();
+    // Gives back an input a crash left on our mic; nothing else starts
+    // until a PC is connected and sharing is on.
+    let audio = {
+        let events = events.clone();
+        MacAudioIo::start(&dir, move |ev| {
+            let _ = events.send(Ev::Audio(ev));
+        })
+    };
 
     let channels = Channels {
         inject,
@@ -209,7 +221,15 @@ pub fn run_mac() -> Result<()> {
     std::thread::Builder::new()
         .name("cj-link".into())
         .spawn(move || {
-            let app = App::new(cfg, config_file, listener, advertiser, channels, drags);
+            let app = App::new(
+                cfg,
+                config_file,
+                listener,
+                advertiser,
+                channels,
+                drags,
+                audio,
+            );
             runtime.block_on(app.run(events_rx, drag_events));
             // Dropping the app drops the tray's model sender, which ends the process.
         })
@@ -303,6 +323,8 @@ pub(super) enum Ev {
         seq: u64,
         state: AccessState,
     },
+    /// From cj-audio.
+    Audio(MacAudioEv),
 }
 
 /// Resolves when SIGTERM arrives (launchctl bootout, logout); never without a handler.
@@ -450,6 +472,7 @@ struct App {
     /// open this app bundle again on the way out.
     reopen: Option<PathBuf>,
     drags: Drags,
+    audio: MacSharing,
 }
 
 impl App {
@@ -460,12 +483,14 @@ impl App {
         advertiser: Option<Advertiser>,
         ch: Channels,
         drags: Drags,
+        audio: MacAudioIo,
     ) -> App {
         let latency = LatencyStats::new();
         let awdl = AwdlKeeper::spawn()
             .inspect_err(|e| warn!("Reduce Wi-Fi hiccups is unavailable: {e:#}"))
             .ok();
         App {
+            audio: MacSharing::new(cfg.audio_sharing, audio),
             cfg,
             config_file,
             listener: Arc::new(listener),
@@ -514,6 +539,7 @@ impl App {
         self.publish();
         loop {
             let quit_by = self.quit_by;
+            let recheck = self.audio.recheck_at().map(Instant::from_std);
             tokio::select! {
                 ev = events.recv() => match ev {
                     Some(ev) => self.handle(ev).await,
@@ -530,6 +556,8 @@ impl App {
                 _ = access_poll.tick() => self.poll_access(),
                 Some(ev) = drag_events.recv() => self.on_link_dnd(ev).await,
                 _ = sweep.tick() => self.sweep_temp_dirs(false),
+                // The plan is worked out again below.
+                _ = sleep_until(recheck.unwrap_or_else(Instant::now)), if recheck.is_some() => {}
                 () = terminated(&mut sigterm) => {
                     info!("SIGTERM received");
                     self.begin_quit();
@@ -542,6 +570,7 @@ impl App {
             if self.done {
                 break;
             }
+            self.update_audio().await;
             self.publish();
         }
         self.set_conn(Conn::Waiting);
@@ -553,10 +582,17 @@ impl App {
         let advertiser = self.advertiser.take();
         // Releases the AWDL hold, if any, before the process ends.
         let awdl = self.awdl.take();
+        // cj-audio gives the user's input back and unmutes the Mac.
+        let audio_stopped = self.audio.quit();
         let _ = tokio::join!(
             tokio::time::sleep(CLOSE_FLUSH),
             tokio::task::spawn_blocking(move || drop(advertiser)),
             tokio::task::spawn_blocking(move || drop(awdl)),
+            tokio::task::spawn_blocking(move || {
+                if audio_stopped.recv_timeout(AUDIO_QUIT).is_err() {
+                    warn!("audio: cj-audio did not stop in time");
+                }
+            }),
         );
         if self.restart {
             error!("exiting with an error so that CursorJump restarts");
@@ -619,6 +655,7 @@ impl App {
                 }
             }
             Ev::Access { seq, state } => self.on_access(seq, state).await,
+            Ev::Audio(ev) => self.audio.event(ev),
         }
     }
 
@@ -630,6 +667,7 @@ impl App {
                 | Control::FileFetch { .. }
                 | Control::DragFinished { .. }),
             ) => self.on_drag_control(c).await,
+            NetEv::Control(Control::AudioStatus(s)) => self.audio.pc_status(s),
             NetEv::Control(c) => debug!(?c, "ignoring unexpected control message"),
             NetEv::Pong { rtt, at } => {
                 self.latency.record(at, rtt);
@@ -705,11 +743,16 @@ impl App {
     /// Replaces the connection; the old one is closed (a live one first
     /// ends its drags, then releases everything on the injection thread).
     fn set_conn(&mut self, conn: Conn) {
-        if matches!(self.conn, Conn::Live(_)) {
+        let was_live = matches!(self.conn, Conn::Live(_));
+        if was_live {
             // Before the machine's `Disconnected`, which dropping it sends.
             self.drags.disconnected();
         }
         self.conn = conn;
+        let live = self.live().map(|l| l.session.clone());
+        if was_live || live.is_some() {
+            self.audio.session(live.as_ref(), std::time::Instant::now());
+        }
         match (&self.conn, &self.awake) {
             (Conn::Live(_), None) => match KeepAwake::start() {
                 Ok(k) => self.awake = Some(k),
@@ -733,8 +776,9 @@ impl App {
     }
 
     /// Logs the latency summary and the Wi-Fi hiccup state, during a
-    /// paired session with samples.
+    /// paired session with samples, and the PC mic's counters while it plays.
     fn log_latency(&self) {
+        self.audio.log_stats();
         if self.live().is_none() || self.latency.is_empty() {
             return;
         }
@@ -791,12 +835,29 @@ impl App {
             self.epoch,
             self.ch.inject.clone(),
             &self.ch.events,
+            self.audio.tx(),
         );
         info!(peer = %live.peer_name, "connected");
         let session = live.session.clone();
         self.set_conn(Conn::Live(live));
         self.drags.connect(&session);
         self.send_mac_ready().await;
+    }
+
+    /// Works out the audio plan again; the PC hears a changed want, and a
+    /// new session hears it anyway.
+    async fn update_audio(&mut self) {
+        let Some(want) = self.audio.update(std::time::Instant::now()) else {
+            return;
+        };
+        let Some(session) = self.live().map(|l| l.session.clone()) else {
+            return;
+        };
+        // Awaited here, outside any select!: send_control is not cancel-safe.
+        if let Err(e) = session.send_control(&Control::AudioWant(want)).await {
+            info!("disconnected: control stream: {e:#}");
+            self.set_conn(Conn::Waiting);
+        }
     }
 
     /// Tells the PC whether it can take the cursor here.
@@ -983,6 +1044,7 @@ impl App {
         let pairing_changed = cfg.paired_peer != self.cfg.paired_peer;
         self.cfg = cfg;
         self.update_awdl();
+        self.audio.set_sharing(self.cfg.audio_sharing);
         self.ch
             .clip_link
             .max_bytes
@@ -1023,6 +1085,11 @@ impl App {
                 info!("asking for the Accessibility permission");
                 // Runs `open`, which is not instant.
                 tokio::task::spawn_blocking(request_post_event_access);
+            }
+            TrayCmd::ToggleAudioSharing => {
+                let on = !self.cfg.audio_sharing;
+                info!(on, "audio sharing switched");
+                self.update_config(move |c| c.audio_sharing = on);
             }
             TrayCmd::Quit => self.begin_quit(),
             // Never sent on macOS: the PC owns crossing, so the Mac's menu has
@@ -1072,6 +1139,7 @@ impl App {
             latency: self.latency_text.clone(),
             paused: false,
             needs_accessibility: !self.has_access(),
+            audio: Some(self.audio.menu(self.cfg.audio_sharing)),
         };
         if self.last_model.as_ref() != Some(&model) {
             let _ = self.ch.tray.send(model.clone());

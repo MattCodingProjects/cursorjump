@@ -25,6 +25,16 @@ pub struct TrayModel {
     /// macOS: input cannot be posted until Accessibility is granted, so the
     /// menu offers "Grant Accessibility…". Always false on Windows.
     pub needs_accessibility: bool,
+    /// macOS: the audio sharing switch and its note. None on Windows.
+    pub audio: Option<AudioMenu>,
+}
+
+/// The Mac menu's audio sharing switch, with a line below it saying where
+/// the sound and the mic go.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AudioMenu {
+    pub on: bool,
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +44,8 @@ pub enum TrayCmd {
     ForgetPairing,
     /// macOS: ask for the Accessibility permission.
     GrantAccessibility,
+    /// macOS: turn "Mac sound and mic through PC" on or off.
+    ToggleAudioSharing,
     Quit,
 }
 
@@ -98,6 +110,49 @@ enum TrayEvent {
     AppGone,
 }
 
+/// A line of the menu, in order (`rows`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Row {
+    Status,
+    Latency,
+    Hint,
+    Separator,
+    Grant,
+    Pause,
+    Audio,
+    AudioNote,
+    Settings,
+    Forget,
+    Separator2,
+    Quit,
+}
+
+/// The menu's lines for `m`, top to bottom. `windows`: the PC's menu, whose
+/// pause item is always there.
+fn rows(m: &TrayModel, windows: bool) -> Vec<Row> {
+    use Row::*;
+    let mut rows = vec![Status, Latency];
+    if m.latency.lines().nth(1).is_some() {
+        rows.push(Hint);
+    }
+    rows.push(Separator);
+    if m.needs_accessibility {
+        rows.push(Grant);
+    }
+    // The PC owns crossing, so only its menu can pause it.
+    if windows {
+        rows.push(Pause);
+    }
+    if let Some(audio) = &m.audio {
+        rows.push(Audio);
+        if audio.note.is_some() {
+            rows.push(AudioNote);
+        }
+    }
+    rows.extend([Settings, Forget, Separator2, Quit]);
+    rows
+}
+
 struct Items {
     menu: Menu,
     status: MenuItem,
@@ -107,6 +162,10 @@ struct Items {
     grant: MenuItem,
     grant_shown: bool,
     pause: CheckMenuItem,
+    audio: CheckMenuItem,
+    audio_shown: bool,
+    audio_note: MenuItem,
+    audio_note_shown: bool,
     settings: MenuItem,
     forget: MenuItem,
     quit: MenuItem,
@@ -123,6 +182,10 @@ impl Items {
             grant: MenuItem::new("Grant Accessibility…", true, None),
             grant_shown: false,
             pause: CheckMenuItem::new("Pause crossing", true, false, None),
+            audio: CheckMenuItem::new("Mac sound and mic through PC", true, false, None),
+            audio_shown: false,
+            audio_note: MenuItem::new("", false, None),
+            audio_note_shown: false,
             settings: MenuItem::new("Settings…", true, None),
             forget: MenuItem::new("Forget paired computer…", true, None),
             quit: MenuItem::new("Quit CursorJump", true, None),
@@ -151,6 +214,8 @@ impl Items {
         let id = ev.id();
         if id == self.pause.id() {
             Some(TrayCmd::TogglePause)
+        } else if id == self.audio.id() {
+            Some(TrayCmd::ToggleAudioSharing)
         } else if id == self.settings.id() {
             Some(TrayCmd::OpenSettings)
         } else if id == self.forget.id() {
@@ -168,37 +233,40 @@ impl Items {
         self.status.set_text(&m.status);
         let mut lines = m.latency.lines();
         self.latency.set_text(lines.next().unwrap_or(""));
-        let hint = lines.next();
-        if let Some(h) = hint {
+        if let Some(h) = lines.next() {
             self.hint.set_text(h);
         }
-        // Menus cannot hide an item, so the hint line and the Accessibility
-        // item are inserted and removed. The hint goes under the latency
-        // line; the Accessibility item heads the actions, below the separator.
+        let audio = m.audio.as_ref();
+        if let Some(note) = audio.and_then(|a| a.note.as_deref()) {
+            self.audio_note.set_text(note);
+        }
+        // Menus cannot hide an item, so these are inserted and removed, top
+        // to bottom: each goes in at its place in `rows`, as everything
+        // above it already is.
+        let rows = rows(m, cfg!(windows));
+        let at = |row| rows.iter().position(|r| *r == row);
+        let menu = &self.menu;
+        show_or_hide(menu, &self.hint, at(Row::Hint), &mut self.hint_shown);
+        show_or_hide(menu, &self.grant, at(Row::Grant), &mut self.grant_shown);
+        show_or_hide(menu, &self.audio, at(Row::Audio), &mut self.audio_shown);
         show_or_hide(
-            &self.menu,
-            &self.hint,
-            2,
-            hint.is_some(),
-            &mut self.hint_shown,
-        );
-        let grant_at = 3 + usize::from(self.hint_shown);
-        show_or_hide(
-            &self.menu,
-            &self.grant,
-            grant_at,
-            m.needs_accessibility,
-            &mut self.grant_shown,
+            menu,
+            &self.audio_note,
+            at(Row::AudioNote),
+            &mut self.audio_note_shown,
         );
         self.pause.set_checked(m.paused);
+        self.audio.set_checked(audio.is_some_and(|a| a.on));
     }
 }
 
-/// Inserts `item` at `position` or removes it, so it is in the menu exactly when `want`.
-fn show_or_hide(menu: &Menu, item: &MenuItem, position: usize, want: bool, shown: &mut bool) {
-    let result = match (want, *shown) {
-        (true, false) => menu.insert(item, position),
-        (false, true) => menu.remove(item),
+/// Inserts `item` at `position` or removes it (None), so it is in the menu
+/// exactly when wanted.
+fn show_or_hide(menu: &Menu, item: &dyn IsMenuItem, position: Option<usize>, shown: &mut bool) {
+    let want = position.is_some();
+    let result = match (position, *shown) {
+        (Some(at), false) => menu.insert(item, at),
+        (None, true) => menu.remove(item),
         _ => Ok(()),
     };
     match result {
@@ -307,10 +375,16 @@ impl TrayLoop {
                     let Some(cmd) = items.command(&e) else {
                         return;
                     };
-                    // The check mark follows the app's state, not the click.
+                    // The check marks follow the app's state, not the click.
                     items
                         .pause
                         .set_checked(model.as_ref().is_some_and(|m| m.paused));
+                    items.audio.set_checked(
+                        model
+                            .as_ref()
+                            .and_then(|m| m.audio.as_ref())
+                            .is_some_and(|a| a.on),
+                    );
                     if cmd == TrayCmd::Quit {
                         quit_by.get_or_insert(Instant::now() + QUIT_GRACE);
                         *control_flow = quit_by.map_or(ControlFlow::Wait, ControlFlow::WaitUntil);
@@ -379,6 +453,59 @@ mod tests {
         assert_eq!(
             latency_text(&stats(&[3, 60, 70, 80, 4])),
             "Latency 60 ms · 3 spikes/min\nWi-Fi is spiky — an Ethernet adapter would help"
+        );
+    }
+
+    fn model(audio: Option<AudioMenu>) -> TrayModel {
+        TrayModel {
+            status: "Connected to PC".into(),
+            latency: "Latency 4 ms".into(),
+            paused: false,
+            needs_accessibility: false,
+            audio,
+        }
+    }
+
+    #[test]
+    fn tray_shows_the_audio_switch_and_note_on_the_mac_only() {
+        use Row::*;
+        let routed = model(Some(AudioMenu {
+            on: true,
+            note: Some("Mac sound and mic go through the PC".into()),
+        }));
+        assert_eq!(
+            rows(&routed, false),
+            [
+                Status, Latency, Separator, Audio, AudioNote, Settings, Forget, Separator2, Quit
+            ]
+        );
+        let no_note = model(Some(AudioMenu {
+            on: false,
+            note: None,
+        }));
+        assert_eq!(
+            rows(&no_note, false),
+            [
+                Status, Latency, Separator, Audio, Settings, Forget, Separator2, Quit
+            ],
+            "the switch stays; the note shows only when there is one"
+        );
+        let mut busy = routed.clone();
+        busy.latency = format!("Latency 60 ms\n{SPIKY_HINT}");
+        busy.needs_accessibility = true;
+        assert_eq!(
+            rows(&busy, false),
+            [
+                Status, Latency, Hint, Separator, Grant, Audio, AudioNote, Settings, Forget,
+                Separator2, Quit
+            ]
+        );
+        assert_eq!(
+            rows(&model(None), true),
+            [
+                Status, Latency, Separator, Pause, Settings, Forget, Separator2, Quit
+            ],
+            "the PC's menu has no audio switch"
         );
     }
 

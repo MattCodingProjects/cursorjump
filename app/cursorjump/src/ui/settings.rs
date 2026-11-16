@@ -77,6 +77,7 @@ enum Setting {
     SwapCtrlCmd,
     Autostart,
     ReduceWifiHiccups,
+    AudioSharing,
 }
 
 impl Setting {
@@ -92,7 +93,7 @@ impl Setting {
 fn settings_shown(is_mac: bool) -> &'static [Setting] {
     use Setting::*;
     if is_mac {
-        &[ReduceWifiHiccups]
+        &[ReduceWifiHiccups, AudioSharing]
     } else {
         &[
             MacSide,
@@ -316,6 +317,7 @@ fn checkbox(ui: &mut egui::Ui, e: &mut Config, setting: Setting) {
             &mut e.reduce_wifi_hiccups,
             "Reduce Wi-Fi hiccups (turns off AirDrop while connected)",
         ),
+        Setting::AudioSharing => (&mut e.audio_sharing, "Mac sound and mic through PC"),
         _ => unreachable!("{setting:?} is a grid row"),
     };
     ui.checkbox(value, text);
@@ -400,6 +402,22 @@ mod tests {
     }
 
     #[test]
+    fn merge_keeps_an_audio_sharing_change() {
+        let before = Config::default();
+        let after = Config {
+            audio_sharing: false,
+            ..before.clone()
+        };
+        let disk = Config {
+            paused: true,
+            ..before.clone()
+        };
+        let merged = merge_edits(&before, &after, disk);
+        assert!(!merged.audio_sharing);
+        assert!(merged.paused);
+    }
+
+    #[test]
     fn merge_applies_forget() {
         let before = Config {
             paired_peer: Some("ab".into()),
@@ -452,7 +470,10 @@ mod tests {
 
     #[test]
     fn the_mac_shows_only_what_the_mac_uses() {
-        assert_eq!(settings_shown(true), [Setting::ReduceWifiHiccups]);
+        assert_eq!(
+            settings_shown(true),
+            [Setting::ReduceWifiHiccups, Setting::AudioSharing]
+        );
         assert!(pc_only_note(true).is_some());
     }
 

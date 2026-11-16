@@ -855,8 +855,8 @@ impl App {
                 });
             }
             TrayCmd::Quit => self.begin_quit().await,
-            // Only the Mac's menu offers it.
-            TrayCmd::GrantAccessibility => {}
+            // Only the Mac's menu offers them.
+            TrayCmd::GrantAccessibility | TrayCmd::ToggleAudioSharing => {}
         }
     }
 
@@ -902,6 +902,7 @@ impl App {
             latency: self.latency_text.clone(),
             paused: self.cfg.paused,
             needs_accessibility: false,
+            audio: None,
         };
         if self.last_model.as_ref() != Some(&model) {
             let _ = self.ch.tray.send(model.clone());

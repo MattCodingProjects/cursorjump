@@ -2,10 +2,6 @@
 //! start at login and the drag-and-drop pills.
 
 pub mod app;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the Mac's audio session uses these next")
-)]
 pub mod audio;
 pub mod autostart;
 pub mod clipboard;
