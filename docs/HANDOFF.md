@@ -2,7 +2,7 @@
 
 ## Audio sharing: everything built; both directions work; acceptance (Task 15) in progress
 
-Last updated: 2026-11-16 (early morning SAST), on the Mac. Work is on branch **`audio`**, made from `phase2`. **All plan tasks 1–14 are done and reviewed, plus the follow-up P16.** Mac sound plays in the PC's headphones, and the PC's mic reaches Mac apps. The user's verdict on the first run: "working flawlessly". What's left is the Task 15 acceptance checklist, cleanup, the final review and the merge.
+Last updated: 2026-11-16 (midday SAST), on the Mac. Work is on branch **`audio`**, made from `phase2`. **All plan tasks 1–14 are done and reviewed, plus the follow-up P16.** Mac sound plays in the PC's headphones, and the PC's mic reaches Mac apps. The user's verdict on the first run: "working flawlessly". What's left is the Task 15 acceptance checklist, cleanup, the final review and the merge.
 
 - **Spec:** `docs/superpowers/specs/2026-10-25-audio-sharing-design.md`
 - **Plan:** `docs/superpowers/plans/2026-11-15-audio-sharing.md` (Task 12 carries an amendment block from the spike)
@@ -26,7 +26,7 @@ Last updated: 2026-11-16 (early morning SAST), on the Mac. Work is on branch **`
 
 ### What is installed right now
 - **PC:** the `audio` build (protocol v4), installed 2026-11-16 around 01:35Z. There have been no PC code changes since, so it is current.
-- **Mac:** `/Applications/CursorJump.app` is built from `63be3a9` (protocol v4). **It does not have P16 yet** (`f90d026`, `d04d6c6`). Reinstall it first: `./scripts/mac/install.sh`. Run it in the user's Terminal, not in Claude Code (see the tooling notes).
+- **Mac:** `/Applications/CursorJump.app` is built from `d9378c5` (protocol v4, P16 included), installed by the user 2026-11-16 09:57Z. Both machines are current.
 - The macOS "System Audio Recording" permission is granted to CursorJump. The first prompt worked: the probe waited 28 s for the click, then got Allowed.
 
 ### Task 15 acceptance so far
@@ -36,22 +36,22 @@ Recorded in the ledger. They still need to be written into `docs/ACCEPTANCE.md` 
 - ✅ **The Windows mic indicator** goes off when no Mac app listens.
 - ✅ **Cursor latency is unchanged** with audio on: median 3.1–3.4 ms, 0 spikes.
 - ✅ **PC mic stream:** 0 lost, 0 underruns.
-- ⏳ **Next batch, already sent to the user:**
-  1. Reinstall the Mac.
-  2. Lip sync, checked by eye.
-  3. The switch, off and on, from the menu, plus the settings checkbox.
-  4. A 2 s Wi-Fi blip on the Mac with no fallback.
-  5. A Wi-Fi drop over 5 s: the Mac's speakers come back, then it returns to the PC.
-  6. The PC volume keys while the cursor is on the Mac.
+- ✅ **Lip sync** by eye (2026-11-16).
+- ✅ **The switch** off and on, from the menu and from settings.
+- ✅ **A 2 s Wi-Fi blip:** no fallback.
+- ✅ **A Wi-Fi drop over 5 s:** the Mac's speakers come back after the 5 s grace, then sound returns to the PC on reconnect.
+- ⏸ **The PC volume keys:** deferred. The user's PC keyboard has no volume keys.
+- ⏳ **Next batch, already sent to the user (no results yet):**
+  1. An hour of playback, started in the background (the PC log's "Mac sound" line shows 0 skips).
+  2. Discord on the Mac (input: Default): the mic test or a call. The Windows mic indicator is on only during it. This is also the live proof of P16b.
+  3. Wired headphones or AirPods on the Mac mid-song (the I1/N4 gate: nothing from the Mac's mic, and AirPods must not drop to call quality). Check the log's "aggregate has N input streams" line.
+  4. Unplugging the PC's headphones mid-song (the user has a single PC output): the Mac's speakers take over with the note "the PC has no sound output", then sound returns on replug.
+  5. The Windows mic privacy switch off (the Mac menu note and the PC tray suffix).
 - ⏳ **Still to do after that:**
   - Music during Valorant/Roblox.
-  - A Discord call on the Mac, with the PC mic indicator on only during the call. This is also the live proof of P16b.
-  - Switching the PC's default output mid-song.
-  - AirPods or wired headphones on the Mac mid-song (the I1/N4 gate: nothing from the Mac's mic, and AirPods must not drop to call quality).
   - A 5 GB copy during music.
   - A reboot of each machine, and `kill -9` CursorJump on the Mac (the speakers come back at once, and the mic comes back at the next launch).
-  - An hour of playback (the PC log's "Mac sound" line shows 0 skips).
-  - The Windows mic privacy switch off (the Mac menu note and the PC tray suffix).
+- **Cursor lag note (2026-11-16):** the user saw the Mac cursor lag for a while, then it stopped. The log shows bursts of spikes capped at ~130 ms, mostly in the minute after a connect. The same pattern has been there since 2026-10-19, before audio existed: likely Wi-Fi power save. If it comes back, A/B it with the audio switch off and on for 5 min each. Details are in the ledger.
 
 ### After acceptance
 1. Fix anything that failed, through SDD.
@@ -64,6 +64,7 @@ Recorded in the ledger. They still need to be written into `docs/ACCEPTANCE.md` 
 - **Core Audio IO:** commands from Claude Code need the sandbox off (`dangerouslyDisableSandbox`). They count as Terminal for TCC, and Terminal has System Audio Recording and Microphone.
 - **Signing:** `codesign` with "CursorJump Dev" fails from Claude Code's shell (`errSecInternalComponent`, no keychain access). So `install.sh` and `install-audio-driver.sh` must be run by the user in Terminal.
 - **Logs:** in zsh, `log` is a builtin, so use `/usr/bin/log show …`. The app log is in UTC; `log show` uses local time (SAST, UTC+2).
+- **Two clones on the Mac:** `~/Projects/cursorjump` (the one the sessions use and install from) and `~/Documents/Claude Code Work/untitled folder/cursorjump`. Keep both pulled.
 - **Tap hands-on tests** (`mac::audio::tap`) mute the Mac. Run them only with the user listening. The feed and devices tests only touch the virtual devices.
 - `ParrotAudioPlugin.driver` is a third-party HAL plug-in on this Mac. Clean-room rule: don't read it.
 
