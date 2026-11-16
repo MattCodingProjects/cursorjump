@@ -47,6 +47,10 @@ objc2-io-kit = { version = "0.3.2", default-features = false, features = ["std",
 objc2-uniform-type-identifiers = { version = "0.3.2", default-features = false, features = ["std", "UTType"] }
 # The audio restore file (mac/audio/devices.rs).
 toml = "0.8"
+# Mac sound capture (mac/audio/tap.rs): the IOProc's ring to the sender
+# thread, and a fixed-ratio resampler when the tap isn't at 48 kHz.
+rtrb = "0.4"
+rubato = { version = "5.1", default-features = false }
 # SIGTERM (launchctl bootout, logout) runs the normal quit.
 tokio = { version = "1.53.3", features = ["signal"] }
 

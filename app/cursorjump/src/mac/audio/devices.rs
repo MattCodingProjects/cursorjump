@@ -285,12 +285,12 @@ pub enum AudioDevEv {
     MicListening(bool),
 }
 
-type Listener = RcBlock<dyn Fn(u32, NonNull<AudioObjectPropertyAddress>)>;
+pub(super) type Listener = RcBlock<dyn Fn(u32, NonNull<AudioObjectPropertyAddress>)>;
 
 /// A listener block that moves between threads. Sound: the closures inside
 /// capture only `Send + Sync` data, and block copies and releases are
 /// atomic.
-struct SendBlock(Listener);
+pub(super) struct SendBlock(pub(super) Listener);
 // SAFETY: see above.
 unsafe impl Send for SendBlock {}
 
@@ -479,9 +479,9 @@ impl Shared {
     }
 }
 
-const SYSTEM: AudioObjectID = kAudioObjectSystemObject as AudioObjectID;
+pub(super) const SYSTEM: AudioObjectID = kAudioObjectSystemObject as AudioObjectID;
 
-fn global(selector: AudioObjectPropertySelector) -> AudioObjectPropertyAddress {
+pub(super) fn global(selector: AudioObjectPropertySelector) -> AudioObjectPropertyAddress {
     AudioObjectPropertyAddress {
         mSelector: selector,
         mScope: kAudioObjectPropertyScopeGlobal,
@@ -490,7 +490,7 @@ fn global(selector: AudioObjectPropertySelector) -> AudioObjectPropertyAddress {
 }
 
 /// Reads a fixed-size property; Err is the OSStatus.
-fn get<T: Copy>(
+pub(super) fn get<T: Copy>(
     obj: AudioObjectID,
     mut address: AudioObjectPropertyAddress,
     qualifier: Option<&[u8]>,
@@ -518,7 +518,11 @@ fn get<T: Copy>(
     Ok(unsafe { out.assume_init() })
 }
 
-fn set<T: Copy>(obj: AudioObjectID, mut address: AudioObjectPropertyAddress, value: T) -> i32 {
+pub(super) fn set<T: Copy>(
+    obj: AudioObjectID,
+    mut address: AudioObjectPropertyAddress,
+    value: T,
+) -> i32 {
     let mut v = value;
     // SAFETY: every pointer outlives the call, and the size is `v`'s.
     unsafe {
@@ -563,15 +567,28 @@ fn device_id(uid: &str) -> Option<AudioObjectID> {
     (id != kAudioObjectUnknown).then_some(id)
 }
 
-fn device_uid(id: AudioObjectID) -> Option<String> {
-    let p: *mut CFString = get(id, global(kAudioDevicePropertyDeviceUID), None).ok()?;
-    // SAFETY: Core Audio returns the UID retained (+1); this takes that reference.
+pub(super) fn device_uid(id: AudioObjectID) -> Option<String> {
+    string_property(id, kAudioDevicePropertyDeviceUID)
+}
+
+/// Reads a CFString property of `id`'s global scope.
+pub(super) fn string_property(
+    id: AudioObjectID,
+    selector: AudioObjectPropertySelector,
+) -> Option<String> {
+    let p: *mut CFString = get(id, global(selector), None).ok()?;
+    // SAFETY: Core Audio returns the string retained (+1); this takes that reference.
     let s = unsafe { CFRetained::from_raw(NonNull::new(p)?) };
     Some(s.to_string())
 }
 
 fn device_ids() -> Vec<AudioObjectID> {
-    let mut address = global(kAudioHardwarePropertyDevices);
+    object_list(kAudioHardwarePropertyDevices)
+}
+
+/// Reads a list of objects from the system object, such as its devices.
+pub(super) fn object_list(selector: AudioObjectPropertySelector) -> Vec<AudioObjectID> {
+    let mut address = global(selector);
     let mut size = property_size(SYSTEM, address);
     let mut ids = vec![kAudioObjectUnknown; size as usize / size_of::<AudioObjectID>()];
     if ids.is_empty() {

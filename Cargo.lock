@@ -609,6 +609,8 @@ dependencies = [
  "objc2-io-kit",
  "objc2-uniform-type-identifiers 0.3.2",
  "rfd",
+ "rtrb",
+ "rubato",
  "tao",
  "tempfile",
  "tiny-skia",
@@ -3131,6 +3133,12 @@ dependencies = [
  "untrusted",
  "windows-sys 0.52.0",
 ]
+
+[[package]]
+name = "rtrb"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5974e397833d890f2f74963408e0d4a6cd8eda2f6a445ae06750291b5d7a997e"
 
 [[package]]
 name = "rubato"
