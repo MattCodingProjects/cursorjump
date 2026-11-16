@@ -113,3 +113,4 @@ Task 13: implementer DONE w/ concerns (d1e9749): hands-on tone test PASS 4/4 (99
 Task 13: review 1 — Needs fixes. Important: stop/Drop freed and returned the Box<AudioRx> even when AudioDeviceStop and DestroyIOProcID both failed (possible use-after-free / aliased &mut).
 Ruling P13: MicFeed::stop -> Option<AudioRx>; the rx comes back only if the IOProc never started, or Stop or Destroy returned 0; otherwise it is leaked with a warn, and Task 14 makes a fresh PcMic pipe and swaps its AudioTx — cost: Task 14's tx() must be swappable.
 Task 13: fix round 1/5 dispatched (Important 1, Minors 1 and 3; deferred: Minor 2 pitch margin, Minor 4 unwind into the HAL).
+Task 14: dispatched (BASE 8de7cad, implementer opus), in parallel with the Task 13 fix round (P13's stop -> Option<AudioRx> is fixed by ruling)
