@@ -116,3 +116,7 @@ Task 13: fix round 1/5 dispatched (Important 1, Minors 1 and 3; deferred: Minor 
 Task 14: dispatched (BASE 8de7cad, implementer opus), in parallel with the Task 13 fix round (P13's stop -> Option<AudioRx> is fixed by ruling)
 Task 13: fix round 1/5 (3 addressed, 0 open; commits d1e9749..dbf0aac); re-review clean. Hands-on: 999.001 Hz, −0.000 dB, 0 underruns, 0 skips.
 Task 13: complete (commits 61f4d2a..dbf0aac, review clean)
+Task 14: implementer DONE w/ concerns (0fa9abb): 361+6 tests, clippy clean, aarch64 release build OK; tx() returns MicTx (a swappable AudioTx); mac/app.rs at 1250 lines (audio glue in mac/app/audio.rs).
+Ruling P14: the mic route engages only once MicFeed has started, and releases if the feed fails or stops — a default input that is our mic with no feed is silent (implementer concern 3) — cost: none.
+Ruling P15: MacAudio::set_sharing(true) after false resets capture to Unknown, so toggling the switch re-probes after the user grants capture; NOTE_CAPTURE_DENIED gains ', then turn Mac sound and mic through PC off and on' — without it a refusal sticks until restart (concern 4) — cost: a tiny cj-core change (Task 4 code).
+Task 14: review 1 dispatched (BASE 259e72f).
