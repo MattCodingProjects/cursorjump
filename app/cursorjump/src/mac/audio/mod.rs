@@ -5,8 +5,12 @@
 //! - The app's loop decides (`cj_core::audio_state::MacAudio`); this thread
 //!   only does, and reports what it learns back as [`MacAudioEv`]s.
 //! - Starting the tap probes capture first, which blocks while macOS shows
-//!   its permission prompt: so it happens here, never on the loop, and only
-//!   once a plan asks for the tap.
+//!   its permission prompt (or up to the probe's cap). So it runs on a
+//!   short-lived helper, `cj-audio-tap`, one at a time, and only once a plan
+//!   asks for the tap: `cj-audio` stays free to give the input back, and to
+//!   answer Quit, meanwhile. Rebuilding and dropping the tap stay here.
+//! - CursorJump Microphone is the default input only while the feed plays
+//!   the PC's mic into it (ruling P14).
 //! - The PC's mic reaches the feed through a pipe whose network end
 //!   ([`MicTx`]) is swapped for a fresh one if a feed's teardown leaks the
 //!   old receiver.
@@ -15,7 +19,7 @@ pub mod devices;
 pub mod feed;
 pub mod tap;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -36,6 +40,9 @@ const RESTORE_FILE: &str = "audio-restore.toml";
 /// After the tap failed to start, the soonest it is tried again (an output
 /// change tries at once).
 const TAP_RETRY: Duration = Duration::from_secs(5);
+/// After Quit, how long `cj-audio` waits for a tap start still running, to
+/// drop what it makes.
+const START_DRAIN: Duration = Duration::from_secs(20);
 
 pub enum AudioCmd {
     Apply(AudioPlan),
@@ -127,10 +134,17 @@ impl MicPipe {
     }
 }
 
+/// Gives back an input a crash (or a wedged `cj-audio`) left on our mic:
+/// what `cj-audio` does at launch, for the app's shutdown to fall back on.
+pub fn recover_input(restore_file: &Path) {
+    MicRoute::new(CoreAudioDevices, restore_file.to_path_buf()).recover();
+}
+
 /// The app's handle on `cj-audio`.
 pub struct MacAudioIo {
     cmds: Sender<AudioCmd>,
     mic: MicPipe,
+    restore: PathBuf,
 }
 
 impl MacAudioIo {
@@ -142,11 +156,11 @@ impl MacAudioIo {
         let (cmds, cmds_rx) = unbounded();
         let (mic, idle) = MicPipe::new();
         let restore = app_support.join(RESTORE_FILE);
-        let pipe = mic.clone();
+        let (pipe, file) = (mic.clone(), restore.clone());
         let spawned = std::thread::Builder::new()
             .name("cj-audio".into())
             .spawn(move || {
-                let route = MicRoute::new(CoreAudioDevices, restore);
+                let route = MicRoute::new(CoreAudioDevices, file);
                 let mut worker =
                     Worker::new(route, Factories::real(), pipe, idle, Box::new(events));
                 worker.launch();
@@ -161,11 +175,23 @@ impl MacAudioIo {
                 if let Some(reply) = reply {
                     let _ = reply.send(());
                 }
+                // After the reply: a tap a start still makes is dropped here.
+                worker.drain_start();
             });
         if let Err(e) = spawned {
             error!("audio: starting cj-audio failed: {e}; no audio sharing");
         }
-        MacAudioIo { cmds, mic }
+        MacAudioIo { cmds, mic, restore }
+    }
+
+    /// A handle whose commands go to `cmds`, with no thread behind it.
+    #[cfg(test)]
+    pub fn detached(cmds: Sender<AudioCmd>) -> MacAudioIo {
+        MacAudioIo {
+            cmds,
+            mic: MicPipe::new().0,
+            restore: PathBuf::from("audio-restore.toml"),
+        }
     }
 
     /// For the datagram reader: where the PC's mic goes.
@@ -183,20 +209,40 @@ impl MacAudioIo {
         self.mic.running()
     }
 
+    /// The file [`recover_input`] reads.
+    pub fn restore_file(&self) -> PathBuf {
+        self.restore.clone()
+    }
+
     pub fn send(&self, c: AudioCmd) {
         let _ = self.cmds.send(c);
     }
 }
 
-/// The Mac's sound going to the PC; dropping it destroys the tap.
-trait Tap {
+/// The Mac's sound going to the PC; dropping it destroys the tap. Made on
+/// `cj-audio-tap`, then rebuilt and dropped on `cj-audio`.
+trait Tap: Send {
     /// Moves to the current default output; after an Err the tap is down.
     fn rebuild(&mut self) -> Result<(), TapError>;
 }
 
-impl Tap for SoundTap {
+/// A [`SoundTap`] that may move from `cj-audio-tap` to `cj-audio`.
+struct MovedTap(SoundTap);
+
+// SAFETY: the only part of a SoundTap that is not Send is its IOProc's
+// state pointer (`Io<Capturer>`'s `NonNull`, from `Box::leak`, as in
+// `MicFeed`). That state is owned by the tap and used by Core Audio's
+// IOProc alone while the IOProc exists; the thread holding the SoundTap
+// only calls Core Audio's (thread-safe) stop, destroy and property calls on
+// its IDs, and frees the state after the IOProc is destroyed. Every other
+// field (IDs, an Arc of atomics, a crossbeam sender, a join handle, a
+// dispatch queue and a SendBlock) is Send. The tap is only ever used by one
+// thread at a time: moved once, then owned by `cj-audio`.
+unsafe impl Send for MovedTap {}
+
+impl Tap for MovedTap {
     fn rebuild(&mut self) -> Result<(), TapError> {
-        SoundTap::rebuild(self)
+        self.0.rebuild()
     }
 }
 
@@ -212,7 +258,9 @@ impl Feed for MicFeed {
     }
 }
 
-type TapFactory = Box<dyn Fn(AudioOut) -> Result<Box<dyn Tap>, TapError>>;
+type TapResult = Result<Box<dyn Tap>, TapError>;
+/// Runs on `cj-audio-tap`.
+type TapFactory = Arc<dyn Fn(AudioOut) -> TapResult + Send + Sync>;
 /// The rx comes back with the error (boxed: it is large, and rare).
 type FeedResult = Result<Box<dyn Feed>, Box<(anyhow::Error, AudioRx)>>;
 type FeedFactory = Box<dyn Fn(AudioRx) -> FeedResult>;
@@ -228,7 +276,7 @@ struct Factories {
 impl Factories {
     fn real() -> Factories {
         Factories {
-            tap: Box::new(|out| Ok(Box::new(SoundTap::start(out)?) as Box<dyn Tap>)),
+            tap: Arc::new(|out| Ok(Box::new(MovedTap(SoundTap::start(out)?)) as Box<dyn Tap>)),
             feed: Box::new(|rx| {
                 MicFeed::start(rx)
                     .map(|f| Box::new(f) as Box<dyn Feed>)
@@ -252,6 +300,11 @@ struct Worker<D: InputDevices> {
     tap: Option<Box<dyn Tap>>,
     /// When the tap last failed to start, while it is still wanted.
     tap_failed_at: Option<Instant>,
+    /// A tap start is running on `cj-audio-tap`; its result comes on `starts`.
+    starting: bool,
+    /// The default output changed while a start ran: rebuild what it makes.
+    output_moved: bool,
+    starts: (Sender<TapResult>, Receiver<TapResult>),
     feed: Option<Box<dyn Feed>>,
     mic: MicPipe,
     /// The PC mic's receiver while no feed plays it.
@@ -277,6 +330,9 @@ impl<D: InputDevices> Worker<D> {
             want_mic: false,
             tap: None,
             tap_failed_at: None,
+            starting: false,
+            output_moved: false,
+            starts: unbounded(),
             feed: None,
             mic,
             idle: Some(idle),
@@ -296,6 +352,7 @@ impl<D: InputDevices> Worker<D> {
         cmds: &Receiver<AudioCmd>,
         mut devs: Receiver<AudioDevEv>,
     ) -> Option<std::sync::mpsc::Sender<()>> {
+        let starts = self.starts.1.clone();
         loop {
             let timer = match self.retry_at() {
                 Some(at) => after(at.saturating_duration_since(Instant::now())),
@@ -319,6 +376,12 @@ impl<D: InputDevices> Worker<D> {
                     // No watch (it failed to start): never ready again.
                     Err(_) => devs = never(),
                 },
+                // The worker holds a sender, so this never disconnects.
+                recv(starts) -> r => {
+                    if let Ok(r) = r {
+                        self.tap_started(r, Instant::now());
+                    }
+                }
                 recv(timer) -> _ => self.tick(Instant::now()),
             }
         }
@@ -342,6 +405,8 @@ impl<D: InputDevices> Worker<D> {
                         self.tap_failed_at = Some(now);
                     }
                 }
+                // The tap being made may be on the old output.
+                None if self.starting => self.output_moved = true,
                 // A tap that failed to start may work on the new output.
                 None => retry_tap = true,
             },
@@ -357,7 +422,7 @@ impl<D: InputDevices> Worker<D> {
     /// When the tap's retry is due, if one is waiting.
     fn retry_at(&self) -> Option<Instant> {
         match (&self.tap, self.tap_failed_at) {
-            (None, Some(t)) if self.want_tap => Some(t + TAP_RETRY),
+            (None, Some(t)) if self.want_tap && !self.starting => Some(t + TAP_RETRY),
             _ => None,
         }
     }
@@ -366,30 +431,30 @@ impl<D: InputDevices> Worker<D> {
         self.reconcile(now, false);
     }
 
-    /// Brings the route, the feed and the tap in line with the plan.
+    /// Brings the feed, the route and the tap in line with the plan.
     /// `retry_tap`: try a failed tap again without waiting.
     fn reconcile(&mut self, now: Instant, retry_tap: bool) {
         if self.want_mic {
-            // The feed plays before apps are moved onto our mic.
             self.start_feed();
-            if !self.route.engaged() {
-                match self.route.engage() {
-                    Ok(()) => info!("audio: mic on (CursorJump Microphone is the default input)"),
-                    Err(e) => warn!("audio: making CursorJump Microphone the default input: {e:#}"),
-                }
+        }
+        // Our mic is the default input only while the feed plays into it.
+        let engage = self.want_mic && self.feed.is_some();
+        if engage && !self.route.engaged() {
+            match self.route.engage() {
+                Ok(()) => info!("audio: mic on (CursorJump Microphone is the default input)"),
+                Err(e) => warn!("audio: making CursorJump Microphone the default input: {e:#}"),
             }
-        } else {
-            // The user's input comes back first.
-            if self.route.engaged() {
-                self.route.release();
-                info!("audio: mic off (the Mac's own input is back)");
-            }
+        } else if !engage && self.route.engaged() {
+            // The user's input comes back before the feed stops.
+            self.route.release();
+            info!("audio: mic off (the Mac's own input is back)");
+        }
+        if !self.want_mic {
             self.stop_feed();
         }
-        // Last: starting the tap may wait on macOS's permission prompt.
         if self.want_tap {
             let due = retry_tap || self.retry_at().is_none_or(|at| now >= at);
-            if self.tap.is_none() && due {
+            if self.tap.is_none() && !self.starting && due {
                 self.start_tap(now);
             }
         } else {
@@ -398,13 +463,52 @@ impl<D: InputDevices> Worker<D> {
         }
     }
 
+    /// Starts the tap on `cj-audio-tap`; the result comes back on `starts`.
     fn start_tap(&mut self, now: Instant) {
-        match (self.make.tap)(self.out.clone()) {
-            Ok(tap) => {
+        let (make, out, done) = (
+            Arc::clone(&self.make.tap),
+            self.out.clone(),
+            self.starts.0.clone(),
+        );
+        let spawned = std::thread::Builder::new()
+            .name("cj-audio-tap".into())
+            .spawn(move || {
+                // If cj-audio is gone, the tap is dropped here.
+                let _ = done.send(make(out));
+            });
+        match spawned {
+            Ok(_) => {
+                self.starting = true;
+                self.output_moved = false;
+            }
+            Err(e) => {
+                warn!("audio: starting cj-audio-tap failed: {e}; trying again later");
+                self.tap_failed_at = Some(now);
+            }
+        }
+    }
+
+    /// A start finished on `cj-audio-tap`.
+    fn tap_started(&mut self, result: TapResult, now: Instant) {
+        self.starting = false;
+        match result {
+            Ok(mut tap) => {
+                (self.events)(MacAudioEv::Capture(Capture::Allowed));
+                if !self.want_tap {
+                    // The plan dropped it (or Quit came) meanwhile.
+                    info!("audio: the tap is no longer wanted; dropping it");
+                    return;
+                }
+                if std::mem::take(&mut self.output_moved)
+                    && let Err(e) = tap.rebuild()
+                {
+                    warn!("audio: moving the new tap to the new output failed: {e}");
+                    self.tap_failed_at = Some(now);
+                    return;
+                }
                 info!("audio: tap on (the Mac's sound goes to the PC)");
                 self.tap = Some(tap);
                 self.tap_failed_at = None;
-                (self.events)(MacAudioEv::Capture(Capture::Allowed));
             }
             Err(TapError::Denied) => {
                 info!("audio: capturing the Mac's sound was refused; it stays on the Mac");
@@ -445,7 +549,7 @@ impl<D: InputDevices> Worker<D> {
             }
             Err(failed) => {
                 let (e, rx) = *failed;
-                warn!("audio: starting the mic feed failed: {e:#}");
+                warn!("audio: starting the mic feed failed: {e:#}; the mic stays on the Mac");
                 self.idle = Some(rx);
             }
         }
@@ -473,12 +577,25 @@ impl<D: InputDevices> Worker<D> {
         }
     }
 
-    /// Gives the user's input back, stops the feed and drops the tap.
+    /// Gives the user's input back, stops the feed and drops the tap. A tap
+    /// start still running is not waited for (see `drain_start`).
     fn quit(&mut self) {
         self.want_tap = false;
         self.want_mic = false;
         self.reconcile(Instant::now(), false);
         self.out.set(None);
+    }
+
+    /// After Quit: waits (up to `START_DRAIN`) for a tap start still
+    /// running, and drops what it made.
+    fn drain_start(&mut self) {
+        if !self.starting {
+            return;
+        }
+        match self.starts.1.recv_timeout(START_DRAIN) {
+            Ok(r) => self.tap_started(r, Instant::now()),
+            Err(_) => warn!("audio: a tap start did not finish after quitting"),
+        }
     }
 }
 
@@ -486,18 +603,15 @@ impl<D: InputDevices> Worker<D> {
 mod tests {
     use super::*;
     use std::collections::HashSet;
-    use std::sync::{Arc, Mutex};
-    use std::time::{Duration, Instant};
 
     use anyhow::anyhow;
     use cj_core::audio::{AudioWant, encode_pcm};
-    use cj_core::audio_state::{AudioPlan, Capture};
 
-    use crate::common::audio_pipe::{AudioOut, AudioRx};
-    use devices::{AudioDevEv, InputDevices, MIC_UID, MicRoute};
-    use tap::TapError;
+    use devices::MIC_UID;
 
     const BUILTIN: &str = "BuiltInMicrophoneDevice";
+    /// Upper bound for a fake tap start to come back.
+    const T: Duration = Duration::from_secs(10);
 
     /// What the fakes did, in order.
     #[derive(Clone, Default)]
@@ -511,6 +625,10 @@ mod tests {
         fn take(&self) -> Vec<String> {
             std::mem::take(&mut *self.0.lock().unwrap())
         }
+    }
+
+    fn has(log: &[String], what: &str) -> bool {
+        log.iter().any(|l| l == what)
     }
 
     #[derive(Default)]
@@ -605,6 +723,8 @@ mod tests {
         inputs: Arc<Mutex<Inputs>>,
         events: Arc<Mutex<Vec<MacAudioEv>>>,
         tap_answer: Arc<Mutex<Answer>>,
+        /// While Some, a tap start waits for a message on it.
+        tap_gate: Arc<Mutex<Option<Receiver<()>>>>,
         rebuild_ok: Arc<Mutex<bool>>,
         feed_ok: Arc<Mutex<bool>>,
         feed_leaks: Arc<Mutex<bool>>,
@@ -620,6 +740,21 @@ mod tests {
 
         fn default_input(&self) -> String {
             self.inputs.lock().unwrap().default.clone()
+        }
+
+        /// Waits for the tap start running on `cj-audio-tap` and hands its
+        /// result to the worker, as `run` does.
+        fn started(&mut self, now: Instant) {
+            assert!(self.worker.starting, "no start is running");
+            let r = self.worker.starts.1.recv_timeout(T).expect("a tap start");
+            self.worker.tap_started(r, now);
+        }
+
+        /// Makes tap starts wait until the returned sender sends or drops.
+        fn hold_tap_starts(&self) -> Sender<()> {
+            let (release, gate) = unbounded();
+            *self.tap_gate.lock().unwrap() = Some(gate);
+            release
         }
     }
 
@@ -648,16 +783,25 @@ mod tests {
             restore,
         );
         let tap_answer = Arc::new(Mutex::new(Answer::Ok));
+        let tap_gate: Arc<Mutex<Option<Receiver<()>>>> = Arc::default();
         let rebuild_ok = Arc::new(Mutex::new(true));
         let feed_ok = Arc::new(Mutex::new(true));
         let feed_leaks = Arc::new(Mutex::new(false));
         let driver = Arc::new(Mutex::new(true));
         let make = Factories {
-            tap: Box::new({
-                let (log, answer, rebuild_ok) =
-                    (log.clone(), tap_answer.clone(), rebuild_ok.clone());
+            tap: Arc::new({
+                let (log, answer, gate, rebuild_ok) = (
+                    log.clone(),
+                    tap_answer.clone(),
+                    tap_gate.clone(),
+                    rebuild_ok.clone(),
+                );
                 move |_out: AudioOut| {
                     log.push("tap start");
+                    let gate = gate.lock().unwrap().clone();
+                    if let Some(gate) = gate {
+                        let _ = gate.recv();
+                    }
                     match *answer.lock().unwrap() {
                         Answer::Ok => Ok(Box::new(FakeTap {
                             log: log.clone(),
@@ -700,6 +844,7 @@ mod tests {
             inputs,
             events,
             tap_answer,
+            tap_gate,
             rebuild_ok,
             feed_ok,
             feed_leaks,
@@ -738,6 +883,7 @@ mod tests {
         assert_eq!(r.events(), [MacAudioEv::Driver(true)]);
         assert_eq!(r.worker.retry_at(), None);
         r.worker.apply(&plan(false, false), Instant::now());
+        assert!(!r.worker.starting);
         assert!(r.log.take().is_empty(), "nothing is needed: nothing starts");
     }
 
@@ -746,26 +892,40 @@ mod tests {
         let mut r = rig();
         let t = Instant::now();
         r.worker.apply(&plan(true, false), t);
+        r.started(t);
         assert_eq!(r.log.take(), ["tap start"]);
         assert_eq!(r.events(), [MacAudioEv::Capture(Capture::Allowed)]);
         r.worker.apply(&plan(true, false), t);
-        assert!(r.log.take().is_empty(), "the same plan changes nothing");
+        assert!(!r.worker.starting, "the same plan changes nothing");
+        assert!(r.log.take().is_empty());
         r.worker.apply(&plan(false, false), t);
         assert_eq!(r.log.take(), ["tap drop"]);
     }
 
     #[test]
-    fn a_denied_tap_is_reported_and_not_retried_at_once() {
+    fn a_denied_tap_is_reported_and_probed_again_once_switched_back_on() {
         let mut r = rig();
         *r.tap_answer.lock().unwrap() = Answer::Denied;
         let t = Instant::now();
         r.worker.apply(&plan(true, false), t);
+        r.started(t);
         assert_eq!(r.log.take(), ["tap start"]);
         assert_eq!(r.events(), [MacAudioEv::Capture(Capture::Denied)]);
-        // The app's next plan (tap off) is on its way.
+        // A plan sent before the app heard of the refusal.
         r.worker
             .apply(&plan(true, true), t + Duration::from_secs(1));
-        assert!(!r.log.take().contains(&"tap start".to_string()));
+        assert!(!r.worker.starting, "not probed again at once");
+        // The app's next plan: tap off. Then the user, having allowed
+        // capture, switches sharing off and on (P15).
+        r.worker
+            .apply(&plan(false, true), t + Duration::from_secs(2));
+        *r.tap_answer.lock().unwrap() = Answer::Ok;
+        r.worker
+            .apply(&plan(true, true), t + Duration::from_secs(3));
+        r.started(t + Duration::from_secs(3));
+        assert!(has(&r.log.take(), "tap start"), "a fresh probe and tap");
+        assert_eq!(r.events(), [MacAudioEv::Capture(Capture::Allowed)]);
+        assert!(r.worker.tap.is_some());
     }
 
     #[test]
@@ -774,25 +934,31 @@ mod tests {
         *r.tap_answer.lock().unwrap() = Answer::Fail;
         let t = Instant::now();
         r.worker.apply(&plan(true, false), t);
+        assert_eq!(r.worker.retry_at(), None, "no retry while a start runs");
+        r.started(t);
         assert_eq!(r.log.take(), ["tap start"]);
         assert!(r.events().is_empty(), "a failure is no Capture answer");
         assert_eq!(r.worker.retry_at(), Some(t + TAP_RETRY));
         r.worker.tick(t + Duration::from_secs(4));
         r.worker
             .apply(&plan(true, true), t + Duration::from_secs(4));
-        assert!(!r.log.take().contains(&"tap start".to_string()));
+        assert!(!r.worker.starting);
+        assert!(!has(&r.log.take(), "tap start"), "not before 5 s");
         r.worker.tick(t + TAP_RETRY);
+        r.started(t + TAP_RETRY);
         assert_eq!(r.log.take(), ["tap start"]);
         let t2 = t + TAP_RETRY + Duration::from_secs(1);
         r.worker.device(AudioDevEv::DefaultOutputChanged, t2);
-        assert_eq!(r.log.take(), ["tap start"], "a new output is worth a try");
+        assert!(r.worker.starting, "a new output is worth a try");
+        r.started(t2);
         *r.tap_answer.lock().unwrap() = Answer::Ok;
         r.worker.tick(t2 + TAP_RETRY);
-        assert_eq!(r.log.take(), ["tap start"]);
+        r.started(t2 + TAP_RETRY);
+        assert_eq!(r.log.take(), ["tap start", "tap start"]);
         assert_eq!(r.events(), [MacAudioEv::Capture(Capture::Allowed)]);
         assert_eq!(r.worker.retry_at(), None);
         r.worker.apply(&plan(false, true), t2 + TAP_RETRY);
-        assert!(r.log.take().contains(&"tap drop".to_string()));
+        assert!(has(&r.log.take(), "tap drop"));
     }
 
     #[test]
@@ -800,19 +966,84 @@ mod tests {
         let mut r = rig();
         let t = Instant::now();
         r.worker.apply(&plan(true, false), t);
+        r.started(t);
         r.log.take();
         r.worker.device(AudioDevEv::DefaultOutputChanged, t);
         assert_eq!(r.log.take(), ["tap rebuild"]);
         *r.rebuild_ok.lock().unwrap() = false;
         r.worker.device(AudioDevEv::DefaultOutputChanged, t);
         assert_eq!(r.log.take(), ["tap rebuild", "tap drop"]);
+        assert!(!r.worker.starting);
         assert_eq!(r.worker.retry_at(), Some(t + TAP_RETRY));
         r.worker.tick(t + TAP_RETRY);
+        r.started(t + TAP_RETRY);
         assert_eq!(r.log.take(), ["tap start"]);
     }
 
     #[test]
-    fn the_feed_and_the_route_follow_mic_default() {
+    fn an_output_change_during_a_start_rebuilds_the_new_tap() {
+        let mut r = rig();
+        let release = r.hold_tap_starts();
+        let t = Instant::now();
+        r.worker.apply(&plan(true, false), t);
+        r.worker.device(AudioDevEv::DefaultOutputChanged, t);
+        drop(release);
+        r.started(t);
+        assert_eq!(r.log.take(), ["tap start", "tap rebuild"]);
+        assert!(r.worker.tap.is_some());
+    }
+
+    #[test]
+    fn a_blocked_tap_start_holds_up_neither_the_mic_nor_quit() {
+        let mut r = rig();
+        let release = r.hold_tap_starts();
+        let t = Instant::now();
+        r.worker.apply(&plan(true, true), t);
+        assert!(r.worker.starting);
+        // The start is stuck (a permission prompt); the mic still routes.
+        assert_eq!(r.default_input(), MIC_UID);
+        r.worker.apply(&plan(true, true), t + TAP_RETRY);
+        r.worker.tick(t + TAP_RETRY);
+        r.worker
+            .device(AudioDevEv::DefaultOutputChanged, t + TAP_RETRY);
+        // The switch goes off: the input comes back at once.
+        r.worker.apply(&plan(false, false), t + TAP_RETRY);
+        assert_eq!(r.default_input(), BUILTIN);
+        let log = r.log.take();
+        assert_eq!(
+            log.iter().filter(|l| *l == "tap start").count(),
+            1,
+            "one start at a time: {log:?}"
+        );
+        assert!(has(&log, "feed stop"));
+        // The late tap is dropped as soon as it arrives.
+        drop(release);
+        r.started(t + TAP_RETRY);
+        assert_eq!(r.log.take(), ["tap drop"]);
+        assert!(r.worker.tap.is_none());
+    }
+
+    #[test]
+    fn quit_answers_while_a_tap_start_is_blocked() {
+        let mut r = rig();
+        let release = r.hold_tap_starts();
+        let (cmds, cmds_rx) = unbounded();
+        let (_devs, devs_rx) = unbounded::<AudioDevEv>();
+        let (reply, _replied) = std::sync::mpsc::channel();
+        cmds.send(AudioCmd::Apply(plan(true, true))).unwrap();
+        cmds.send(AudioCmd::Quit(reply)).unwrap();
+        assert!(r.worker.run(&cmds_rx, devs_rx).is_some(), "Quit's reply");
+        assert_eq!(r.default_input(), BUILTIN, "the input is back first");
+        assert!(r.worker.starting, "the start is still stuck");
+        drop(release);
+        r.worker.drain_start();
+        assert!(r.worker.tap.is_none());
+        let log = r.log.take();
+        assert_eq!(log.last().map(String::as_str), Some("tap drop"), "{log:?}");
+    }
+
+    #[test]
+    fn the_route_follows_a_running_feed() {
         let mut r = rig();
         let t = Instant::now();
         r.worker.apply(&plan(false, true), t);
@@ -834,25 +1065,30 @@ mod tests {
     }
 
     #[test]
-    fn no_feed_without_the_driver() {
+    fn no_feed_and_no_route_without_the_driver() {
         let mut r = rig();
         *r.driver.lock().unwrap() = false;
         r.worker.apply(&plan(false, true), Instant::now());
-        assert!(!r.log.take().contains(&"feed start".to_string()));
+        assert!(r.log.take().is_empty(), "no feed, so no engage");
+        assert_eq!(r.default_input(), BUILTIN);
         assert_eq!(r.events(), [MacAudioEv::Driver(false)]);
     }
 
     #[test]
-    fn a_failed_feed_keeps_its_pipe_and_retries_on_the_next_event() {
+    fn a_failed_feed_leaves_the_input_alone_until_a_retry_works() {
         let mut r = rig();
         *r.feed_ok.lock().unwrap() = false;
         let t = Instant::now();
         r.worker.apply(&plan(false, true), t);
-        assert!(r.log.take().contains(&"feed start".to_string()));
+        assert_eq!(r.log.take(), ["feed start"], "no engage (P14)");
+        assert_eq!(r.default_input(), BUILTIN);
         assert!(!r.mic.running());
         *r.feed_ok.lock().unwrap() = true;
         r.worker.device(AudioDevEv::DevicesChanged, t);
-        assert_eq!(r.log.take(), ["feed start"]);
+        assert_eq!(
+            r.log.take(),
+            ["feed start", format!("input {MIC_UID}").as_str()]
+        );
         assert!(r.mic.running());
     }
 
@@ -863,7 +1099,16 @@ mod tests {
         let t = Instant::now();
         r.worker.apply(&plan(false, true), t);
         r.worker.apply(&plan(false, false), t);
-        assert!(r.log.take().contains(&"feed stop".to_string()));
+        assert_eq!(
+            r.log.take(),
+            [
+                "feed start",
+                format!("input {MIC_UID}").as_str(),
+                format!("input {BUILTIN}").as_str(),
+                "feed stop"
+            ],
+            "released, then stopped"
+        );
         // The network's handle now feeds the new pipe, and the stats follow.
         let tx = r.mic.tx();
         for seq in 0..3 {
@@ -873,6 +1118,12 @@ mod tests {
         rx.pull(&mut [0.0; 480]);
         assert_eq!(rx.stats().snapshot().received, 3);
         assert_eq!(r.mic.stats().snapshot().received, 3);
+        // And it plays again on the next plan.
+        r.worker.apply(&plan(false, true), t);
+        assert_eq!(
+            r.log.take(),
+            ["feed start", format!("input {MIC_UID}").as_str()]
+        );
     }
 
     #[test]
@@ -916,8 +1167,8 @@ mod tests {
     #[test]
     fn run_carries_out_commands_until_quit_even_without_a_watch() {
         let mut r = rig();
-        let (cmds, cmds_rx) = crossbeam_channel::unbounded();
-        let (devs, devs_rx) = crossbeam_channel::unbounded::<AudioDevEv>();
+        let (cmds, cmds_rx) = unbounded();
+        let (devs, devs_rx) = unbounded::<AudioDevEv>();
         // The watch failed to start: its sender is gone.
         drop(devs);
         let (reply, _replied) = std::sync::mpsc::channel();
@@ -925,6 +1176,8 @@ mod tests {
         cmds.send(AudioCmd::Session(None)).unwrap();
         cmds.send(AudioCmd::Quit(reply)).unwrap();
         assert!(r.worker.run(&cmds_rx, devs_rx).is_some(), "Quit's reply");
+        // Before or after Quit, the tap that start makes is dropped.
+        r.worker.drain_start();
         assert_eq!(r.log.take(), ["tap start", "tap drop"]);
     }
 
@@ -933,6 +1186,7 @@ mod tests {
         let mut r = rig();
         let t = Instant::now();
         r.worker.apply(&plan(true, true), t);
+        r.started(t);
         r.log.take();
         r.worker.quit();
         assert_eq!(

@@ -62,7 +62,7 @@ use crate::common::settings_window::SettingsWindow;
 use crate::paths;
 use crate::ui::dialogs;
 use crate::ui::tray::{TrayCmd, TrayModel, latency_text, run_tray};
-use audio::{AUDIO_QUIT, MacSharing};
+use audio::MacSharing;
 use drags::{Drags, Pills, SWEEP_EVERY};
 
 const PING_EVERY: Duration = Duration::from_millis(100);
@@ -582,17 +582,14 @@ impl App {
         let advertiser = self.advertiser.take();
         // Releases the AWDL hold, if any, before the process ends.
         let awdl = self.awdl.take();
-        // cj-audio gives the user's input back and unmutes the Mac.
+        // cj-audio gives the user's input back and unmutes the Mac; if it
+        // doesn't answer in time, the input is given back from here.
         let audio_stopped = self.audio.quit();
         let _ = tokio::join!(
             tokio::time::sleep(CLOSE_FLUSH),
             tokio::task::spawn_blocking(move || drop(advertiser)),
             tokio::task::spawn_blocking(move || drop(awdl)),
-            tokio::task::spawn_blocking(move || {
-                if audio_stopped.recv_timeout(AUDIO_QUIT).is_err() {
-                    warn!("audio: cj-audio did not stop in time");
-                }
-            }),
+            tokio::task::spawn_blocking(audio_stopped),
         );
         if self.restart {
             error!("exiting with an error so that CursorJump restarts");

@@ -4,19 +4,19 @@
 //! (`AudioCmd::Apply`), and each change of want to the PC
 //! (`Control::AudioWant`), which every new session also gets.
 
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use cj_core::audio::{AudioStatus, AudioWant};
 use cj_core::audio_state::{AudioPlan, Capture, MacAudio};
 use cj_net::session::Session;
-use tracing::info;
+use tracing::{error, info, warn};
 
-use crate::mac::audio::{AudioCmd, MacAudioEv, MacAudioIo, MicTx};
+use crate::mac::audio::{AudioCmd, MacAudioEv, MacAudioIo, MicTx, recover_input};
 use crate::ui::tray::AudioMenu;
 
 /// How long quitting waits for `cj-audio` to give the input back.
-pub(super) const AUDIO_QUIT: Duration = Duration::from_secs(1);
+const AUDIO_QUIT: Duration = Duration::from_secs(1);
 
 /// From the plan `cj-audio` and the PC have to the next one: whether
 /// `cj-audio` needs it (the tap or the mic changed), and whether the PC
@@ -61,12 +61,16 @@ impl MacSharing {
     /// The live session changed to `s`, or ended (None).
     pub fn session(&mut self, s: Option<&Session>, now: Instant) {
         self.io.send(AudioCmd::Session(s.cloned()));
-        match s {
-            Some(_) => {
-                self.rules.connected(now);
-                self.want_due = true;
-            }
-            None => self.rules.disconnected(now),
+        self.link(s.is_some(), now);
+    }
+
+    /// A new session (`up`) or none.
+    fn link(&mut self, up: bool, now: Instant) {
+        if up {
+            self.rules.connected(now);
+            self.want_due = true;
+        } else {
+            self.rules.disconnected(now);
         }
     }
 
@@ -136,19 +140,38 @@ impl MacSharing {
         }
     }
 
-    /// Asks `cj-audio` to give the input back and stop; the receiver hears
-    /// once it has.
-    pub fn quit(&self) -> Receiver<()> {
+    /// Asks `cj-audio` to give the input back and stop. The returned
+    /// closure blocks: it waits up to [`AUDIO_QUIT`] for `cj-audio`, and
+    /// gives the input back itself if no answer comes.
+    pub fn quit(&self) -> impl FnOnce() + Send + 'static {
         let (tx, rx) = std::sync::mpsc::channel();
         self.io.send(AudioCmd::Quit(tx));
-        rx
+        let restore = self.io.restore_file();
+        move || await_quit(&rx, AUDIO_QUIT, || recover_input(&restore))
     }
+}
+
+/// Waits up to `within` for `cj-audio`'s Quit reply; without one (it is
+/// wedged, or gone), runs `recover` so the user's input still comes back.
+fn await_quit(stopped: &Receiver<()>, within: Duration, recover: impl FnOnce()) {
+    match stopped.recv_timeout(within) {
+        Ok(()) => return,
+        Err(RecvTimeoutError::Timeout) => {
+            warn!("audio: cj-audio did not stop in time; giving the input back from here")
+        }
+        Err(RecvTimeoutError::Disconnected) => {
+            error!("audio: cj-audio is gone; giving the input back from here")
+        }
+    }
+    recover();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cj_core::audio::{AudioStatus, DeviceState};
     use cj_core::audio_state::{NOTE_NO_PC_MIC, NOTE_ROUTED};
+    use std::cell::Cell;
 
     fn plan(tap: bool, mic_default: bool, sound: bool, mic: bool) -> AudioPlan {
         AudioPlan {
@@ -199,5 +222,60 @@ mod tests {
             ..noted.clone()
         };
         assert_eq!(audio_updates(&noted, &other_note), (false, false));
+    }
+
+    #[test]
+    fn every_new_session_hears_the_want_even_unchanged() {
+        let (cmds, cmds_rx) = crossbeam_channel::unbounded();
+        let mut a = MacSharing::new(true, MacAudioIo::detached(cmds));
+        let t = Instant::now();
+        a.event(MacAudioEv::Driver(true));
+        a.link(true, t);
+        assert_eq!(a.update(t), Some(AudioWant::default()), "a new session");
+        assert_eq!(a.update(t), None, "nothing changed");
+        a.pc_status(AudioStatus {
+            output: DeviceState::Ok,
+            mic: DeviceState::Ok,
+        });
+        let want = AudioWant {
+            sound: true,
+            mic: false,
+        };
+        assert_eq!(a.update(t), Some(want));
+        assert!(matches!(
+            cmds_rx.try_recv(),
+            Ok(AudioCmd::Apply(AudioPlan {
+                tap: true,
+                mic_default: true,
+                ..
+            }))
+        ));
+        // The session is replaced within the grace: the plan stands.
+        a.link(false, t);
+        a.link(true, t);
+        assert_eq!(a.update(t), Some(want), "the new session hears it too");
+        assert!(cmds_rx.try_recv().is_err(), "cj-audio has the plan already");
+        assert_eq!(a.update(t), None);
+    }
+
+    #[test]
+    fn quit_gives_the_input_back_itself_without_an_answer() {
+        let recovered = Cell::new(0);
+        let recover = || recovered.set(recovered.get() + 1);
+        let short = Duration::from_millis(10);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(()).unwrap();
+        await_quit(&rx, short, recover);
+        assert_eq!(recovered.get(), 0, "cj-audio answered");
+
+        let (_tx, rx) = std::sync::mpsc::channel();
+        await_quit(&rx, short, recover);
+        assert_eq!(recovered.get(), 1, "cj-audio wedged");
+
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        drop(tx);
+        await_quit(&rx, short, recover);
+        assert_eq!(recovered.get(), 2, "cj-audio gone");
     }
 }

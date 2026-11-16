@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 /// How long a dropped link still counts as alive.
 pub const GRACE: Duration = Duration::from_secs(5);
 
-pub const NOTE_CAPTURE_DENIED: &str = "Mac sound stays on the Mac: allow CursorJump in System Settings › Privacy & Security › Screen & System Audio Recording";
+pub const NOTE_CAPTURE_DENIED: &str = "Mac sound stays on the Mac: allow CursorJump in System Settings › Privacy & Security › Screen & System Audio Recording, then turn Mac sound and mic through PC off and on";
 pub const NOTE_NO_PC_OUTPUT: &str = "Mac sound stays on the Mac: the PC has no sound output";
 pub const NOTE_NO_DRIVER: &str =
     "Mic stays on the Mac: the CursorJump audio driver isn't installed";
@@ -83,7 +83,12 @@ impl MacAudio {
         self.connected = false;
     }
 
+    /// Switching sharing back on forgets a refused capture, so the next
+    /// plan asks macOS again (after the user allowed it in System Settings).
     pub fn set_sharing(&mut self, on: bool) {
+        if on && !self.sharing {
+            self.capture = Capture::Unknown;
+        }
         self.sharing = on;
     }
 
@@ -282,6 +287,21 @@ mod tests {
         let p = a.plan(t);
         assert!(!p.tap && p.mic_default);
         assert_eq!(p.note, Some(NOTE_CAPTURE_DENIED));
+    }
+
+    #[test]
+    fn switching_sharing_off_and_on_asks_for_capture_again() {
+        let t = Instant::now();
+        let mut a = up(t);
+        a.set_capture(Capture::Denied);
+        assert!(!a.plan(t).tap);
+        a.set_sharing(true);
+        assert!(!a.plan(t).tap, "on while on: still refused");
+        a.set_sharing(false);
+        a.set_sharing(true);
+        let p = a.plan(t);
+        assert!(p.tap, "the next plan probes again");
+        assert_eq!(p.note, Some(NOTE_ROUTED));
     }
 
     #[test]
