@@ -68,17 +68,22 @@ impl<D: InputDevices> MicRoute<D> {
     }
 
     /// Saves the current default input's UID, unless it is ours or one is
-    /// saved already, then makes our mic the default.
+    /// saved already, then makes our mic the default. Never switches without
+    /// knowing what to restore: with our mic installed there is always a
+    /// default input, so not reading one is an error.
     pub fn engage(&mut self) -> Result<()> {
-        let current = self.devices.default_input_uid();
-        if current.as_deref() == Some(MIC_UID) {
+        let current = self
+            .devices
+            .default_input_uid()
+            .context("reading the default input")?;
+        if current == MIC_UID {
             info!("audio engage: {MIC_UID} is already the default input; nothing to save");
             self.engaged = true;
             return Ok(());
         }
         let mut wrote = false;
-        if let (Some(uid), None) = (&current, self.saved()) {
-            write_restore_file(&self.restore_file, uid)?;
+        if self.saved().is_none() {
+            write_restore_file(&self.restore_file, &current)?;
             wrote = true;
         }
         if let Err(e) = self.devices.set_default_input(MIC_UID) {
@@ -87,10 +92,7 @@ impl<D: InputDevices> MicRoute<D> {
             }
             return Err(e.context(format!("making {MIC_UID} the default input")));
         }
-        info!(
-            "audio engage: default input {} -> {MIC_UID}",
-            current.as_deref().unwrap_or("<none>")
-        );
+        info!("audio engage: default input {current} -> {MIC_UID}");
         self.engaged = true;
         Ok(())
     }
@@ -145,6 +147,7 @@ impl<D: InputDevices> MicRoute<D> {
             Some(uid) => {
                 if let Err(e) = self.devices.set_default_input(&uid) {
                     warn!("audio {why}: setting the default input back to {uid}: {e:#}");
+                    self.move_off_our_mic(why, &uid);
                     return; // keep the file: the next launch retries
                 }
                 info!(
@@ -161,6 +164,22 @@ impl<D: InputDevices> MicRoute<D> {
             None => debug!("audio {why}: nothing to restore"),
         }
         self.delete_restore_file();
+    }
+
+    /// After a failed restore to `failed`: if the default is still our mic,
+    /// tries the built-in mic, so the Mac doesn't stay on a silent input.
+    fn move_off_our_mic(&mut self, why: &str, failed: &str) {
+        if self.devices.default_input_uid().as_deref() != Some(MIC_UID) {
+            return;
+        }
+        let Some(builtin) = self.devices.builtin_input_uid().filter(|b| b != failed) else {
+            warn!("audio {why}: no other mic to move off {MIC_UID} to");
+            return;
+        };
+        match self.devices.set_default_input(&builtin) {
+            Ok(()) => info!("audio {why}: default input {MIC_UID} -> {builtin} (for now)"),
+            Err(e) => warn!("audio {why}: setting the default input to {builtin}: {e:#}"),
+        }
     }
 
     /// The saved input, if the restore file holds one.
@@ -409,36 +428,38 @@ impl Shared {
             );
         }
         let was = mic.last.take();
-        mic.id = id;
-        if id == kAudioObjectUnknown {
-            drop(mic);
-            if was == Some(true) {
-                (self.on)(AudioDevEv::MicListening(false));
+        // Stored only once its listener is added, so a failed registration
+        // is retried on the next DevicesChanged.
+        mic.id = kAudioObjectUnknown;
+        if id != kAudioObjectUnknown {
+            let weak = Arc::downgrade(self);
+            let block: Listener =
+                RcBlock::new(move |_: u32, _: NonNull<AudioObjectPropertyAddress>| {
+                    if let Some(s) = weak.upgrade() {
+                        s.mic_changed();
+                    }
+                });
+            let st = add_listener(
+                id,
+                kAudioDevicePropertyDeviceIsRunningSomewhere,
+                &self.queue,
+                &block,
+            );
+            if st == 0 {
+                mic.id = id;
+                mic.block = Some(SendBlock(block));
+                let running = running_somewhere(id);
+                mic.last = Some(running);
+                drop(mic);
+                (self.on)(AudioDevEv::MicListening(running));
+                return;
             }
-            return;
-        }
-        let weak = Arc::downgrade(self);
-        let block: Listener =
-            RcBlock::new(move |_: u32, _: NonNull<AudioObjectPropertyAddress>| {
-                if let Some(s) = weak.upgrade() {
-                    s.mic_changed();
-                }
-            });
-        let st = add_listener(
-            id,
-            kAudioDevicePropertyDeviceIsRunningSomewhere,
-            &self.queue,
-            &block,
-        );
-        if st == 0 {
-            mic.block = Some(SendBlock(block));
-        } else {
             warn!("audio watch: listening to our mic {id}: OSStatus {st}");
         }
-        let running = running_somewhere(id);
-        mic.last = Some(running);
         drop(mic);
-        (self.on)(AudioDevEv::MicListening(running));
+        if was == Some(true) {
+            (self.on)(AudioDevEv::MicListening(false));
+        }
     }
 
     /// Our mic's `IsRunningSomewhere` changed. Runs on the queue.
@@ -644,8 +665,8 @@ mod tests {
         default: Option<String>,
         present: Vec<String>,
         sets: Vec<String>,
-        /// Every set fails, as if coreaudiod refused it.
-        refuse: bool,
+        /// Sets to these devices fail, as if coreaudiod refused them.
+        refused: Vec<String>,
     }
 
     /// Fake devices; the test keeps a handle on the state.
@@ -684,7 +705,7 @@ mod tests {
         }
         fn set_default_input(&mut self, uid: &str) -> Result<()> {
             let mut s = self.0.borrow_mut();
-            anyhow::ensure!(!s.refuse, "refused {uid}");
+            anyhow::ensure!(!s.refused.iter().any(|d| d == uid), "refused {uid}");
             anyhow::ensure!(s.present.iter().any(|d| d == uid), "no device {uid}");
             s.default = Some(uid.into());
             s.sets.push(uid.into());
@@ -804,23 +825,52 @@ mod tests {
     }
 
     #[test]
-    fn release_that_fails_to_restore_keeps_the_file() {
+    fn release_that_fails_to_restore_moves_to_the_builtin_mic_and_keeps_the_file() {
         let dir = tempfile::tempdir().unwrap();
         let fake = Fake::with_default(USB);
         let mut r = route(&fake, &dir);
         r.engage().unwrap();
-        fake.0.borrow_mut().refuse = true;
+        fake.0.borrow_mut().refused = vec![USB.into()];
         r.release();
         assert!(!r.engaged());
-        fake.0.borrow_mut().refuse = false;
+        assert_eq!(fake.current().as_deref(), Some(BUILTIN));
         assert_eq!(
             saved(&dir).as_deref(),
             Some("previous_input = \"usb-mic\"\n")
         );
-        // The next launch retries.
+        // The next launch retries the user's own device.
+        fake.0.borrow_mut().refused.clear();
         let mut next = route(&fake, &dir);
         next.recover();
         assert_eq!(fake.current().as_deref(), Some(USB));
+        assert_eq!(saved(&dir), None);
+    }
+
+    #[test]
+    fn release_that_cannot_switch_at_all_keeps_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Fake::with_default(USB);
+        let mut r = route(&fake, &dir);
+        r.engage().unwrap();
+        fake.0.borrow_mut().refused = vec![USB.into(), BUILTIN.into()];
+        r.release();
+        assert!(!r.engaged());
+        assert_eq!(fake.current().as_deref(), Some(MIC_UID));
+        assert_eq!(
+            saved(&dir).as_deref(),
+            Some("previous_input = \"usb-mic\"\n")
+        );
+    }
+
+    #[test]
+    fn engage_that_cannot_read_the_default_does_not_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Fake::with_default(USB);
+        fake.0.borrow_mut().default = None;
+        let mut r = route(&fake, &dir);
+        assert!(r.engage().is_err());
+        assert!(!r.engaged());
+        assert!(fake.sets().is_empty());
         assert_eq!(saved(&dir), None);
     }
 
@@ -930,24 +980,38 @@ mod tests {
     #[test]
     #[ignore = "switches this Mac's default input; needs the CursorJump audio driver"]
     fn engage_and_release_on_this_mac() {
-        assert!(driver_present(), "the CursorJump audio driver is installed");
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("audio-restore.toml");
+        /// Releases even if an assertion panics, so the Mac gets its input back.
+        struct ReleaseOnDrop(MicRoute<CoreAudioDevices>);
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                self.0.release();
+            }
+        }
+
         let before = CoreAudioDevices.default_input_uid();
+        println!(
+            "default input before the test: {}",
+            before.as_deref().unwrap_or("<none>")
+        );
+        assert!(driver_present(), "the CursorJump audio driver is installed");
         let expected = if before.as_deref() == Some(MIC_UID) {
             CoreAudioDevices.builtin_input_uid()
         } else {
             before.clone()
         };
-        let mut r = MicRoute::new(CoreAudioDevices, file.clone());
-        r.engage().unwrap();
+        // Declared before the guard, so the restore file outlives it: locals
+        // drop in reverse order, also while unwinding.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("audio-restore.toml");
+        let mut r = ReleaseOnDrop(MicRoute::new(CoreAudioDevices, file.clone()));
+        r.0.engage().unwrap();
         assert_eq!(
             CoreAudioDevices.default_input_uid().as_deref(),
             Some(MIC_UID)
         );
         // Time to see the switch in System Settings > Sound > Input.
         std::thread::sleep(std::time::Duration::from_secs(3));
-        r.release();
+        r.0.release();
         assert_eq!(CoreAudioDevices.default_input_uid(), expected);
         assert!(!file.exists());
     }
