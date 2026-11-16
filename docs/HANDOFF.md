@@ -1,32 +1,73 @@
 # CursorJump — Handoff
 
-## Audio sharing: PC side built (Tasks 2–9); Mac tasks next
+## Audio sharing: everything built; both directions work; acceptance (Task 15) in progress
 
-Last updated: 2026-11-16, on the PC. On 2026-11-15 the user chose to start audio before phase 2 is merged. Work is on branch **`audio`**, made from `phase2`.
+Last updated: 2026-11-16 (early morning SAST), on the Mac. Work is on branch **`audio`**, made from `phase2`. **All plan tasks 1–14 are done and reviewed, plus the follow-up P16.** Mac sound plays in the PC's headphones, and the PC's mic reaches Mac apps. The user's verdict on the first run: "working flawlessly". What's left is the Task 15 acceptance checklist, cleanup, the final review and the merge.
 
 - **Spec:** `docs/superpowers/specs/2026-10-25-audio-sharing-design.md`
-- **Plan:** `docs/superpowers/plans/2026-11-15-audio-sharing.md`
-- **Ledger:** `docs/superpowers/progress/audio-ledger.md` (rulings P1–P10, deferred minors), shared by both machines: pull before writing, and append only. It is copied from the PC's SDD workspace.
-- **Done and reviewed on the PC:**
-  - Task 2: audio core (jitter buffer, drift-correcting receiver, no allocation on audio threads)
-  - Task 3: protocol **v4**, `send_audio`
-  - Task 4: Mac routing rules (5 s grace)
-  - Task 5: PC volume keys pass through to Windows while on the Mac
-  - Task 6: audio pipes
-  - Task 7: WASAPI output
-  - Task 8: WASAPI mic
-  - Task 9: PC app wiring
-- **Not yet run:** the PC hands-on tests, which need the user listening. Run them one at a time:
-  `cargo test -p cursorjump win::audio -- --ignored --nocapture --test-threads=1`
-  The tests are `render_plays_a_tone_through_the_default_output`, `render_follows_a_default_device_change` and `capture_records_the_default_mic`.
-- **Next, on the Mac:**
-  1. Task 1, the process-tap spike, with the user listening.
-  2. Task 10, the HAL driver.
-  3. Tasks 11–14.
-  4. Task 15, acceptance on both machines. Both machines must be reinstalled together, because this is protocol v4.
+- **Plan:** `docs/superpowers/plans/2026-11-15-audio-sharing.md` (Task 12 carries an amendment block from the spike)
+- **Spike findings:** `docs/superpowers/progress/audio-spike.md` (S1–S5, F1–F6)
+- **Ledger:** `docs/superpowers/progress/audio-ledger.md`. It has rulings P1–P16b, per-task notes, deferred minors and hands-on results. **Read it first.** Pull before writing, and append only.
 
-  Task 14 must drop the non-Windows `expect(dead_code)` on `audio_pipe` in `app/cursorjump/src/common/mod.rs`.
-- **Phase 2 is still open:** the Mac→PC edge-strip misses (see below) block merging `phase2`. `audio` gets rebased onto `main` after that merge.
+### What was built on the Mac
+- **Task 10, the driver.** `app/cursorjump-audio-driver/` is a HAL plug-in with "CursorJump Microphone" (visible) and "CursorJump Mic Feed" (hidden), on one clock. Install it with `./scripts/mac/install-audio-driver.sh` (`--uninstall` to remove). **It is installed on the Mac.**
+- **Task 11, the default input.** `mac/audio/devices.rs` switches the default input to CursorJump Microphone and always restores it: on release, on quit, and on the next launch after a crash. It falls back to the built-in mic if the saved device fails.
+- **Task 12, the tap.** `mac/audio/tap.rs` runs a muted process tap of everything except CursorJump.
+  - **P12:** a self-probe decides whether capture is allowed. A refused tap still mutes (F6), so when the probe says Denied, the app makes no tap and the Mac keeps its own sound.
+  - Only the tap's input stream is used, and the IOProc guards the stream layout.
+  - The sample rate is followed live.
+- **Task 13, the feed.** `mac/audio/feed.rs` plays the PC mic into the feed device. `stop` returns `Option<AudioRx>` (P13).
+- **Task 14, the wiring.** `mac/audio/mod.rs` (the `cj-audio` worker), `mac/app/audio.rs`, `mac/link.rs`, the tray switch and note, the settings checkbox, and `NSAudioCaptureUsageDescription` in Info.plist.
+  - The tap starts on a helper thread, `cj-audio-tap`. Quit restores the input, with a fallback `recover()` if the worker doesn't answer.
+  - **P14:** the mic route engages only while the feed runs.
+  - **P15:** turning the switch off and on re-probes after a refusal.
+- **P16 / P16b.** "A Mac app is listening" is worked out from Core Audio's process list. CursorJump itself and Siri (`com.apple.CoreSpeech`) don't count. Calls that record through private aggregates do count.
+- **A fix to Task 6's audio pipe.** It allocated on the realtime thread on macOS; this is fixed in `add47f6`. CI now runs that test on macOS.
+
+### What is installed right now
+- **PC:** the `audio` build (protocol v4), installed 2026-11-16 around 01:35Z. There have been no PC code changes since, so it is current.
+- **Mac:** `/Applications/CursorJump.app` is built from `63be3a9` (protocol v4). **It does not have P16 yet** (`f90d026`, `d04d6c6`). Reinstall it first: `./scripts/mac/install.sh`. Run it in the user's Terminal, not in Claude Code (see the tooling notes).
+- The macOS "System Audio Recording" permission is granted to CursorJump. The first prompt worked: the probe waited 28 s for the click, then got Allowed.
+
+### Task 15 acceptance so far
+Recorded in the ledger. They still need to be written into `docs/ACCEPTANCE.md` under a new "Audio sharing acceptance" section.
+- ✅ **YouTube on the Mac** plays in the PC headphones, and the Mac's speakers are silent.
+- ✅ **The PC mic in a Mac app:** a QuickTime recording from CursorJump Microphone was clear.
+- ✅ **The Windows mic indicator** goes off when no Mac app listens.
+- ✅ **Cursor latency is unchanged** with audio on: median 3.1–3.4 ms, 0 spikes.
+- ✅ **PC mic stream:** 0 lost, 0 underruns.
+- ⏳ **Next batch, already sent to the user:**
+  1. Reinstall the Mac.
+  2. Lip sync, checked by eye.
+  3. The switch, off and on, from the menu, plus the settings checkbox.
+  4. A 2 s Wi-Fi blip on the Mac with no fallback.
+  5. A Wi-Fi drop over 5 s: the Mac's speakers come back, then it returns to the PC.
+  6. The PC volume keys while the cursor is on the Mac.
+- ⏳ **Still to do after that:**
+  - Music during Valorant/Roblox.
+  - A Discord call on the Mac, with the PC mic indicator on only during the call. This is also the live proof of P16b.
+  - Switching the PC's default output mid-song.
+  - AirPods or wired headphones on the Mac mid-song (the I1/N4 gate: nothing from the Mac's mic, and AirPods must not drop to call quality).
+  - A 5 GB copy during music.
+  - A reboot of each machine, and `kill -9` CursorJump on the Mac (the speakers come back at once, and the mic comes back at the next launch).
+  - An hour of playback (the PC log's "Mac sound" line shows 0 skips).
+  - The Windows mic privacy switch off (the Mac menu note and the PC tray suffix).
+
+### After acceptance
+1. Fix anything that failed, through SDD.
+2. Delete `app/cursorjump/examples/audio_spike_mac.rs`, and drop the spike's `[profile]`/dependency leftovers if unused.
+3. Run `cargo test --workspace` on each machine.
+4. Run the final whole-branch review. It should start from the "FINAL-REVIEW PRIORITY" and "deferred" lines in the ledger.
+5. Merge. `phase2` still has to merge into `main` first: the Mac→PC drag-strip misses are still open (below). Then rebase `audio` onto `main`.
+
+### Tooling notes from the Mac session (2026-11-16)
+- **Core Audio IO:** commands from Claude Code need the sandbox off (`dangerouslyDisableSandbox`). They count as Terminal for TCC, and Terminal has System Audio Recording and Microphone.
+- **Signing:** `codesign` with "CursorJump Dev" fails from Claude Code's shell (`errSecInternalComponent`, no keychain access). So `install.sh` and `install-audio-driver.sh` must be run by the user in Terminal.
+- **Logs:** in zsh, `log` is a builtin, so use `/usr/bin/log show …`. The app log is in UTC; `log show` uses local time (SAST, UTC+2).
+- **Tap hands-on tests** (`mac::audio::tap`) mute the Mac. Run them only with the user listening. The feed and devices tests only touch the virtual devices.
+- `ParrotAudioPlugin.driver` is a third-party HAL plug-in on this Mac. Clean-room rule: don't read it.
+
+---
 
 ## Phase 2 (file drag-and-drop): all code done; acceptance (Task 18) in progress
 
