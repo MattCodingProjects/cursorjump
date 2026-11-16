@@ -128,9 +128,13 @@ pub fn mix_gain(volume_db: Option<f32>, muted: bool) -> f32 {
 /// IOProc and destroys the aggregate, then the tap: the Mac's speakers play
 /// again.
 ///
-/// Make, rebuild and drop it on the `cj-audio` thread only: the probe and
-/// the tap block while macOS shows its permission prompt (T12-d). It is not
-/// `Send`, so it stays on the thread that made it.
+/// `start` blocks while macOS shows its permission prompt (T12-d), so it
+/// runs on a short-lived helper thread (`cj-audio-tap`). The tap is not
+/// `Send`: it is moved once, after `start`, to `cj-audio` through
+/// `MovedTap` in `mac/audio/mod.rs`, then rebuilt and dropped there only.
+/// Any new field must keep `MovedTap`'s SAFETY invariant: no `Rc`, no
+/// `Cell`, no thread-affine Objective-C `Retained`, and no non-atomic
+/// shared state.
 pub struct SoundTap {
     /// Our own process object, left out of the tap.
     me: AudioObjectID,

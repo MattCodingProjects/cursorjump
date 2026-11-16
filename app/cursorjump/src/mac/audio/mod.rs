@@ -1009,6 +1009,12 @@ mod tests {
         // The switch goes off: the input comes back at once.
         r.worker.apply(&plan(false, false), t + TAP_RETRY);
         assert_eq!(r.default_input(), BUILTIN);
+        assert!(!r.mic.running(), "the feed stopped");
+        // The late tap is dropped as soon as it arrives. Its helper has
+        // logged its start by then, so the log is complete.
+        drop(release);
+        r.started(t + TAP_RETRY);
+        assert!(r.worker.tap.is_none());
         let log = r.log.take();
         assert_eq!(
             log.iter().filter(|l| *l == "tap start").count(),
@@ -1016,11 +1022,7 @@ mod tests {
             "one start at a time: {log:?}"
         );
         assert!(has(&log, "feed stop"));
-        // The late tap is dropped as soon as it arrives.
-        drop(release);
-        r.started(t + TAP_RETRY);
-        assert_eq!(r.log.take(), ["tap drop"]);
-        assert!(r.worker.tap.is_none());
+        assert_eq!(log.last().map(String::as_str), Some("tap drop"), "{log:?}");
     }
 
     #[test]
